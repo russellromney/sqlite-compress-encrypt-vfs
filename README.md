@@ -1,0 +1,1 @@
+# sqlite-compress-encrypt-vfs
