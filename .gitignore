@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+*.db
+*.db-shm
+*.db-wal
+*.dict
+/benchmark-pages
+/benches/results

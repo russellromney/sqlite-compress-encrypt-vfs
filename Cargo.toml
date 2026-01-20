@@ -1,0 +1,40 @@
+[package]
+name = "sqlite-compress-encrypt-vfs"
+version = "0.1.0"
+edition = "2021"
+description = "SQLCEs (cinco seis) - SQLite VFS with compression + encryption, custom compression dictionary support, WAL mode, full-text search"
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/sqlite-compress-encrypt-vfs"
+keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
+categories = ["database", "compression", "cryptography"]
+
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+lz4 = ["dep:lz4_flex"]
+snappy = ["dep:snap"]
+gzip = ["dep:flate2"]
+encryption = ["dep:aes-gcm", "dep:sha2", "dep:rand"]
+
+[dependencies]
+sqlite-vfs = "0.2"
+zstd = { version = "0.13", optional = true }
+lz4_flex = { version = "0.11", optional = true }
+snap = { version = "1.1", optional = true }
+flate2 = { version = "1.0", optional = true }
+thiserror = "1"
+parking_lot = "0.12"
+
+# Encryption (optional)
+aes-gcm = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+rusqlite = { version = "0.35", features = ["bundled"] }
+tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "vfs_benchmark"
+harness = false
