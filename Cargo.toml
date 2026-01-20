@@ -30,11 +30,56 @@ aes-gcm = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
 
-[dev-dependencies]
+# CLI dependencies
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rusqlite = { version = "0.35", features = ["bundled"] }
 tempfile = "3"
+
+[dev-dependencies]
 criterion = "0.5"
 
 [[bench]]
 name = "vfs_benchmark"
 harness = false
+
+[[bin]]
+name = "sqlces"
+path = "bin/sqlces.rs"
+
+[[bin]]
+name = "sqlces-bench"
+path = "bin/sqlces-bench.rs"
+
+[[bin]]
+name = "test-plain-sqlite"
+path = "bin/test-plain-sqlite.rs"
+
+[[bin]]
+name = "diagnose-write"
+path = "bin/diagnose-write.rs"
+
+[[bin]]
+name = "trace-syncs"
+path = "bin/trace-syncs.rs"
+
+[[bin]]
+name = "simple-bench"
+path = "bin/simple-bench.rs"
+
+[[bin]]
+name = "debug-copy"
+path = "bin/debug-copy.rs"
+[[bin]]
+name = "test-rusqlite-large"
+path = "/tmp/test-rusqlite-large.rs"
+
+[[bin]]
+name = "test-vfs-passthrough"
+path = "bin/test-vfs-passthrough.rs"
+
+[[bin]]
+name = "basic-write-test"
+path = "bin/basic-write-test.rs"
