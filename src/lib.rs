@@ -1454,9 +1454,6 @@ impl Vfs for CompressedVfs {
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
         let path = self.base_dir.join(db);
 
-        // Only compress main database (WAL is append-only, compression doesn't help)
-        let use_compression = matches!(opts.kind, OpenKind::MainDb) && self.compress;
-
         // Encrypt both main DB and WAL when encryption is enabled
         let use_encryption = matches!(opts.kind, OpenKind::MainDb | OpenKind::Wal) && self.encrypt;
 
@@ -1475,11 +1472,10 @@ impl Vfs for CompressedVfs {
                 .open(&path)?,
         };
 
-        // Main DB: Use VFS page index format for compression/encryption
-        // WAL: Use passthrough with optional in-place encryption (can't use VFS format - SQLite needs to parse WAL structure)
-        // Journals/temp: Use passthrough without encryption
-        if use_compression {
-            // Main DB with compression (and maybe encryption)
+        // Main DB: Always use VFS page index format (handles concurrent access properly)
+        // WAL/journals: Use passthrough (SQLite needs to parse structure directly)
+        if matches!(opts.kind, OpenKind::MainDb) {
+            // Main DB - use VFS format for proper concurrent access
             let password = {
                 #[cfg(feature = "encryption")]
                 { self.password.as_deref() }
@@ -1490,14 +1486,14 @@ impl Vfs for CompressedVfs {
                 file,
                 path.clone(),
                 self.compression_level,
-                use_compression,
-                use_encryption,
+                self.compress,      // whether to compress pages
+                self.encrypt,       // whether to encrypt pages
                 password,
                 #[cfg(feature = "zstd")]
                 self.dictionary.as_deref(),
             )
         } else if use_encryption {
-            // WAL with encryption but no compression - use passthrough with in-place encryption
+            // WAL with encryption - passthrough with in-place encryption
             let encryption_key = {
                 #[cfg(feature = "encryption")]
                 {
