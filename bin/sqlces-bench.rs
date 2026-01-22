@@ -127,6 +127,24 @@ struct Cli {
     /// VFS modes to test (comma-separated: passthrough,compressed,encrypted,both)
     #[arg(long, default_value = "passthrough,compressed,encrypted,both")]
     modes: String,
+
+    /// Force fresh generation (ignore cached corpus and databases)
+    #[arg(long)]
+    fresh: bool,
+}
+
+/// Get the cache directory for benchmark data
+fn get_cache_dir() -> PathBuf {
+    // Use ~/.cache/sqlces-bench/ on Unix, or temp dir on other platforms
+    if let Some(home) = dirs_home() {
+        home.join(".cache").join("sqlces-bench")
+    } else {
+        std::env::temp_dir().join("sqlces-bench")
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[derive(Subcommand)]
@@ -204,6 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &cli.output_format,
             cli.output_file.as_deref(),
             &modes,
+            cli.fresh,
         );
     }
 
@@ -316,12 +335,13 @@ fn bench_gutenberg_db(
     output_format: &str,
     output_file: Option<&std::path::Path>,
     modes: &[&str],
+    fresh: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::atomic::AtomicU32;
     static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    // Generate corpus first
-    let corpus = generate_gutenberg_corpus(corpus_size_mb)?;
+    // Get or generate corpus (uses cache by default)
+    let corpus = get_or_generate_corpus(corpus_size_mb, fresh)?;
 
     println!();
     println!("=== SQLCEs Database Benchmark (Gutenberg Data) ===");
@@ -343,6 +363,7 @@ fn bench_gutenberg_db(
 
         let result = bench_with_corpus(
             &corpus,
+            corpus_size_mb,
             *mode,
             duration_secs,
             reader_threads,
@@ -353,6 +374,7 @@ fn bench_gutenberg_db(
             mmap_percent,
             wal_autocheckpoint,
             encryption_key,
+            fresh,
             &VFS_COUNTER,
         );
 
@@ -402,6 +424,7 @@ fn bench_gutenberg_db(
 /// Benchmark a specific VFS mode with provided corpus data
 fn bench_with_corpus(
     corpus: &[(String, String, String)],
+    corpus_size_mb: usize,
     mode: &str,
     duration_secs: u64,
     reader_threads: usize,
@@ -412,24 +435,77 @@ fn bench_with_corpus(
     mmap_percent: f64,
     wal_autocheckpoint: i64,
     encryption_key: &str,
+    fresh: bool,
     vfs_counter: &std::sync::atomic::AtomicU32,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
-    use std::sync::atomic::Ordering;
-
     let start_total = Instant::now();
+    let cache_dir = get_cache_dir();
+    std::fs::create_dir_all(&cache_dir)?;
 
-    // Create temp dir and VFS with unique name
-    let temp_dir = tempfile::TempDir::new()?;
-    let vfs_id = vfs_counter.fetch_add(1, Ordering::SeqCst);
-    let vfs_name = format!("bench_gutenberg_{}_{}", mode, vfs_id);
+    // Database cache paths
+    // For passthrough mode, we use the source directly (plain SQLite)
+    // For other modes, we have a separate converted database
+    let source_db_dir = cache_dir.join(format!("db_{}mb_source", corpus_size_mb));
+    let source_db_path = source_db_dir.join("bench.db");
+    let target_db_dir = cache_dir.join(format!("db_{}mb_{}", corpus_size_mb, mode));
+    let target_db_path = target_db_dir.join("bench.db");
+
+    // Setup timing
+    let setup_start = Instant::now();
+
+    // Step 1: Ensure plain SQLite source database exists (no VFS - regular SQLite format)
+    let source_needs_creation = fresh || !source_db_path.exists();
+    if source_needs_creation {
+        println!("  Creating source database (plain SQLite)...");
+        std::fs::create_dir_all(&source_db_dir)?;
+
+        // Remove old files if fresh
+        if source_db_path.exists() {
+            std::fs::remove_file(&source_db_path)?;
+        }
+        let wal_path = source_db_dir.join("bench.db-wal");
+        let shm_path = source_db_dir.join("bench.db-shm");
+        if wal_path.exists() { std::fs::remove_file(&wal_path)?; }
+        if shm_path.exists() { std::fs::remove_file(&shm_path)?; }
+
+        // Create plain SQLite database (NO VFS) for source
+        let conn = Connection::open(&source_db_path)?;
+
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+
+        // Bulk insert corpus
+        conn.execute("BEGIN", [])?;
+        for (author, title, body) in corpus {
+            conn.execute(
+                "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
+                (author, title, body),
+            )?;
+        }
+        conn.execute("COMMIT", [])?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        drop(conn);
+
+        println!("  Source database created: {} documents", corpus.len());
+    } else {
+        println!("  Using cached source database");
+    }
+
+    // Step 2: Create/reuse target database for the specific mode
+    let target_needs_creation = fresh || !target_db_path.exists();
+
+    // Create VFS for target
+    std::fs::create_dir_all(&target_db_dir)?;
+    let vfs_id = vfs_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let vfs_name = format!("bench_{}_{}", mode, vfs_id);
 
     let vfs = match mode {
-        "passthrough" => CompressedVfs::passthrough(temp_dir.path()),
-        "compressed" => CompressedVfs::new(temp_dir.path(), 3),
+        "passthrough" => CompressedVfs::passthrough(&target_db_dir),
+        "compressed" => CompressedVfs::new(&target_db_dir, 3),
         "encrypted" => {
             #[cfg(feature = "encryption")]
             {
-                CompressedVfs::encrypted(temp_dir.path(), encryption_key)
+                CompressedVfs::encrypted(&target_db_dir, encryption_key)
             }
             #[cfg(not(feature = "encryption"))]
             {
@@ -439,7 +515,7 @@ fn bench_with_corpus(
         "both" => {
             #[cfg(feature = "encryption")]
             {
-                CompressedVfs::compressed_encrypted(temp_dir.path(), 3, encryption_key)
+                CompressedVfs::compressed_encrypted(&target_db_dir, 3, encryption_key)
             }
             #[cfg(not(feature = "encryption"))]
             {
@@ -451,32 +527,69 @@ fn bench_with_corpus(
 
     register(&vfs_name, vfs)?;
 
-    // Create database and insert corpus
-    let setup_start = Instant::now();
-    let db_path = temp_dir.path().join("bench.db");
+    if target_needs_creation {
+        println!("  Converting to {} mode...", mode);
+
+        // Remove old files if fresh
+        if target_db_path.exists() {
+            std::fs::remove_file(&target_db_path)?;
+        }
+        let wal_path = target_db_dir.join("bench.db-wal");
+        let shm_path = target_db_dir.join("bench.db-shm");
+        if wal_path.exists() { std::fs::remove_file(&wal_path)?; }
+        if shm_path.exists() { std::fs::remove_file(&shm_path)?; }
+
+        // Copy data from source (plain SQLite) to target (through VFS)
+        // This applies to ALL modes including passthrough
+        let source_conn = Connection::open_with_flags(
+            &source_db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+
+        let target_conn = Connection::open_with_flags_and_vfs(
+            &target_db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )?;
+
+        target_conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        target_conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+        target_conn.execute("BEGIN", [])?;
+
+        // Copy all data from source to target
+        {
+            let mut stmt = source_conn.prepare("SELECT author, title, body FROM articles")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let author: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let body: String = row.get(2)?;
+                target_conn.execute(
+                    "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
+                    (&author, &title, &body),
+                )?;
+            }
+        }
+
+        target_conn.execute("COMMIT", [])?;
+        target_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        println!("  Conversion complete");
+    } else {
+        println!("  Using cached {} database", mode);
+    }
+
+    // Open the target database for benchmarking
+    let db_path = target_db_path;
     let conn = Connection::open_with_flags_and_vfs(
         &db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
         &vfs_name,
     )?;
 
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-    conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
 
-    // Bulk insert corpus
-    conn.execute("BEGIN", [])?;
-    for (author, title, body) in corpus {
-        conn.execute(
-            "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
-            (author, title, body),
-        )?;
-    }
-    conn.execute("COMMIT", [])?;
-
-    // Checkpoint WAL to flush data to main database file
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-
-    let doc_count = corpus.len();
+    let doc_count: usize = conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))?;
     let setup_duration = setup_start.elapsed().as_secs_f64();
 
     // Configure cache and mmap
@@ -1081,16 +1194,43 @@ fn clean_gutenberg_text(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Get or generate corpus, using cache if available
+fn get_or_generate_corpus(target_size_mb: usize, fresh: bool) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+    let cache_dir = get_cache_dir();
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let corpus_cache_file = cache_dir.join(format!("corpus_{}mb.json", target_size_mb));
+
+    // Check for cached corpus
+    if !fresh && corpus_cache_file.exists() {
+        println!("Loading cached corpus from {:?}...", corpus_cache_file);
+        let cached_data = std::fs::read_to_string(&corpus_cache_file)?;
+        let corpus: Vec<(String, String, String)> = serde_json::from_str(&cached_data)?;
+        println!("Loaded {} documents from cache", corpus.len());
+        return Ok(corpus);
+    }
+
+    // Generate fresh corpus
+    let corpus = generate_gutenberg_corpus(target_size_mb)?;
+
+    // Save to cache
+    println!("Caching corpus to {:?}...", corpus_cache_file);
+    let json = serde_json::to_string(&corpus)?;
+    std::fs::write(&corpus_cache_file, json)?;
+
+    Ok(corpus)
+}
+
 /// Generate corpus from Gutenberg texts
 fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
-    let cache_dir = std::env::temp_dir().join("sqlces_gutenberg_cache");
-    std::fs::create_dir_all(&cache_dir)?;
+    let gutenberg_cache_dir = get_cache_dir().join("gutenberg_texts");
+    std::fs::create_dir_all(&gutenberg_cache_dir)?;
 
     let target_bytes = target_size_mb * 1024 * 1024;
     let mut corpus = Vec::new();
     let mut current_size = 0usize;
 
-    println!("Downloading Gutenberg texts (cached in {:?})...", cache_dir);
+    println!("Downloading Gutenberg texts (cached in {:?})...", gutenberg_cache_dir);
 
     for (ebook_id, author, title) in GUTENBERG_TEXTS {
         if current_size >= target_bytes {
@@ -1100,7 +1240,7 @@ fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, Strin
         print!("  {} - {}... ", author, title);
         std::io::Write::flush(&mut std::io::stdout())?;
 
-        match download_gutenberg_text(*ebook_id, &cache_dir) {
+        match download_gutenberg_text(*ebook_id, &gutenberg_cache_dir) {
             Ok(text) => {
                 // Split into sections of ~2000 chars each
                 let sections = split_into_sections(&text, author, title);
@@ -1125,7 +1265,7 @@ fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, Strin
                 break;
             }
 
-            let cache_file = cache_dir.join(format!("{}.txt", ebook_id));
+            let cache_file = gutenberg_cache_dir.join(format!("{}.txt", ebook_id));
             if !cache_file.exists() {
                 continue;
             }
