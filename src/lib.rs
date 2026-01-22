@@ -119,7 +119,8 @@ const HEADER_SIZE: u64 = 64;
 /// Size of inline record header: page_num(8) + size(4)
 const RECORD_HEADER_SIZE: u64 = 12;
 
-/// Header flags
+/// Header flags (reserved for future use in file format)
+#[allow(dead_code)]
 const FLAG_ENCRYPTED: u32 = 1 << 0;
 
 /// File header structure
@@ -152,6 +153,8 @@ impl FileHeader {
         }
     }
 
+    /// Create header with embedded dictionary (for future v0.2 dictionary embedding)
+    #[allow(dead_code)]
     fn new_with_dict(dict_size: u32) -> Self {
         Self {
             page_size: 0,
@@ -320,7 +323,9 @@ pub struct CompressedHandle {
     /// This allows writers to reserve space without blocking readers
     write_end: AtomicU64,
     /// Compression dictionary bytes (loaded from file or provided at creation)
+    /// Kept for potential inspection; actual compression uses pre-compiled encoder/decoder dicts
     #[cfg(feature = "zstd")]
+    #[allow(dead_code)]
     dictionary: Option<Vec<u8>>,
     /// Pre-compiled encoder dictionary for fast compression
     #[cfg(feature = "zstd")]
