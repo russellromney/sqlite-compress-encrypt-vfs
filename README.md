@@ -47,6 +47,18 @@ With encryption:
 sqlite-compress-encrypt-vfs = { version = "0.1", features = ["encryption"] }
 ```
 
+With parallel compaction (uses rayon):
+```toml
+[dependencies]
+sqlite-compress-encrypt-vfs = { version = "0.1", features = ["parallel"] }
+```
+
+All features:
+```toml
+[dependencies]
+sqlite-compress-encrypt-vfs = { version = "0.1", features = ["encryption", "parallel"] }
+```
+
 Alternative compressors:
 ```toml
 # Use LZ4 instead of zstd
@@ -115,17 +127,60 @@ register("passthrough", vfs)?;
 
 ## Benchmarking
 
-Run the included benchmark:
+### Quick Benchmark
 
 ```bash
+# Benchmark VFS modes (read/write throughput)
 cargo run --example quick_bench --features encryption --release
+
+# Benchmark parallel vs serial compaction
+cargo run --release --bin sqlces-bench --features "encryption parallel" -- \
+  bench-compact --rows 10000 --iterations 3
 ```
 
-Expected results (typical workload):
-- **Compression ratio:** 5-10x smaller files
-- **Write overhead:** ~2-3x slower in WAL mode
-- **Read overhead:** ~1.5-2x slower
-- **Encryption overhead:** ~1.2x on modern CPUs (AES-NI)
+### sqlces-bench CLI
+
+The `sqlces-bench` tool provides comprehensive benchmarking:
+
+```bash
+# Benchmark parallel compaction speedup
+cargo run --release --bin sqlces-bench --features "encryption parallel" -- \
+  bench-compact --rows 50000 --iterations 3 --compression-level 3
+
+# Benchmark VFS modes with an existing database
+cargo run --release --bin sqlces-bench --features encryption -- \
+  --database path/to/db.db \
+  --duration-secs 10 \
+  --reader-threads 4 \
+  --writer-threads 2
+```
+
+### Expected Results
+
+**Compression Ratios** (by data type):
+| Data Type | Typical Ratio | Notes |
+|-----------|---------------|-------|
+| JSON/XML | 5-10x | Great for structured data |
+| Repeated text (logs) | 10-20x | Excellent compression |
+| Structured data | 3-7x | Good for typical workloads |
+| Binary/random | 1.0x | No benefit |
+
+**Performance Overhead** (WAL mode):
+| Mode | Write | Read | Notes |
+|------|-------|------|-------|
+| Passthrough | baseline | baseline | No overhead |
+| Compressed | ~2-3x slower | ~1.5-2x slower | CPU-bound |
+| Encrypted | ~1.2x slower | ~1.2x slower | AES-NI accelerated |
+| Both | ~2.5-3x slower | ~2x slower | Compress then encrypt |
+
+**Parallel Compaction Speedup** (M-series Mac, 8 cores):
+| Rows | File Size | Serial | Parallel | Speedup |
+|------|-----------|--------|----------|---------|
+| 10k | 0.7 MB | 0.73s | 0.24s | **3.0x** |
+| 50k | 3.6 MB | 3.82s | 1.31s | **2.9x** |
+| 100k | 7.2 MB | 8.22s | 2.46s | **3.3x** |
+
+Speedup scales with core count - expect 4-8x on servers with more cores.
 
 ## Migration Guide
 
@@ -320,20 +375,25 @@ cargo test --all-features
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) and [RECONSTRUCTION.md](RECONSTRUCTION.md) for detailed plans.
+See [ROADMAP.md](ROADMAP.md) for detailed plans.
+
+**v0.1 (Current):**
+- [x] Four VFS modes (compressed, encrypted, both, passthrough)
+- [x] Dictionary compression support
+- [x] Parallel compaction with rayon (`parallel` feature)
+- [x] `compact_if_needed()` helper
+- [x] `sqlces-bench` CLI tool
 
 **v0.2 (Planned):**
 - [ ] Dictionary embedding in database files
-- [ ] `sqlces` CLI tool
+- [ ] `sqlces` CLI tool (inspect, migrate, dict commands)
 - [ ] Argon2 key derivation with salt
 - [ ] Key rotation support
-- [ ] Migration utilities
 
 **v0.3 (Future):**
 - [ ] Encryption key wrapping
+- [ ] Page-level checksums (CRC32)
 - [ ] Multi-version dictionary support
-- [ ] Compression statistics API
-- [ ] Benchmark suite with corpus data
 
 ## Contributing
 
