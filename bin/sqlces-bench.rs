@@ -14,7 +14,7 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
+use sqlite_compress_encrypt_vfs::{clear_all_caches, register, CompressedVfs};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -339,6 +339,11 @@ fn bench_gutenberg_db(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::atomic::AtomicU32;
     static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    // Clear VFS caches when running fresh to avoid stale state
+    if fresh {
+        clear_all_caches();
+    }
 
     // Get or generate corpus (uses cache by default)
     let corpus = get_or_generate_corpus(corpus_size_mb, fresh)?;

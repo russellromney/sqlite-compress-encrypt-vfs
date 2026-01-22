@@ -52,14 +52,20 @@ static SHARED_FILE_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, Arc<Share
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Invalidate cached state for a file. Call this after modifying a database
-/// file externally (e.g., after compact()).
-fn invalidate_cache<P: AsRef<Path>>(path: P) {
+/// file externally (e.g., after compact(), or before deleting/recreating a file).
+pub fn invalidate_cache<P: AsRef<Path>>(path: P) {
     let path = path.as_ref();
     if let Ok(canonical) = path.canonicalize() {
         SHARED_FILE_CACHE.lock().remove(&canonical);
     }
     // Also try the raw path in case canonicalize failed during original caching
     SHARED_FILE_CACHE.lock().remove(&path.to_path_buf());
+}
+
+/// Clear all cached shared state. Call this when running fresh benchmarks
+/// or tests to ensure no stale state is reused.
+pub fn clear_all_caches() {
+    SHARED_FILE_CACHE.lock().clear();
 }
 
 // SQLite main database lock byte offsets (from sqlite3.c)
@@ -408,8 +414,10 @@ impl CompressedHandle {
         } else {
             let canonical_path = db_path.canonicalize().unwrap_or_else(|_| db_path.clone());
             let mut cache = SHARED_FILE_CACHE.lock();
+
             if let Some(existing) = cache.get(&canonical_path) {
-                // Reuse existing shared state - no scan needed!
+                // Reuse existing shared state - critical for concurrent access!
+                // All handles to the same file MUST share the same state.
                 Arc::clone(existing)
             } else {
                 // First open of this file - scan and create shared state
