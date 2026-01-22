@@ -93,12 +93,12 @@ struct Cli {
     mmap_kb: Option<i64>,
 
     /// Page cache size as percentage of logical DB size (0.0-1.0)
-    #[arg(long, default_value = "0.10")]
+    #[arg(long, default_value = "0.20")]
     cache_percent: f64,
 
-    /// Memory-mapped I/O size as multiplier of cache size
-    #[arg(long, default_value = "4.0")]
-    mmap_multiplier: f64,
+    /// Memory-mapped I/O size as percentage of logical DB size (0.0-1.0)
+    #[arg(long, default_value = "0.50")]
+    mmap_percent: f64,
 
     /// WAL autocheckpoint threshold in pages (0 = disable)
     #[arg(long, default_value = "5000")]
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.cache_kb,
             cli.mmap_kb,
             cli.cache_percent,
-            cli.mmap_multiplier,
+            cli.mmap_percent,
             cli.wal_autocheckpoint,
             &cli.encryption_key,
             &cli.output_format,
@@ -242,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cache_kb > 0 {
         println!("Cache: {} KB, mmap: {} KB", cache_kb, mmap_kb);
     } else {
-        println!("Cache: {:.0}% of logical size, mmap: {:.1}x cache", cli.cache_percent * 100.0, cli.mmap_multiplier);
+        println!("Cache: {:.0}% of logical size, mmap: {:.0}% of logical size", cli.cache_percent * 100.0, cli.mmap_percent * 100.0);
     }
     println!();
 
@@ -258,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match bench_existing_db(&database, mode, duration_secs,
                                cli.reader_threads, cli.writer_threads,
-                               cache_kb, mmap_kb, cli.cache_percent, cli.mmap_multiplier,
+                               cache_kb, mmap_kb, cli.cache_percent, cli.mmap_percent,
                                cli.wal_autocheckpoint, enc_key) {
             Ok(result) => {
                 println!("  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
@@ -310,7 +310,7 @@ fn bench_gutenberg_db(
     cache_kb_override: Option<i64>,
     mmap_kb_override: Option<i64>,
     cache_percent: f64,
-    mmap_multiplier: f64,
+    mmap_percent: f64,
     wal_autocheckpoint: i64,
     encryption_key: &str,
     output_format: &str,
@@ -329,6 +329,11 @@ fn bench_gutenberg_db(
     println!("Modes: {:?}", modes);
     println!("Duration: {}s with {}x readers + {}x writers running concurrently",
              duration_secs, reader_threads, writer_threads);
+    if cache_kb_override.unwrap_or(0) > 0 {
+        println!("Cache: {} KB, mmap: {} KB", cache_kb_override.unwrap(), mmap_kb_override.unwrap_or(0));
+    } else {
+        println!("Cache: {:.0}% of logical size, mmap: {:.0}% of logical size", cache_percent * 100.0, mmap_percent * 100.0);
+    }
     println!();
 
     let mut results = Vec::new();
@@ -345,7 +350,7 @@ fn bench_gutenberg_db(
             cache_kb_override.unwrap_or(0),
             mmap_kb_override.unwrap_or(0),
             cache_percent,
-            mmap_multiplier,
+            mmap_percent,
             wal_autocheckpoint,
             encryption_key,
             &VFS_COUNTER,
@@ -404,7 +409,7 @@ fn bench_with_corpus(
     cache_kb_override: i64,
     mmap_kb_override: i64,
     cache_percent: f64,
-    mmap_multiplier: f64,
+    mmap_percent: f64,
     wal_autocheckpoint: i64,
     encryption_key: &str,
     vfs_counter: &std::sync::atomic::AtomicU32,
@@ -487,7 +492,7 @@ fn bench_with_corpus(
     let mmap_size_kb = if mmap_kb_override > 0 {
         mmap_kb_override
     } else {
-        (cache_size_kb as f64 * mmap_multiplier) as i64
+        (logical_size_kb as f64 * mmap_percent) as i64
     };
 
     let file_size_mb = std::fs::metadata(&db_path)?.len() as f64 / (1024.0 * 1024.0);
@@ -569,7 +574,7 @@ fn bench_existing_db(
     cache_kb_override: i64,
     mmap_kb_override: i64,
     cache_percent: f64,
-    mmap_multiplier: f64,
+    mmap_percent: f64,
     wal_autocheckpoint: i64,
     encryption_key: Option<&str>,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
@@ -666,7 +671,7 @@ fn bench_existing_db(
     let mmap_size_kb = if mmap_kb_override > 0 {
         mmap_kb_override
     } else {
-        (cache_size_kb as f64 * mmap_multiplier) as i64
+        (logical_size_kb as f64 * mmap_percent) as i64
     };
 
     let file_size_mb = std::fs::metadata(&db_path)?.len() as f64 / (1024.0 * 1024.0);
@@ -761,7 +766,7 @@ fn bench_reads_concurrent(
         let valid_ids = Arc::clone(valid_ids);
 
         let handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
-            // Each thread opens its own connection (SQLite supports this in WAL mode)
+            // Each reader opens its own connection (WAL mode allows concurrent reads)
             let conn = Connection::open_with_flags_and_vfs(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -848,7 +853,7 @@ fn bench_writes_concurrent(
         let counter = Arc::clone(&counter);
 
         let handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
-            // Each thread opens its own connection (SQLite WAL mode handles write serialization)
+            // Each writer opens its own connection (WAL mode handles serialization)
             let conn = Connection::open_with_flags_and_vfs(
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE,
