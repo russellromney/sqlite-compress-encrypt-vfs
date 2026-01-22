@@ -115,6 +115,18 @@ struct Cli {
     /// Output file path
     #[arg(long)]
     output_file: Option<PathBuf>,
+
+    /// Use Project Gutenberg texts to generate test data (no --database or --preset needed)
+    #[arg(long)]
+    gutenberg: bool,
+
+    /// Corpus size in MB when using --gutenberg (default: 10)
+    #[arg(long, default_value = "10")]
+    corpus_size_mb: usize,
+
+    /// VFS modes to test (comma-separated: passthrough,compressed,encrypted,both)
+    #[arg(long, default_value = "passthrough,compressed,encrypted,both")]
+    modes: String,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +185,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Parse modes
+    let modes: Vec<&str> = cli.modes.split(',').map(|s| s.trim()).collect();
+
+    // Handle --gutenberg mode (generate test data inline)
+    if cli.gutenberg {
+        return bench_gutenberg_db(
+            cli.corpus_size_mb,
+            cli.duration_secs,
+            cli.reader_threads,
+            cli.writer_threads,
+            cli.cache_kb,
+            cli.mmap_kb,
+            cli.cache_percent,
+            cli.mmap_multiplier,
+            cli.wal_autocheckpoint,
+            &cli.encryption_key,
+            &cli.output_format,
+            cli.output_file.as_deref(),
+            &modes,
+        );
+    }
+
     // Resolve database path and settings from preset or CLI args
     let (database, duration_secs, cache_kb, mmap_kb) = if let Some(preset_name) = &cli.preset {
         let preset = get_preset(preset_name).ok_or_else(|| {
@@ -188,9 +222,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(db_path) = &cli.database {
         (db_path.clone(), cli.duration_secs, cli.cache_kb.unwrap_or(0), cli.mmap_kb.unwrap_or(0))
     } else {
-        eprintln!("Error: Either --preset or --database is required");
+        eprintln!("Error: Either --preset, --database, or --gutenberg is required");
         eprintln!("  Example: sqlces-bench --preset 50mb");
         eprintln!("  Example: sqlces-bench --database path/to/db.db");
+        eprintln!("  Example: sqlces-bench --gutenberg --corpus-size-mb 20");
         std::process::exit(1);
     };
 
@@ -201,6 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== SQLCEs Database Benchmark ===");
     println!("Database: {}", database.display());
+    println!("Modes: {:?}", modes);
     println!("Duration: {}s with {}x readers + {}x writers running concurrently",
              duration_secs, cli.reader_threads, cli.writer_threads);
     if cache_kb > 0 {
@@ -210,12 +246,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    let modes = vec!["passthrough", "compressed", "encrypted", "both"];
     let mut results = Vec::new();
 
     for mode in &modes {
         println!("Testing {} mode...", mode);
-        let enc_key = if mode.contains("encrypted") || *mode == "both" {
+        let enc_key = if mode.contains("encrypted") || mode == &"both" {
             Some(cli.encryption_key.as_str())
         } else {
             None
@@ -264,6 +299,265 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Benchmark VFS modes using Gutenberg-generated data
+fn bench_gutenberg_db(
+    corpus_size_mb: usize,
+    duration_secs: u64,
+    reader_threads: usize,
+    writer_threads: usize,
+    cache_kb_override: Option<i64>,
+    mmap_kb_override: Option<i64>,
+    cache_percent: f64,
+    mmap_multiplier: f64,
+    wal_autocheckpoint: i64,
+    encryption_key: &str,
+    output_format: &str,
+    output_file: Option<&std::path::Path>,
+    modes: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::AtomicU32;
+    static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    // Generate corpus first
+    let corpus = generate_gutenberg_corpus(corpus_size_mb)?;
+
+    println!();
+    println!("=== SQLCEs Database Benchmark (Gutenberg Data) ===");
+    println!("Corpus: {} documents, {} MB", corpus.len(), corpus_size_mb);
+    println!("Modes: {:?}", modes);
+    println!("Duration: {}s with {}x readers + {}x writers running concurrently",
+             duration_secs, reader_threads, writer_threads);
+    println!();
+
+    let mut results = Vec::new();
+
+    for mode in modes {
+        println!("Testing {} mode...", mode);
+
+        let result = bench_with_corpus(
+            &corpus,
+            *mode,
+            duration_secs,
+            reader_threads,
+            writer_threads,
+            cache_kb_override.unwrap_or(0),
+            mmap_kb_override.unwrap_or(0),
+            cache_percent,
+            mmap_multiplier,
+            wal_autocheckpoint,
+            encryption_key,
+            &VFS_COUNTER,
+        );
+
+        match result {
+            Ok(res) => {
+                println!("  ✓ Complete - {:.0} read ops/sec, {:.0} write ops/sec, {:.2} MB",
+                         res.read_ops_per_sec, res.write_ops_per_sec, res.file_size_mb);
+                results.push(res);
+            }
+            Err(e) => {
+                println!("  ✗ Failed: {}", e);
+            }
+        }
+        println!();
+    }
+
+    // Output results
+    match output_format.to_lowercase().as_str() {
+        "json" => {
+            let json = serde_json::to_string_pretty(&results)?;
+            if let Some(path) = output_file {
+                std::fs::write(path, json)?;
+            } else {
+                println!("{}", json);
+            }
+        }
+        "markdown" => {
+            let markdown = format_markdown_report(&results);
+            if let Some(path) = output_file {
+                std::fs::write(path, markdown)?;
+            } else {
+                println!("{}", markdown);
+            }
+        }
+        _ => {
+            print_comparison_table(&results);
+            if let Some(path) = output_file {
+                let text = format_comparison_table(&results);
+                std::fs::write(path, text)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Benchmark a specific VFS mode with provided corpus data
+fn bench_with_corpus(
+    corpus: &[(String, String, String)],
+    mode: &str,
+    duration_secs: u64,
+    reader_threads: usize,
+    writer_threads: usize,
+    cache_kb_override: i64,
+    mmap_kb_override: i64,
+    cache_percent: f64,
+    mmap_multiplier: f64,
+    wal_autocheckpoint: i64,
+    encryption_key: &str,
+    vfs_counter: &std::sync::atomic::AtomicU32,
+) -> Result<BenchmarkResult, Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+
+    let start_total = Instant::now();
+
+    // Create temp dir and VFS with unique name
+    let temp_dir = tempfile::TempDir::new()?;
+    let vfs_id = vfs_counter.fetch_add(1, Ordering::SeqCst);
+    let vfs_name = format!("bench_gutenberg_{}_{}", mode, vfs_id);
+
+    let vfs = match mode {
+        "passthrough" => CompressedVfs::passthrough(temp_dir.path()),
+        "compressed" => CompressedVfs::new(temp_dir.path(), 3),
+        "encrypted" => {
+            #[cfg(feature = "encryption")]
+            {
+                CompressedVfs::encrypted(temp_dir.path(), encryption_key)
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                return Err("Encryption not enabled".into());
+            }
+        }
+        "both" => {
+            #[cfg(feature = "encryption")]
+            {
+                CompressedVfs::compressed_encrypted(temp_dir.path(), 3, encryption_key)
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                return Err("Encryption not enabled".into());
+            }
+        }
+        _ => return Err(format!("Unknown mode: {}", mode).into()),
+    };
+
+    register(&vfs_name, vfs)?;
+
+    // Create database and insert corpus
+    let setup_start = Instant::now();
+    let db_path = temp_dir.path().join("bench.db");
+    let conn = Connection::open_with_flags_and_vfs(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        &vfs_name,
+    )?;
+
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", [])?;
+
+    // Bulk insert corpus
+    conn.execute("BEGIN", [])?;
+    for (author, title, body) in corpus {
+        conn.execute(
+            "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
+            (author, title, body),
+        )?;
+    }
+    conn.execute("COMMIT", [])?;
+
+    // Checkpoint WAL to flush data to main database file
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let doc_count = corpus.len();
+    let setup_duration = setup_start.elapsed().as_secs_f64();
+
+    // Configure cache and mmap
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let logical_size_kb = (page_count * page_size) / 1024;
+
+    let cache_size_kb = if cache_kb_override > 0 {
+        cache_kb_override
+    } else {
+        (logical_size_kb as f64 * cache_percent) as i64
+    };
+    let mmap_size_kb = if mmap_kb_override > 0 {
+        mmap_kb_override
+    } else {
+        (cache_size_kb as f64 * mmap_multiplier) as i64
+    };
+
+    let file_size_mb = std::fs::metadata(&db_path)?.len() as f64 / (1024.0 * 1024.0);
+
+    conn.execute(&format!("PRAGMA cache_size = -{}", cache_size_kb), [])?;
+    conn.execute(&format!("PRAGMA mmap_size = {}", mmap_size_kb * 1024), [])?;
+
+    // Collect rowids for random access
+    let mut valid_ids: Vec<i64> = Vec::new();
+    let mut stmt = conn.prepare("SELECT rowid FROM articles")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    for row_result in rows {
+        valid_ids.push(row_result?);
+    }
+    drop(stmt);
+    drop(conn);
+
+    // Share state across threads
+    let valid_ids = Arc::new(valid_ids);
+    let db_path = Arc::new(db_path);
+    let vfs_name = Arc::new(vfs_name);
+
+    // Run readers and writers concurrently
+    use std::thread;
+
+    let db_path_readers = Arc::clone(&db_path);
+    let vfs_name_readers = Arc::clone(&vfs_name);
+    let valid_ids_readers = Arc::clone(&valid_ids);
+
+    let db_path_writers = Arc::clone(&db_path);
+    let vfs_name_writers = Arc::clone(&vfs_name);
+
+    let reader_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
+        bench_reads_concurrent(
+            &db_path_readers, &vfs_name_readers, duration_secs, reader_threads,
+            cache_size_kb, mmap_size_kb, &valid_ids_readers
+        ).map_err(|e| e.to_string())
+    });
+
+    let writer_handle = thread::spawn(move || -> Result<(usize, Vec<f64>), String> {
+        bench_writes_concurrent(&db_path_writers, &vfs_name_writers, duration_secs, writer_threads, wal_autocheckpoint)
+            .map_err(|e| e.to_string())
+    });
+
+    let (read_count, read_latencies) = reader_handle.join()
+        .map_err(|_| "Reader thread panicked".to_string())??;
+    let (write_count, write_latencies) = writer_handle.join()
+        .map_err(|_| "Writer thread panicked".to_string())??;
+
+    let read_ops_per_sec = read_count as f64 / read_latencies.iter().sum::<f64>() * 1_000_000.0;
+    let write_ops_per_sec = write_count as f64 / write_latencies.iter().sum::<f64>() * 1_000_000.0;
+
+    let read_p50 = percentile(&read_latencies, 0.5);
+    let read_p99 = percentile(&read_latencies, 0.99);
+    let write_p50 = percentile(&write_latencies, 0.5);
+    let write_p99 = percentile(&write_latencies, 0.99);
+
+    Ok(BenchmarkResult {
+        mode: mode.to_string(),
+        document_count: doc_count,
+        read_ops_per_sec,
+        read_p50_us: read_p50,
+        read_p99_us: read_p99,
+        write_ops_per_sec,
+        write_p50_us: write_p50,
+        write_p99_us: write_p99,
+        file_size_mb,
+        setup_duration_secs: setup_duration,
+        total_duration_secs: start_total.elapsed().as_secs_f64(),
+    })
 }
 
 fn bench_existing_db(
