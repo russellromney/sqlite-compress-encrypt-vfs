@@ -99,6 +99,26 @@ enum Commands {
         #[arg(long)]
         keep_compression: bool,
     },
+
+    /// Embed a compression dictionary into a database file
+    EmbedDict {
+        /// Path to database file
+        db: PathBuf,
+        /// Path to dictionary file
+        dict: PathBuf,
+        /// Create backup before modifying
+        #[arg(long, default_value = "true")]
+        backup: bool,
+    },
+
+    /// Extract embedded dictionary from a database file
+    ExtractDict {
+        /// Path to database file
+        db: PathBuf,
+        /// Output dictionary file (optional, defaults to <db>.dict)
+        #[arg(long)]
+        dict_out: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -131,6 +151,8 @@ fn main() -> Result<()> {
             password,
             keep_compression,
         } => cmd_decrypt(&db, &password, keep_compression),
+        Commands::EmbedDict { db, dict, backup } => cmd_embed_dict(&db, &dict, backup),
+        Commands::ExtractDict { db, dict_out } => cmd_extract_dict(&db, dict_out),
     }
 }
 
@@ -775,4 +797,125 @@ fn cmd_decrypt(db: &Path, password: &str, keep_compression: bool) -> Result<()> 
             Err(e)
         }
     }
+}
+
+/// Header size for SQLCEs format
+const HEADER_SIZE: u64 = 64;
+
+/// Embed a compression dictionary into a SQLCEs database file.
+///
+/// This modifies the file in-place by:
+/// 1. Reading the existing header and page data
+/// 2. Updating the header with new dict_size and data_start
+/// 3. Writing: header + dictionary + page data
+fn cmd_embed_dict(db: &Path, dict_path: &Path, backup: bool) -> Result<()> {
+    if !db.exists() {
+        bail!("Database file not found: {}", db.display());
+    }
+    if !dict_path.exists() {
+        bail!("Dictionary file not found: {}", dict_path.display());
+    }
+    if !is_sqlces_file(db)? {
+        bail!("Not a SQLCEs database (expected SQLCEvfS magic bytes)");
+    }
+
+    // Read dictionary
+    let dict_bytes = fs::read(dict_path).context("Failed to read dictionary file")?;
+    let dict_size = dict_bytes.len() as u32;
+
+    if dict_size == 0 {
+        bail!("Dictionary file is empty");
+    }
+
+    println!("Embedding dictionary ({} bytes) into {}", dict_size, db.display());
+
+    // Create backup if requested
+    if backup {
+        let backup_path = db.with_extension("db.backup");
+        fs::copy(db, &backup_path).context("Failed to create backup")?;
+        println!("Backup created: {}", backup_path.display());
+    }
+
+    // Read existing file
+    let mut file = File::open(db).context("Failed to open database")?;
+
+    // Read header
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).context("Failed to read header")?;
+
+    // Parse header fields
+    let old_data_start = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let old_dict_size = u32::from_le_bytes(header[20..24].try_into().unwrap());
+
+    // Read existing page data (everything after header + old dictionary)
+    file.seek(SeekFrom::Start(old_data_start))?;
+    let mut page_data = Vec::new();
+    file.read_to_end(&mut page_data)?;
+    drop(file);
+
+    // Calculate new data_start (header + new dictionary)
+    let new_data_start = HEADER_SIZE + dict_size as u64;
+
+    // Update header with new values
+    header[12..20].copy_from_slice(&new_data_start.to_le_bytes());
+    header[20..24].copy_from_slice(&dict_size.to_le_bytes());
+
+    // Write new file
+    let mut file = File::create(db).context("Failed to write database")?;
+    file.write_all(&header)?;
+    file.write_all(&dict_bytes)?;
+    file.write_all(&page_data)?;
+    file.sync_all()?;
+
+    println!("Dictionary embedded successfully");
+    if old_dict_size > 0 {
+        println!("  Replaced existing dictionary ({} bytes -> {} bytes)", old_dict_size, dict_size);
+    } else {
+        println!("  Added new dictionary ({} bytes)", dict_size);
+    }
+    println!("  Data start: {} -> {}", old_data_start, new_data_start);
+
+    Ok(())
+}
+
+/// Extract embedded dictionary from a SQLCEs database file.
+fn cmd_extract_dict(db: &Path, dict_out: Option<PathBuf>) -> Result<()> {
+    if !db.exists() {
+        bail!("Database file not found: {}", db.display());
+    }
+    if !is_sqlces_file(db)? {
+        bail!("Not a SQLCEs database (expected SQLCEvfS magic bytes)");
+    }
+
+    // Read header
+    let mut file = File::open(db).context("Failed to open database")?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).context("Failed to read header")?;
+
+    // Parse dict_size
+    let dict_size = u32::from_le_bytes(header[20..24].try_into().unwrap());
+
+    if dict_size == 0 {
+        bail!("Database does not contain an embedded dictionary");
+    }
+
+    // Read dictionary bytes (immediately after header)
+    let mut dict_bytes = vec![0u8; dict_size as usize];
+    file.read_exact(&mut dict_bytes).context("Failed to read dictionary")?;
+
+    // Determine output path
+    let out_path = dict_out.unwrap_or_else(|| {
+        let mut p = db.to_path_buf();
+        p.set_extension("dict");
+        p
+    });
+
+    // Write dictionary
+    fs::write(&out_path, &dict_bytes).context("Failed to write dictionary file")?;
+
+    println!("Dictionary extracted successfully");
+    println!("  Size: {} bytes", dict_size);
+    println!("  Output: {}", out_path.display());
+
+    Ok(())
 }

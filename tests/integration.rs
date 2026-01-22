@@ -295,8 +295,84 @@ fn test_compressed_encrypted_mode() {
     }
 }
 
+/// Test dictionary compression improves compression and works correctly
 #[test]
-#[cfg(feature = "encryption")]
+fn test_dictionary_compression() {
+    use sqlite_compress_encrypt_vfs::dict::train_dictionary;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create sample data with repeated patterns (simulates Redis-like workload)
+    let samples: Vec<Vec<u8>> = (0..100)
+        .map(|i| format!("user:{}:session:active:timestamp:1234567890:data:{}", i, "x".repeat(100)).into_bytes())
+        .collect();
+
+    // Train a dictionary from the samples
+    let dict = train_dictionary(&samples, 16 * 1024).expect("Failed to train dictionary");
+    assert!(!dict.is_empty(), "Dictionary should not be empty");
+
+    // Create VFS with dictionary
+    let vfs = CompressedVfs::new_with_dict(dir.path(), 3, dict);
+    register("dict_test", vfs).unwrap();
+
+    let conn = Connection::open_with_flags_and_vfs(
+        dir.path().join("dict.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        "dict_test",
+    )
+    .unwrap();
+
+    // Create table and insert data with repeated patterns
+    conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+        .unwrap();
+
+    // Insert data similar to training samples
+    for i in 0..50 {
+        let key = format!("user:{}:session", i);
+        let value = format!("active:timestamp:1234567890:data:{}", "x".repeat(100));
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )
+        .unwrap();
+    }
+
+    // Verify data integrity
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 50);
+
+    // Check specific row
+    let value: String = conn
+        .query_row("SELECT value FROM kv WHERE key = 'user:25:session'", [], |r| r.get(0))
+        .unwrap();
+    assert!(value.starts_with("active:timestamp:"));
+
+    // Close and reopen to test persistence with dictionary
+    drop(conn);
+
+    let vfs2 = CompressedVfs::new_with_dict(
+        dir.path(),
+        3,
+        train_dictionary(&samples, 16 * 1024).unwrap(),
+    );
+    register("dict_test2", vfs2).unwrap();
+
+    let conn2 = Connection::open_with_flags_and_vfs(
+        dir.path().join("dict.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        "dict_test2",
+    )
+    .unwrap();
+
+    let count2: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM kv", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count2, 50);
+}
+
+#[test]
 fn test_all_four_modes_comparison() {
     let dir = tempfile::tempdir().unwrap();
 

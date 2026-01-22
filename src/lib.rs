@@ -319,9 +319,15 @@ pub struct CompressedHandle {
     /// Atomic write position for lock-free space reservation in compressed mode
     /// This allows writers to reserve space without blocking readers
     write_end: AtomicU64,
-    /// Compression dictionary (loaded from file or provided at creation)
+    /// Compression dictionary bytes (loaded from file or provided at creation)
     #[cfg(feature = "zstd")]
     dictionary: Option<Vec<u8>>,
+    /// Pre-compiled encoder dictionary for fast compression
+    #[cfg(feature = "zstd")]
+    encoder_dict: Option<EncoderDictionary<'static>>,
+    /// Pre-compiled decoder dictionary for fast decompression
+    #[cfg(feature = "zstd")]
+    decoder_dict: Option<DecoderDictionary<'static>>,
 }
 
 impl CompressedHandle {
@@ -330,6 +336,7 @@ impl CompressedHandle {
     /// - `compress`: whether to compress pages (false = store uncompressed)
     /// - `encrypt`: whether to encrypt pages (requires encryption feature)
     /// - `password`: encryption password (required if encrypt=true)
+    /// - `provided_dict`: optional pre-trained compression dictionary
     fn new(
         mut file: File,
         db_path: PathBuf,
@@ -337,6 +344,8 @@ impl CompressedHandle {
         compress: bool,
         #[allow(unused_variables)] encrypt: bool,
         #[allow(unused_variables)] password: Option<&str>,
+        #[cfg(feature = "zstd")]
+        #[allow(unused_variables)] provided_dict: Option<&[u8]>,
     ) -> io::Result<Self> {
         // Derive encryption key if needed
         #[cfg(feature = "encryption")]
@@ -350,7 +359,26 @@ impl CompressedHandle {
         };
 
         // Load existing file or create new (may include embedded dictionary)
-        let (header, index, initial_write_end, dictionary) = Self::load_file(&mut file)?;
+        let (header, index, initial_write_end, file_dictionary) = Self::load_file(&mut file)?;
+
+        // Use provided dictionary if given, otherwise use one from file (if any)
+        #[cfg(feature = "zstd")]
+        let dictionary = provided_dict
+            .map(|d| d.to_vec())
+            .or(file_dictionary);
+
+        #[cfg(not(feature = "zstd"))]
+        let _ = file_dictionary; // Suppress unused warning
+
+        // Pre-compile dictionaries for faster compression/decompression
+        #[cfg(feature = "zstd")]
+        let (encoder_dict, decoder_dict) = match &dictionary {
+            Some(dict_bytes) => (
+                Some(EncoderDictionary::copy(dict_bytes, compression_level)),
+                Some(DecoderDictionary::copy(dict_bytes)),
+            ),
+            None => (None, None),
+        };
 
         Ok(Self {
             file: RwLock::new(file),
@@ -372,6 +400,10 @@ impl CompressedHandle {
             write_end: AtomicU64::new(initial_write_end),
             #[cfg(feature = "zstd")]
             dictionary,
+            #[cfg(feature = "zstd")]
+            encoder_dict,
+            #[cfg(feature = "zstd")]
+            decoder_dict,
         })
     }
 
@@ -401,19 +433,41 @@ impl CompressedHandle {
             write_end: AtomicU64::new(0), // Not used in passthrough mode
             #[cfg(feature = "zstd")]
             dictionary: None,
+            #[cfg(feature = "zstd")]
+            encoder_dict: None,
+            #[cfg(feature = "zstd")]
+            decoder_dict: None,
         }
     }
 
     /// Create compressed handle (for tests)
     #[cfg(test)]
     fn new_compressed(file: File, compression_level: i32, compress: bool) -> io::Result<Self> {
-        Self::new(file, PathBuf::new(), compression_level, compress, false, None)
+        Self::new(
+            file,
+            PathBuf::new(),
+            compression_level,
+            compress,
+            false,
+            None,
+            #[cfg(feature = "zstd")]
+            None,
+        )
     }
 
     /// Create encrypted handle (for tests)
     #[cfg(all(test, feature = "encryption"))]
     fn new_encrypted(file: File, compression_level: i32, compress: bool, password: &str) -> io::Result<Self> {
-        Self::new(file, PathBuf::new(), compression_level, compress, true, Some(password))
+        Self::new(
+            file,
+            PathBuf::new(),
+            compression_level,
+            compress,
+            true,
+            Some(password),
+            #[cfg(feature = "zstd")]
+            None,
+        )
     }
 
     /// Load file header, dictionary (if present), and build index by scanning
@@ -472,13 +526,35 @@ impl CompressedHandle {
     // ===== ZSTD Compression =====
     #[cfg(feature = "zstd")]
     fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        encode_all(data, self.compression_level)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        use std::io::Write;
+
+        // Use pre-compiled dictionary if available for better compression
+        if let Some(ref encoder_dict) = self.encoder_dict {
+            let mut encoder = zstd::stream::Encoder::with_prepared_dictionary(Vec::new(), encoder_dict)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            encoder.write_all(data)?;
+            encoder.finish()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        } else {
+            encode_all(data, self.compression_level)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        }
     }
 
     #[cfg(feature = "zstd")]
     fn decompress(&self, data: &[u8]) -> io::Result<Vec<u8>> {
-        decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        use std::io::Read;
+
+        // Use pre-compiled dictionary if available for faster decompression
+        if let Some(ref decoder_dict) = self.decoder_dict {
+            let mut decoder = zstd::stream::Decoder::with_prepared_dictionary(data, decoder_dict)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let mut output = Vec::new();
+            decoder.read_to_end(&mut output)?;
+            Ok(output)
+        } else {
+            decode_all(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        }
     }
 
     // ===== LZ4 Compression =====
@@ -1249,6 +1325,9 @@ pub struct CompressedVfs {
     /// Password for encryption
     #[cfg(feature = "encryption")]
     password: Option<String>,
+    /// Compression dictionary (for improved compression ratios)
+    #[cfg(feature = "zstd")]
+    dictionary: Option<Vec<u8>>,
 }
 
 impl CompressedVfs {
@@ -1261,6 +1340,54 @@ impl CompressedVfs {
             encrypt: false,
             #[cfg(feature = "encryption")]
             password: None,
+            #[cfg(feature = "zstd")]
+            dictionary: None,
+        }
+    }
+
+    /// Create a new compressed VFS with a pre-trained dictionary.
+    ///
+    /// Dictionary compression typically improves compression ratios by 2-5x
+    /// for structured data with repeated patterns (like Redis workloads).
+    ///
+    /// # Example
+    /// ```ignore
+    /// use sqlite_compress_encrypt_vfs::{CompressedVfs, dict::train_from_database};
+    ///
+    /// // Train a dictionary from existing data
+    /// let dict = train_from_database("sample.db", 100 * 1024)?;
+    ///
+    /// // Create VFS with dictionary
+    /// let vfs = CompressedVfs::new_with_dict("./db", 3, dict);
+    /// ```
+    #[cfg(feature = "zstd")]
+    pub fn new_with_dict<P: AsRef<Path>>(base_dir: P, compression_level: i32, dictionary: Vec<u8>) -> Self {
+        Self {
+            base_dir: base_dir.as_ref().to_path_buf(),
+            compression_level: compression_level.clamp(1, 22),
+            compress: true,
+            encrypt: false,
+            #[cfg(feature = "encryption")]
+            password: None,
+            dictionary: Some(dictionary),
+        }
+    }
+
+    /// Create a compressed and encrypted VFS with a pre-trained dictionary.
+    #[cfg(all(feature = "zstd", feature = "encryption"))]
+    pub fn compressed_encrypted_with_dict<P: AsRef<Path>>(
+        base_dir: P,
+        compression_level: i32,
+        password: &str,
+        dictionary: Vec<u8>,
+    ) -> Self {
+        Self {
+            base_dir: base_dir.as_ref().to_path_buf(),
+            compression_level: compression_level.clamp(1, 22),
+            compress: true,
+            encrypt: true,
+            password: Some(password.to_string()),
+            dictionary: Some(dictionary),
         }
     }
 
@@ -1276,6 +1403,8 @@ impl CompressedVfs {
             encrypt: false,
             #[cfg(feature = "encryption")]
             password: None,
+            #[cfg(feature = "zstd")]
+            dictionary: None,
         }
     }
 
@@ -1291,6 +1420,8 @@ impl CompressedVfs {
             compress: false,
             encrypt: true,
             password: Some(password.to_string()),
+            #[cfg(feature = "zstd")]
+            dictionary: None,
         }
     }
 
@@ -1306,6 +1437,8 @@ impl CompressedVfs {
             compress: true,
             encrypt: true,
             password: Some(password.to_string()),
+            #[cfg(feature = "zstd")]
+            dictionary: None,
         }
     }
 }
@@ -1355,6 +1488,8 @@ impl Vfs for CompressedVfs {
                 use_compression,
                 use_encryption,
                 password,
+                #[cfg(feature = "zstd")]
+                self.dictionary.as_deref(),
             )
         } else if use_encryption {
             // WAL with encryption but no compression - use passthrough with in-place encryption
