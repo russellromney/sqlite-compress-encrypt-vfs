@@ -35,7 +35,7 @@
 
 pub mod dict;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenKind, OpenOptions, Vfs};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions as FsOpenOptions};
@@ -43,7 +43,24 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Global cache of shared file state (index, header, write_end) per database path.
+/// All handles to the same file share one index to avoid duplicate memory and scans.
+static SHARED_FILE_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, Arc<SharedFileState>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Invalidate cached state for a file. Call this after modifying a database
+/// file externally (e.g., after compact()).
+fn invalidate_cache<P: AsRef<Path>>(path: P) {
+    let path = path.as_ref();
+    if let Ok(canonical) = path.canonicalize() {
+        SHARED_FILE_CACHE.lock().remove(&canonical);
+    }
+    // Also try the raw path in case canonicalize failed during original caching
+    SHARED_FILE_CACHE.lock().remove(&path.to_path_buf());
+}
 
 // SQLite main database lock byte offsets (from sqlite3.c)
 // These are at the 1GB mark to not interfere with actual data
@@ -293,11 +310,33 @@ impl PageIndex {
     }
 }
 
+/// Shared file state across all handles to the same database file.
+/// Contains the page index, header, and write position - the expensive parts to rebuild.
+pub struct SharedFileState {
+    /// File header with page size, data start, etc.
+    header: RwLock<FileHeader>,
+    /// Page index: maps page number to (offset, size)
+    index: RwLock<PageIndex>,
+    /// Current write position (end of data)
+    write_end: AtomicU64,
+}
+
+impl SharedFileState {
+    fn new(header: FileHeader, index: PageIndex, write_end: u64) -> Self {
+        Self {
+            header: RwLock::new(header),
+            index: RwLock::new(index),
+            write_end: AtomicU64::new(write_end),
+        }
+    }
+}
+
 /// Compressed database file handle
 pub struct CompressedHandle {
     file: RwLock<File>,
-    header: RwLock<FileHeader>,
-    index: RwLock<PageIndex>,
+    /// Shared state (index, header, write_end) - shared across all handles to same file.
+    /// None for passthrough/auxiliary files that don't use VFS format.
+    shared_state: Option<Arc<SharedFileState>>,
     lock: RwLock<LockKind>,
     compression_level: i32,
     /// Whether this is a main database (uses VFS format) or auxiliary file (passthrough)
@@ -319,9 +358,6 @@ pub struct CompressedHandle {
     /// - "pending": exclusive lock on PENDING_BYTE
     /// - "exclusive": exclusive lock on entire SHARED range
     active_db_locks: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
-    /// Atomic write position for lock-free space reservation in compressed mode
-    /// This allows writers to reserve space without blocking readers
-    write_end: AtomicU64,
     /// Compression dictionary bytes (loaded from file or provided at creation)
     /// Kept for potential inspection; actual compression uses pre-compiled encoder/decoder dicts
     #[cfg(feature = "zstd")]
@@ -363,17 +399,47 @@ impl CompressedHandle {
             None
         };
 
-        // Load existing file or create new (may include embedded dictionary)
-        let (header, index, initial_write_end, file_dictionary) = Self::load_file(&mut file)?;
+        // Check if we have shared state for this file in the cache
+        // Skip caching for anonymous files (empty path - used in tests)
+        let shared_state = if db_path.as_os_str().is_empty() {
+            // Anonymous file - always create fresh state, no caching
+            let (header, index, initial_write_end, _file_dictionary) = Self::load_file(&mut file)?;
+            Arc::new(SharedFileState::new(header, index, initial_write_end))
+        } else {
+            let canonical_path = db_path.canonicalize().unwrap_or_else(|_| db_path.clone());
+            let mut cache = SHARED_FILE_CACHE.lock();
+            if let Some(existing) = cache.get(&canonical_path) {
+                // Reuse existing shared state - no scan needed!
+                Arc::clone(existing)
+            } else {
+                // First open of this file - scan and create shared state
+                let (header, index, initial_write_end, _file_dictionary) = Self::load_file(&mut file)?;
+
+                let state = Arc::new(SharedFileState::new(header, index, initial_write_end));
+                cache.insert(canonical_path.clone(), Arc::clone(&state));
+                state
+            }
+        };
+
+        // Load dictionary from file if needed (only on first open, but we need it for compression)
+        #[cfg(feature = "zstd")]
+        let file_dictionary = {
+            let header = shared_state.header.read();
+            if header.dict_size > 0 {
+                let mut dict_bytes = vec![0u8; header.dict_size as usize];
+                use std::os::unix::fs::FileExt;
+                file.read_exact_at(&mut dict_bytes, HEADER_SIZE)?;
+                Some(dict_bytes)
+            } else {
+                None
+            }
+        };
 
         // Use provided dictionary if given, otherwise use one from file (if any)
         #[cfg(feature = "zstd")]
         let dictionary = provided_dict
             .map(|d| d.to_vec())
             .or(file_dictionary);
-
-        #[cfg(not(feature = "zstd"))]
-        let _ = file_dictionary; // Suppress unused warning
 
         // Pre-compile dictionaries for faster compression/decompression
         #[cfg(feature = "zstd")]
@@ -387,8 +453,7 @@ impl CompressedHandle {
 
         Ok(Self {
             file: RwLock::new(file),
-            header: RwLock::new(header),
-            index: RwLock::new(index),
+            shared_state: Some(shared_state),
             lock: RwLock::new(LockKind::None),
             compression_level,
             compressed: true,
@@ -402,7 +467,6 @@ impl CompressedHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
-            write_end: AtomicU64::new(initial_write_end),
             #[cfg(feature = "zstd")]
             dictionary,
             #[cfg(feature = "zstd")]
@@ -423,8 +487,7 @@ impl CompressedHandle {
     ) -> Self {
         Self {
             file: RwLock::new(file),
-            header: RwLock::new(FileHeader::new()),
-            index: RwLock::new(PageIndex::new()),
+            shared_state: None, // Passthrough files don't use shared index
             lock: RwLock::new(LockKind::None),
             compression_level: 0,
             compressed: false,
@@ -435,7 +498,6 @@ impl CompressedHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
-            write_end: AtomicU64::new(0), // Not used in passthrough mode
             #[cfg(feature = "zstd")]
             dictionary: None,
             #[cfg(feature = "zstd")]
@@ -458,6 +520,12 @@ impl CompressedHandle {
             #[cfg(feature = "zstd")]
             None,
         )
+    }
+
+    /// Get shared state (panics if called on passthrough handle)
+    #[inline]
+    fn shared(&self) -> &SharedFileState {
+        self.shared_state.as_ref().expect("shared_state required for compressed mode")
     }
 
     /// Create encrypted handle (for tests)
@@ -887,8 +955,8 @@ impl DatabaseHandle for CompressedHandle {
 
         // Return logical size (uncompressed)
         // Use (max_page + 1) * page_size to account for gaps like SQLite's lock page
-        let header = self.header.read();
-        let index = self.index.read();
+        let header = self.shared().header.read();
+        let index = self.shared().index.read();
         if header.page_size > 0 && !index.entries.is_empty() {
             Ok((index.max_page + 1) * header.page_size as u64)
         } else {
@@ -916,7 +984,7 @@ impl DatabaseHandle for CompressedHandle {
             return file.read_exact_at(buf, offset);
         }
 
-        let header = self.header.read();
+        let header = self.shared().header.read();
         let page_size = if header.page_size > 0 {
             header.page_size as usize
         } else {
@@ -926,7 +994,7 @@ impl DatabaseHandle for CompressedHandle {
 
         let page_num = offset / page_size as u64;
 
-        let index = self.index.read();
+        let index = self.shared().index.read();
         if let Some(&(file_offset, compressed_size)) = index.entries.get(&page_num) {
             drop(index);
 
@@ -986,7 +1054,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Set page size from first write (brief lock)
         {
-            let mut header = self.header.write();
+            let mut header = self.shared().header.write();
             if header.page_size == 0 {
                 header.page_size = buf.len() as u32;
             }
@@ -994,7 +1062,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Read page_size (brief read lock)
         let page_size = {
-            let header = self.header.read();
+            let header = self.shared().header.read();
             header.page_size as u64
         };
 
@@ -1022,7 +1090,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // ATOMIC SPACE RESERVATION: Reserve space without blocking readers
         // fetch_add returns the OLD value, which is our record offset
-        let record_offset = self.write_end.fetch_add(record_size, Ordering::SeqCst);
+        let record_offset = self.shared().write_end.fetch_add(record_size, Ordering::SeqCst);
         let data_offset = record_offset + RECORD_HEADER_SIZE;
 
         // FILE I/O WITHOUT LOCKS: pwrite is thread-safe
@@ -1042,7 +1110,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // BRIEF INDEX UPDATE: Only lock for HashMap insertion
         {
-            let mut index = self.index.write();
+            let mut index = self.shared().index.write();
             index.entries.insert(page_num, (data_offset, data_size));
             if page_num > index.max_page {
                 index.max_page = page_num;
@@ -1063,7 +1131,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Read header fields
         let (page_size, data_start, dict_size, flags) = {
-            let header = self.header.read();
+            let header = self.shared().header.read();
             (header.page_size, header.data_start, header.dict_size, header.flags)
         };
 
@@ -1090,7 +1158,7 @@ impl DatabaseHandle for CompressedHandle {
         // For compressed files, we update the in-memory index
         // Note: truncated pages become "dead" records in the file
         // They will be cleaned up on compaction
-        let header = self.header.read();
+        let header = self.shared().header.read();
         if header.page_size == 0 {
             return Ok(());
         }
@@ -1099,7 +1167,7 @@ impl DatabaseHandle for CompressedHandle {
 
         let max_page = if size == 0 { 0 } else { (size - 1) / page_size };
 
-        let mut index = self.index.write();
+        let mut index = self.shared().index.write();
         index.entries.retain(|&page_num, _| page_num <= max_page);
 
         Ok(())
@@ -1834,6 +1902,9 @@ pub fn compact<P: AsRef<Path>>(path: P) -> io::Result<u64> {
     // Atomic replace
     std::fs::rename(&temp_path, path)?;
 
+    // Invalidate cached state since file was rewritten
+    invalidate_cache(path);
+
     let new_size = std::fs::metadata(path)?.len();
     let freed = original_size.saturating_sub(new_size);
     Ok(freed)
@@ -2100,6 +2171,9 @@ pub fn compact_with_recompression<P: AsRef<Path>>(path: P, config: CompactionCon
 
     // Atomic replace
     std::fs::rename(&temp_path, path)?;
+
+    // Invalidate cached state since file was rewritten
+    invalidate_cache(path);
 
     let new_size = std::fs::metadata(path)?.len();
     let freed = original_size.saturating_sub(new_size);

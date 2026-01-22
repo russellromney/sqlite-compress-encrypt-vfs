@@ -27,6 +27,7 @@ thiserror = "1"
 parking_lot = "0.12"
 fs2 = "0.4"
 file-guard = "0.2"
+once_cell = "1"
 
 # Encryption (optional)
 aes-gcm = { version = "0.10", optional = true }
