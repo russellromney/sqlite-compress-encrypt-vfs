@@ -3,7 +3,7 @@
 //! Commands:
 //! - info: Show database statistics (pages, dead space, compression ratio)
 //! - compact: Remove dead space from database
-//! - retrain: Train compression dictionary and recompress
+//! - train: Train compression dictionary from database
 //! - convert: Convert between plain SQLite and compressed formats
 //! - encrypt: Add encryption to existing database
 //! - decrypt: Remove encryption from database
@@ -45,8 +45,8 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Train dictionary on database and recompress
-    Retrain {
+    /// Train compression dictionary from database
+    Train {
         /// Path to database file
         db: PathBuf,
         /// Dictionary size in KB (default: 100)
@@ -107,12 +107,12 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Info { db, json } => cmd_info(&db, json),
         Commands::Compact { db, verbose } => cmd_compact(&db, verbose),
-        Commands::Retrain {
+        Commands::Train {
             db,
             dict_size,
             dict_out,
             level,
-        } => cmd_retrain(&db, dict_size, dict_out, level),
+        } => cmd_train(&db, dict_size, dict_out, level),
         Commands::Convert {
             src,
             dst,
@@ -141,7 +141,7 @@ fn is_sqlces_file(path: &Path) -> Result<bool> {
     if file.read_exact(&mut magic).is_err() {
         return Ok(false);
     }
-    Ok(&magic == b"SQLCEvf2" || &magic == b"SQLCEvfS")
+    Ok(&magic == b"SQLCEvfS")
 }
 
 /// Detect if a file is a plain SQLite database
@@ -182,7 +182,6 @@ fn cmd_info(db: &Path, json: bool) -> Result<()> {
         if json {
             let output = serde_json::json!({
                 "format": "sqlces",
-                "version": stats.version,
                 "page_size": stats.page_size,
                 "page_count": stats.page_count,
                 "total_records": stats.total_records,
@@ -196,7 +195,6 @@ fn cmd_info(db: &Path, json: bool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!("SQLCEs Database: {}", db.display());
-            println!("  Format version:    v{}", stats.version);
             println!("  Page size:         {} bytes", stats.page_size);
             println!("  Pages:             {}", stats.page_count);
             println!("  Total records:     {} (includes superseded)", stats.total_records);
@@ -274,7 +272,7 @@ fn cmd_compact(db: &Path, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_retrain(db: &Path, dict_size_kb: usize, dict_out: Option<PathBuf>, level: i32) -> Result<()> {
+fn cmd_train(db: &Path, dict_size_kb: usize, dict_out: Option<PathBuf>, level: i32) -> Result<()> {
     use sqlite_compress_encrypt_vfs::dict;
 
     if !db.exists() {
@@ -398,7 +396,7 @@ fn extract_samples_from_sqlces(db: &Path) -> Result<Vec<Vec<u8>>> {
 
     // Create temp directory
     let temp_dir = tempfile::tempdir()?;
-    let vfs_name = format!("sqlces_retrain_{}", std::process::id());
+    let vfs_name = format!("sqlces_train_{}", std::process::id());
 
     // Copy the file to temp location for VFS access
     let temp_db = temp_dir.path().join("src.db");

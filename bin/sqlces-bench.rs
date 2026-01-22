@@ -334,12 +334,6 @@ fn bench_existing_db(
 
     conn.execute(&format!("PRAGMA cache_size = -{}", cache_size_kb), [])?;
     conn.execute(&format!("PRAGMA mmap_size = {}", mmap_size_kb * 1024), [])?;
-    eprintln!("DEBUG [{}]: Logical: {:.2} MB, File: {:.2} MB, Cache: {} KB ({} pages), mmap: {} KB",
-              mode,
-              logical_size_kb as f64 / 1024.0,
-              file_size_mb,
-              cache_size_kb, cache_size_kb / 4,
-              mmap_size_kb);
 
     // Collect all existing rowids for random access
     let mut valid_ids: Vec<i64> = Vec::new();
@@ -350,9 +344,6 @@ fn bench_existing_db(
     }
     drop(stmt);
     drop(conn);
-
-    eprintln!("DEBUG [{}]: Collected {} rowids, db_path={:?}, db_exists={}",
-              mode, valid_ids.len(), db_path, db_path.exists());
 
     // Share valid_ids across threads
     let valid_ids = Arc::new(valid_ids);
@@ -513,30 +504,10 @@ fn bench_reads_concurrent(
                 &*vfs_name,
             ).map_err(|e| e.to_string())?;
 
-            // Debug: check if table has data
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM articles", [], |r| r.get(0))
-                .map_err(|e| format!("Count query failed: {}", e))?;
-            let max_rowid: i64 = conn.query_row("SELECT MAX(rowid) FROM articles", [], |r| r.get(0))
-                .map_err(|e| format!("Max rowid query failed: {}", e))?;
-            let min_rowid: i64 = conn.query_row("SELECT MIN(rowid) FROM articles", [], |r| r.get(0))
-                .map_err(|e| format!("Min rowid query failed: {}", e))?;
-            // Check if various rowids exist
-            let low_exists: i64 = conn.query_row("SELECT COUNT(*) FROM articles WHERE rowid = 100", [], |r| r.get(0)).unwrap_or(-1);
-            let high_exists: i64 = conn.query_row("SELECT COUNT(*) FROM articles WHERE rowid = 14000", [], |r| r.get(0)).unwrap_or(-1);
-            // Try actually selecting from high rowid
-            let high_select = conn.query_row("SELECT rowid FROM articles WHERE rowid = 14000", [], |r| r.get::<_, i64>(0));
-            if thread_id == 0 {
-                eprintln!("Reader thread {}: count={}, range={}-{}, low(100)={}, high(14000)={}, high_select={:?}",
-                          thread_id, count, min_rowid, max_rowid, low_exists, high_exists, high_select);
-            }
-            if count == 0 {
-                return Err(format!("Reader thread {}: Table is empty!", thread_id));
-            }
-
-            // Configure cache for this connection (disable mmap for debugging)
+            // Configure cache for this connection
             conn.execute(&format!("PRAGMA cache_size = -{}", cache_size_kb), [])
                 .map_err(|e| e.to_string())?;
-            conn.execute("PRAGMA mmap_size = 0", [])
+            conn.execute(&format!("PRAGMA mmap_size = {}", mmap_size_kb * 1024), [])
                 .map_err(|e| e.to_string())?;
 
             let mut latencies = Vec::new();
@@ -558,24 +529,16 @@ fn bench_reads_concurrent(
 
                 let start = Instant::now();
 
-                // First try just selecting rowid to see if that works
-                let found_rowid: i64 = conn.query_row(
-                    "SELECT rowid FROM articles WHERE rowid = ?",
-                    [rowid],
-                    |row| row.get(0),
-                ).map_err(|e| format!("Thread {}: SELECT rowid {} failed: {}", thread_id, rowid, e))?;
-
-                // Then try getting the actual data
                 conn.query_row(
                     "SELECT author, title, body FROM articles WHERE rowid = ?",
-                    [found_rowid],
+                    [rowid],
                     |row| {
                         let _author: String = row.get(0)?;
                         let _title: String = row.get(1)?;
                         let _body: String = row.get(2)?;
                         Ok(())
                     },
-                ).map_err(|e| format!("Thread {}: SELECT data for rowid {} failed: {}", thread_id, rowid, e))?;
+                ).map_err(|e| format!("Thread {}: SELECT rowid {} failed: {}", thread_id, rowid, e))?;
 
                 latencies.push(start.elapsed().as_micros() as f64);
                 i += 1;

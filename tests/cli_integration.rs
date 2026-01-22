@@ -56,7 +56,6 @@ fn test_inspect_database_valid() {
 
     let stats = inspect_database(&db_path).expect("inspect_database should succeed");
 
-    assert_eq!(stats.version, 2, "Should be v2 format");
     assert_eq!(stats.page_size, 4096, "Default page size should be 4096");
     assert!(stats.page_count > 0, "Should have pages");
     assert!(stats.file_size > 0, "File should have size");
@@ -399,7 +398,6 @@ mod encryption_tests {
 
         // inspect_database works on the raw file format
         let stats = inspect_database(&db_path).expect("Should be able to inspect encrypted db");
-        assert_eq!(stats.version, 2);
         assert!(stats.page_count > 0);
     }
 

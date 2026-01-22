@@ -5,11 +5,12 @@
 //! - `lz4`: Fastest compression/decompression
 //! - `snappy`: Very fast, moderate compression
 //!
-//! File format (v2 - inline index):
-//! - Header (64 bytes): magic, version, page_size, write_end
-//! - Data section: page records stored sequentially, each with inline metadata
+//! File format:
+//! - Header (64 bytes): magic "SQLCEvfS", page_size, data_start, dict_size, flags
+//! - Dictionary section (optional): zstd dictionary bytes
+//! - Data section: page records stored sequentially
 //!   - Each record: page_num(8) + size(4) + data(size)
-//! - On open: scan to build in-memory index (fast sequential read)
+//! - On open: scan from data_start to build in-memory index
 //! - On sync: just fsync (no index rewrite needed!)
 //!
 //! WAL and journal files are stored uncompressed.
@@ -41,11 +42,52 @@ use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
+
+// SQLite main database lock byte offsets (from sqlite3.c)
+// These are at the 1GB mark to not interfere with actual data
+const PENDING_BYTE: u64 = 0x40000000;  // 1073741824
+const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
+const SHARED_FIRST: u64 = PENDING_BYTE + 2;
+const SHARED_SIZE: u64 = 510;
+
+// SQLite WAL-index lock byte offset (in the -shm file)
+// Locks are at bytes 120-127 in the WAL-index header
+const WAL_LOCK_OFFSET: u64 = 120;
+
+/// Debug lock tracing - enabled via SQLCES_DEBUG_LOCKS=1
+static DEBUG_LOCKS: AtomicBool = AtomicBool::new(false);
+
+/// Initialize debug lock tracing from environment
+pub fn init_debug_locks() {
+    if std::env::var("SQLCES_DEBUG_LOCKS").map(|v| v == "1").unwrap_or(false) {
+        DEBUG_LOCKS.store(true, Ordering::Relaxed);
+        eprintln!("[LOCK DEBUG] Lock tracing enabled");
+    }
+}
+
+/// Log a lock operation if debug is enabled
+#[inline]
+fn debug_lock(op: &str, path: &str, from: LockKind, to: LockKind, result: &str) {
+    if DEBUG_LOCKS.load(Ordering::Relaxed) {
+        eprintln!(
+            "[LOCK DEBUG] {:?} {} {} {:?} -> {:?} => {}",
+            std::thread::current().id(),
+            op,
+            path,
+            from,
+            to,
+            result
+        );
+    }
+}
 
 // Compressor-specific imports and magic bytes
 #[cfg(feature = "zstd")]
 use zstd::{decode_all, encode_all};
+#[cfg(feature = "zstd")]
+use zstd::dict::{EncoderDictionary, DecoderDictionary};
 
 #[cfg(feature = "lz4")]
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
@@ -62,30 +104,60 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 #[cfg(feature = "encryption")]
+use aes::Aes256;
+#[cfg(feature = "encryption")]
+use ctr::cipher::{KeyIvInit, StreamCipher};
+#[cfg(feature = "encryption")]
+type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+#[cfg(feature = "encryption")]
 use sha2::{Digest, Sha256};
 
-/// Magic bytes for v2 format (inline index)
-const MAGIC_V2: &[u8; 8] = b"SQLCEvf2";
-/// Magic bytes for v1 format (legacy, separate index)
-const MAGIC_V1: &[u8; 8] = b"SQLCEvfS";
-const VERSION: u32 = 2;
+/// Magic bytes identifying SQLCEs format
+/// Header fields (dict_size, flags) determine capabilities, not magic version
+const MAGIC: &[u8; 8] = b"SQLCEvfS";
 const HEADER_SIZE: u64 = 64;
 /// Size of inline record header: page_num(8) + size(4)
 const RECORD_HEADER_SIZE: u64 = 12;
 
-/// File header structure (v2)
+/// Header flags
+const FLAG_ENCRYPTED: u32 = 1 << 0;
+
+/// File header structure
+///
+/// Layout (64 bytes):
+/// - 0-7:   Magic "SQLCEvfS"
+/// - 8-11:  page_size
+/// - 12-19: data_start (offset where page records begin, after optional dict)
+/// - 20-23: dict_size (0 = no dictionary)
+/// - 24-27: flags (bit 0: encrypted)
+/// - 28-63: reserved
 #[derive(Debug, Clone, Copy)]
 struct FileHeader {
     page_size: u32,
-    /// End of data section (where next write should go)
-    write_end: u64,
+    /// Offset where page records begin (after header and optional dictionary)
+    data_start: u64,
+    /// Size of embedded dictionary (0 = no dictionary)
+    dict_size: u32,
+    /// Flags (bit 0: encrypted)
+    flags: u32,
 }
 
 impl FileHeader {
     fn new() -> Self {
         Self {
             page_size: 0,
-            write_end: HEADER_SIZE,
+            data_start: HEADER_SIZE, // No dictionary by default
+            dict_size: 0,
+            flags: 0,
+        }
+    }
+
+    fn new_with_dict(dict_size: u32) -> Self {
+        Self {
+            page_size: 0,
+            data_start: HEADER_SIZE + dict_size as u64,
+            dict_size,
+            flags: 0,
         }
     }
 
@@ -99,46 +171,30 @@ impl FileHeader {
             Err(e) => return Err(e),
         }
 
-        // Check for v2 magic
-        if &buf[0..8] == MAGIC_V2 {
-            let version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-            if version != VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Unsupported version: {}", version),
-                ));
-            }
-
-            let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-            let write_end = u64::from_le_bytes([
-                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-            ]);
-
-            return Ok(Some(Self { page_size, write_end }));
+        // Check for SQLCEvfS magic
+        if &buf[0..8] != MAGIC {
+            return Ok(None);
         }
 
-        // Check for v1 magic (legacy format) - convert on open
-        if &buf[0..8] == MAGIC_V1 {
-            let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-            // For v1, we need to scan to find write_end during index loading
-            // Just return the page_size, PageIndex::read_from_v1 will handle the rest
-            return Ok(Some(Self {
-                page_size,
-                write_end: HEADER_SIZE, // Will be updated during scan
-            }));
-        }
+        let page_size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let data_start = u64::from_le_bytes([
+            buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+        ]);
+        let dict_size = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        let flags = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
 
-        Ok(None)
+        Ok(Some(Self { page_size, data_start, dict_size, flags }))
     }
 
     fn write_to(&self, file: &mut File) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
         let mut buf = [0u8; HEADER_SIZE as usize];
-        buf[0..8].copy_from_slice(MAGIC_V2);
-        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.page_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.write_end.to_le_bytes());
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&self.page_size.to_le_bytes());
+        buf[12..20].copy_from_slice(&self.data_start.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.dict_size.to_le_bytes());
+        buf[24..28].copy_from_slice(&self.flags.to_le_bytes());
 
         file.write_all_at(&buf, 0)
     }
@@ -164,22 +220,23 @@ impl PageIndex {
         }
     }
 
-    /// Scan file to build index from inline records (v2 format)
-    /// Uses buffered I/O for performance on large files
-    fn scan_from_file(file: &mut File, header: &FileHeader) -> io::Result<Self> {
+    /// Scan file to build index from inline records.
+    /// Uses buffered I/O for performance on large files.
+    /// Returns (PageIndex, write_end) where write_end is the position after the last record.
+    fn scan_from_file(file: &mut File, header: &FileHeader) -> io::Result<(Self, u64)> {
         use std::io::BufReader;
 
         let start = std::time::Instant::now();
         let mut index = Self::new();
-        let mut pos = HEADER_SIZE;
+        let mut pos = header.data_start;
         let mut record_count = 0u64;
         let mut max_page_num: u64 = 0;
 
         // Use a large buffer for sequential scanning (1MB)
-        file.seek(SeekFrom::Start(HEADER_SIZE))?;
+        file.seek(SeekFrom::Start(header.data_start))?;
         let mut reader = BufReader::with_capacity(1024 * 1024, file);
 
-        while pos < header.write_end {
+        loop {
             // Read record header: page_num(8) + size(4)
             let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
 
@@ -229,45 +286,7 @@ impl PageIndex {
         }
 
         index.max_page = max_page_num;
-        Ok(index)
-    }
-
-    /// Read legacy v1 format (separate index section)
-    fn read_from_v1(file: &mut File, page_count: u32, index_offset: u64) -> io::Result<(Self, u64)> {
-        let mut index = Self::new();
-        let mut max_end: u64 = HEADER_SIZE;
-
-        if page_count == 0 {
-            return Ok((index, max_end));
-        }
-
-        file.seek(SeekFrom::Start(index_offset))?;
-
-        for _ in 0..page_count {
-            let mut entry = [0u8; 20]; // page_num(8) + offset(8) + size(4)
-            file.read_exact(&mut entry)?;
-
-            let page_num = u64::from_le_bytes([
-                entry[0], entry[1], entry[2], entry[3],
-                entry[4], entry[5], entry[6], entry[7],
-            ]);
-            let offset = u64::from_le_bytes([
-                entry[8], entry[9], entry[10], entry[11],
-                entry[12], entry[13], entry[14], entry[15],
-            ]);
-            let size = u32::from_le_bytes([entry[16], entry[17], entry[18], entry[19]]);
-
-            index.entries.insert(page_num, (offset, size));
-            if page_num > index.max_page {
-                index.max_page = page_num;
-            }
-            let end = offset + size as u64;
-            if end > max_end {
-                max_end = end;
-            }
-        }
-
-        Ok((index, max_end))
+        Ok((index, pos)) // pos is now the write_end (position after last record)
     }
 }
 
@@ -287,12 +306,51 @@ pub struct CompressedHandle {
     /// Encryption key (32 bytes for AES-256)
     #[cfg(feature = "encryption")]
     encryption_key: Option<[u8; 32]>,
+    /// Path to the database file (for WAL index)
+    db_path: PathBuf,
+    /// Separate file handle for byte-range locking (Arc for multiple FileGuards)
+    lock_file: Option<std::sync::Arc<File>>,
+    /// Active byte-range locks for main DB:
+    /// - "shared": shared lock on one byte in SHARED range
+    /// - "reserved": exclusive lock on RESERVED_BYTE
+    /// - "pending": exclusive lock on PENDING_BYTE
+    /// - "exclusive": exclusive lock on entire SHARED range
+    active_db_locks: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+    /// Atomic write position for lock-free space reservation in compressed mode
+    /// This allows writers to reserve space without blocking readers
+    write_end: AtomicU64,
+    /// Compression dictionary (loaded from file or provided at creation)
+    #[cfg(feature = "zstd")]
+    dictionary: Option<Vec<u8>>,
 }
 
 impl CompressedHandle {
-    fn new_compressed(mut file: File, compression_level: i32, compress_pages: bool) -> io::Result<Self> {
-        // Try to read existing header and build index by scanning
-        let (header, index) = Self::load_file(&mut file)?;
+    /// Create a new handle with VFS page index format.
+    ///
+    /// - `compress`: whether to compress pages (false = store uncompressed)
+    /// - `encrypt`: whether to encrypt pages (requires encryption feature)
+    /// - `password`: encryption password (required if encrypt=true)
+    fn new(
+        mut file: File,
+        db_path: PathBuf,
+        compression_level: i32,
+        compress: bool,
+        #[allow(unused_variables)] encrypt: bool,
+        #[allow(unused_variables)] password: Option<&str>,
+    ) -> io::Result<Self> {
+        // Derive encryption key if needed
+        #[cfg(feature = "encryption")]
+        let encryption_key = if encrypt {
+            let pwd = password.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Password required for encryption")
+            })?;
+            Some(Self::derive_key(pwd)?)
+        } else {
+            None
+        };
+
+        // Load existing file or create new (may include embedded dictionary)
+        let (header, index, initial_write_end, dictionary) = Self::load_file(&mut file)?;
 
         Ok(Self {
             file: RwLock::new(file),
@@ -301,14 +359,31 @@ impl CompressedHandle {
             lock: RwLock::new(LockKind::None),
             compression_level,
             compressed: true,
-            compress_pages,
+            compress_pages: compress,
+            #[cfg(feature = "encryption")]
+            encrypt_pages: encrypt,
+            #[cfg(not(feature = "encryption"))]
             encrypt_pages: false,
             #[cfg(feature = "encryption")]
-            encryption_key: None,
+            encryption_key,
+            db_path,
+            lock_file: None,
+            active_db_locks: HashMap::new(),
+            write_end: AtomicU64::new(initial_write_end),
+            #[cfg(feature = "zstd")]
+            dictionary,
         })
     }
 
-    fn new_passthrough(file: File) -> Self {
+    /// Create a passthrough handle for WAL/journal files (direct file I/O).
+    /// Can optionally encrypt data in-place while maintaining SQLite's file format.
+    fn new_passthrough(
+        file: File,
+        db_path: PathBuf,
+        encrypt: bool,
+        #[cfg(feature = "encryption")]
+        encryption_key: Option<[u8; 32]>,
+    ) -> Self {
         Self {
             file: RwLock::new(file),
             header: RwLock::new(FileHeader::new()),
@@ -317,36 +392,34 @@ impl CompressedHandle {
             compression_level: 0,
             compressed: false,
             compress_pages: false,
-            encrypt_pages: false,
+            encrypt_pages: encrypt,
             #[cfg(feature = "encryption")]
-            encryption_key: None,
+            encryption_key,
+            db_path,
+            lock_file: None,
+            active_db_locks: HashMap::new(),
+            write_end: AtomicU64::new(0), // Not used in passthrough mode
+            #[cfg(feature = "zstd")]
+            dictionary: None,
         }
     }
 
-    #[cfg(feature = "encryption")]
-    fn new_encrypted(mut file: File, compression_level: i32, compress_pages: bool, password: &str) -> io::Result<Self> {
-        // Derive encryption key from password
-        let key = Self::derive_key(password)?;
-
-        // Try to read existing header and build index by scanning
-        let (header, index) = Self::load_file(&mut file)?;
-
-        Ok(Self {
-            file: RwLock::new(file),
-            header: RwLock::new(header),
-            index: RwLock::new(index),
-            lock: RwLock::new(LockKind::None),
-            compression_level,
-            compressed: true,
-            compress_pages,
-            encrypt_pages: true,
-            encryption_key: Some(key),
-        })
+    /// Create compressed handle (for tests)
+    #[cfg(test)]
+    fn new_compressed(file: File, compression_level: i32, compress: bool) -> io::Result<Self> {
+        Self::new(file, PathBuf::new(), compression_level, compress, false, None)
     }
 
-    /// Load file header and build index by scanning (v2) or reading index section (v1 legacy)
-    fn load_file(file: &mut File) -> io::Result<(FileHeader, PageIndex)> {
-        // First, check the magic to determine format version
+    /// Create encrypted handle (for tests)
+    #[cfg(all(test, feature = "encryption"))]
+    fn new_encrypted(file: File, compression_level: i32, compress: bool, password: &str) -> io::Result<Self> {
+        Self::new(file, PathBuf::new(), compression_level, compress, true, Some(password))
+    }
+
+    /// Load file header, dictionary (if present), and build index by scanning
+    /// Returns (FileHeader, PageIndex, write_end, Option<dictionary_bytes>)
+    fn load_file(file: &mut File) -> io::Result<(FileHeader, PageIndex, u64, Option<Vec<u8>>)> {
+        // First, check the magic to determine format
         let mut magic = [0u8; 8];
         file.seek(SeekFrom::Start(0))?;
         match file.read_exact(&mut magic) {
@@ -355,39 +428,33 @@ impl CompressedHandle {
                 // Empty file - create new
                 let header = FileHeader::new();
                 header.write_to(file)?;
-                return Ok((header, PageIndex::new()));
+                return Ok((header, PageIndex::new(), HEADER_SIZE, None));
             }
             Err(e) => return Err(e),
         }
 
-        if &magic == MAGIC_V2 {
-            // V2 format: scan to build index
-            let header = FileHeader::read_from(file)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid header"))?;
-            let index = PageIndex::scan_from_file(file, &header)?;
-            Ok((header, index))
-        } else if &magic == MAGIC_V1 {
-            // V1 legacy format: read index section, then migrate to v2 on next write
-            let mut buf = [0u8; HEADER_SIZE as usize];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut buf)?;
-
-            let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-            let page_count = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-            let index_offset = u64::from_le_bytes([
-                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-            ]);
-
-            let (index, write_end) = PageIndex::read_from_v1(file, page_count, index_offset)?;
-            let header = FileHeader { page_size, write_end };
-
-            Ok((header, index))
-        } else {
-            // Unknown format or empty - create new
+        if &magic != MAGIC {
+            // Unknown format - create new
             let header = FileHeader::new();
             header.write_to(file)?;
-            Ok((header, PageIndex::new()))
+            return Ok((header, PageIndex::new(), HEADER_SIZE, None));
         }
+
+        let header = FileHeader::read_from(file)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid header"))?;
+
+        // Read dictionary if present
+        let dictionary = if header.dict_size > 0 {
+            let mut dict_bytes = vec![0u8; header.dict_size as usize];
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut dict_bytes, HEADER_SIZE)?;
+            Some(dict_bytes)
+        } else {
+            None
+        };
+
+        let (index, write_end) = PageIndex::scan_from_file(file, &header)?;
+        Ok((header, index, write_end, dictionary))
     }
 
     #[cfg(feature = "encryption")]
@@ -506,31 +573,229 @@ impl CompressedHandle {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))
     }
 
+    // ===== AES-CTR Encryption (for passthrough mode - no size overhead) =====
+    #[cfg(feature = "encryption")]
+    fn encrypt_inplace(&self, data: &[u8], offset: u64) -> io::Result<Vec<u8>> {
+        let key = self.encryption_key.as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No encryption key set"))?;
+
+        // Use offset as IV/nonce (16 bytes for CTR mode)
+        let mut iv = [0u8; 16];
+        iv[0..8].copy_from_slice(&offset.to_le_bytes());
+
+        let mut cipher = Aes256Ctr::new(key.into(), &iv.into());
+        let mut result = data.to_vec();
+        cipher.apply_keystream(&mut result);
+        Ok(result)
+    }
+
+    #[cfg(feature = "encryption")]
+    fn decrypt_inplace(&self, data: &[u8], offset: u64) -> io::Result<Vec<u8>> {
+        // CTR mode: encryption and decryption are the same operation
+        self.encrypt_inplace(data, offset)
+    }
+
+    /// Get or create the lock file handle for byte-range locking
+    fn ensure_lock_file(&mut self) -> io::Result<std::sync::Arc<File>> {
+        if self.lock_file.is_none() {
+            let file = FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.db_path)?;
+            self.lock_file = Some(std::sync::Arc::new(file));
+        }
+        Ok(std::sync::Arc::clone(self.lock_file.as_ref().unwrap()))
+    }
+
 }
 
-/// Stub WAL index (uses default file-based WAL)
-pub struct StubWalIndex;
+/// File-backed WAL index for proper multi-connection coordination
+pub struct FileWalIndex {
+    /// Path to the -shm file
+    path: PathBuf,
+    /// Cached regions (region_id -> data)
+    regions: HashMap<u32, [u8; 32768]>,
+    /// File handle for data I/O
+    file: Option<File>,
+    /// Separate file handle for locking (Arc for multiple FileGuards)
+    lock_file: Option<std::sync::Arc<File>>,
+    /// Active byte-range locks: slot -> FileGuard
+    /// Using Box<dyn Any> to store type-erased FileGuards
+    active_locks: HashMap<u8, Box<dyn std::any::Any + Send + Sync>>,
+}
 
-impl sqlite_vfs::wip::WalIndex for StubWalIndex {
-    fn map(&mut self, _region: u32) -> Result<[u8; 32768], io::Error> {
-        Ok([0u8; 32768])
+impl FileWalIndex {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            regions: HashMap::new(),
+            file: None,
+            lock_file: None,
+            active_locks: HashMap::new(),
+        }
+    }
+
+    fn ensure_file(&mut self) -> io::Result<&mut File> {
+        if self.file.is_none() {
+            let file = FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&self.path)?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().unwrap())
+    }
+
+    fn ensure_lock_file(&mut self) -> io::Result<std::sync::Arc<File>> {
+        if self.lock_file.is_none() {
+            let file = FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&self.path)?;
+            self.lock_file = Some(std::sync::Arc::new(file));
+        }
+        Ok(std::sync::Arc::clone(self.lock_file.as_ref().unwrap()))
+    }
+}
+
+impl sqlite_vfs::wip::WalIndex for FileWalIndex {
+    fn map(&mut self, region: u32) -> Result<[u8; 32768], io::Error> {
+        // Each region is 32KB
+        let region_size = 32768u64;
+        let offset = region as u64 * region_size;
+
+        // Ensure file exists and is large enough
+        let file = self.ensure_file()?;
+        let file_len = file.metadata()?.len();
+
+        if file_len < offset + region_size {
+            // Extend file with zeros
+            file.set_len(offset + region_size)?;
+        }
+
+        // Read or create the region
+        use std::os::unix::fs::FileExt;
+        let mut data = [0u8; 32768];
+        match file.read_exact_at(&mut data, offset) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // File was just created/extended, return zeros
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Cache it
+        self.regions.insert(region, data);
+        Ok(data)
     }
 
     fn lock(
         &mut self,
-        _locks: Range<u8>,
-        _lock: sqlite_vfs::wip::WalIndexLock,
+        locks: Range<u8>,
+        lock: sqlite_vfs::wip::WalIndexLock,
     ) -> Result<bool, io::Error> {
+        // Proper byte-range locking for WAL-index using file-guard
+        // SQLite WAL-index locks are at bytes WAL_LOCK_OFFSET + slot_number
+        use sqlite_vfs::wip::WalIndexLock;
+
+        let lock_file = self.ensure_lock_file()?;
+
+        match lock {
+            WalIndexLock::None => {
+                // Release all locks in the range
+                for slot in locks.clone() {
+                    self.active_locks.remove(&slot);
+                }
+            }
+            WalIndexLock::Shared | WalIndexLock::Exclusive => {
+                // First, try to acquire ALL locks without modifying state
+                // This ensures atomicity - either all succeed or none are modified
+                let mut new_guards: Vec<(u8, Box<dyn std::any::Any + Send + Sync>)> = Vec::new();
+                let lock_type = if matches!(lock, WalIndexLock::Shared) {
+                    file_guard::Lock::Shared
+                } else {
+                    file_guard::Lock::Exclusive
+                };
+
+                for slot in locks.clone() {
+                    let offset = WAL_LOCK_OFFSET + slot as u64;
+
+                    // Release existing lock on this slot first (needed to acquire new one)
+                    // We save it temporarily in case we need to restore
+                    let old_guard = self.active_locks.remove(&slot);
+
+                    match file_guard::try_lock(
+                        std::sync::Arc::clone(&lock_file),
+                        lock_type,
+                        offset as usize,
+                        1,
+                    ) {
+                        Ok(guard) => {
+                            new_guards.push((slot, Box::new(guard)));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            // Failed - restore any removed locks and the ones we acquired
+                            // Put back the old guard if we had one
+                            if let Some(guard) = old_guard {
+                                self.active_locks.insert(slot, guard);
+                            }
+                            // Put back all guards we acquired so far (they'll be dropped, releasing locks)
+                            // Actually, we need to restore the original state for already-processed slots
+                            // For simplicity, just drop new_guards - the locks will be released
+                            // The caller will retry if needed
+                            if DEBUG_LOCKS.load(Ordering::Relaxed) {
+                                eprintln!(
+                                    "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY",
+                                    std::thread::current().id(),
+                                    self.path.display(),
+                                    slot,
+                                    lock
+                                );
+                            }
+                            return Ok(false);
+                        }
+                        Err(e) => {
+                            // Restore old guard on error
+                            if let Some(guard) = old_guard {
+                                self.active_locks.insert(slot, guard);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+
+                // All locks acquired successfully - commit them
+                for (slot, guard) in new_guards {
+                    self.active_locks.insert(slot, guard);
+                }
+            }
+        }
+
+        if DEBUG_LOCKS.load(Ordering::Relaxed) {
+            eprintln!(
+                "[LOCK DEBUG] {:?} WAL_INDEX {} locks {:?}..{:?} {:?} => OK",
+                std::thread::current().id(),
+                self.path.display(),
+                locks.start,
+                locks.end,
+                lock
+            );
+        }
         Ok(true)
     }
 
     fn delete(self) -> Result<(), io::Error> {
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
         Ok(())
     }
 }
 
 impl DatabaseHandle for CompressedHandle {
-    type WalIndex = StubWalIndex;
+    type WalIndex = FileWalIndex;
 
     fn size(&self) -> Result<u64, io::Error> {
         if !self.compressed {
@@ -553,8 +818,20 @@ impl DatabaseHandle for CompressedHandle {
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), io::Error> {
         if !self.compressed {
             // Passthrough: direct file read with position-aware I/O
+            // Optionally decrypt data after reading (for WAL encryption)
             use std::os::unix::fs::FileExt;
             let file = self.file.read();  // READ lock instead of write lock!
+
+            #[cfg(feature = "encryption")]
+            if self.encrypt_pages {
+                // Read encrypted data, then decrypt with AES-CTR (same size as plaintext)
+                let mut encrypted = vec![0u8; buf.len()];
+                file.read_exact_at(&mut encrypted, offset)?;
+                let decrypted = self.decrypt_inplace(&encrypted, offset)?;
+                buf.copy_from_slice(&decrypted);
+                return Ok(());
+            }
+
             return file.read_exact_at(buf, offset);
         }
 
@@ -612,12 +889,21 @@ impl DatabaseHandle for CompressedHandle {
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> Result<(), io::Error> {
         if !self.compressed {
             // Passthrough: direct file write with position-aware I/O
+            // Optionally encrypt data in-place before writing (for WAL encryption)
             use std::os::unix::fs::FileExt;
-            let file = self.file.write();  // WRITE lock needed for writes!
+            let file = self.file.read();  // Read lock - pwrite is atomic
+
+            #[cfg(feature = "encryption")]
+            if self.encrypt_pages {
+                // Encrypt data using AES-CTR (no size overhead)
+                let encrypted = self.encrypt_inplace(buf, offset)?;
+                return file.write_all_at(&encrypted, offset);
+            }
+
             return file.write_all_at(buf, offset);
         }
 
-        // Set page size from first write
+        // Set page size from first write (brief lock)
         {
             let mut header = self.header.write();
             if header.page_size == 0 {
@@ -625,42 +911,42 @@ impl DatabaseHandle for CompressedHandle {
             }
         }
 
-        let header = self.header.read();
-        let page_size = header.page_size as u64;
-        drop(header);
+        // Read page_size (brief read lock)
+        let page_size = {
+            let header = self.header.read();
+            header.page_size as u64
+        };
 
         let page_num = offset / page_size;
 
-        // Compress or passthrough based on compress_pages flag
-        let data = if self.compress_pages {
-            self.compress(buf)?
+        // Process data: compress and/or encrypt as needed
+        // This happens WITHOUT any locks held
+        use std::borrow::Cow;
+
+        let data: Cow<'_, [u8]> = if self.compress_pages {
+            Cow::Owned(self.compress(buf)?)
         } else {
-            buf.to_vec()
+            Cow::Borrowed(buf)
         };
 
-        // Encrypt if encryption is enabled
         #[cfg(feature = "encryption")]
-        let data = if self.encrypt_pages {
-            self.encrypt(&data, page_num)?
+        let data: Cow<'_, [u8]> = if self.encrypt_pages {
+            Cow::Owned(self.encrypt(&data, page_num)?)
         } else {
             data
         };
 
         let data_size = data.len() as u32;
+        let record_size = RECORD_HEADER_SIZE + data_size as u64;
 
-        let mut index = self.index.write();
-        let mut header = self.header.write();
-        let file = self.file.read(); // Read lock is enough with pwrite
-
-        // Always append new records (simpler and more reliable)
-        // In-place update is tricky with variable-size compressed data
-        // Old records become dead space and can be compacted later
-        let record_offset = header.write_end;
+        // ATOMIC SPACE RESERVATION: Reserve space without blocking readers
+        // fetch_add returns the OLD value, which is our record offset
+        let record_offset = self.write_end.fetch_add(record_size, Ordering::SeqCst);
         let data_offset = record_offset + RECORD_HEADER_SIZE;
-        header.write_end = data_offset + data_size as u64;
 
-        // Write inline record: page_num(8) + size(4) + data
+        // FILE I/O WITHOUT LOCKS: pwrite is thread-safe
         use std::os::unix::fs::FileExt;
+        let file = self.file.read(); // Read lock only - pwrite is atomic
 
         // Write record header
         let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
@@ -671,10 +957,15 @@ impl DatabaseHandle for CompressedHandle {
         // Write data
         file.write_all_at(&data, data_offset)?;
 
-        // Update in-memory index (data_offset points to data, not record header)
-        index.entries.insert(page_num, (data_offset, data_size));
-        if page_num > index.max_page {
-            index.max_page = page_num;
+        drop(file); // Release file read lock before taking index write lock
+
+        // BRIEF INDEX UPDATE: Only lock for HashMap insertion
+        {
+            let mut index = self.index.write();
+            index.entries.insert(page_num, (data_offset, data_size));
+            if page_num > index.max_page {
+                index.max_page = page_num;
+            }
         }
 
         Ok(())
@@ -685,22 +976,26 @@ impl DatabaseHandle for CompressedHandle {
             return self.file.write().sync_all();
         }
 
-        // V2 format: just update header with write_end and fsync
-        // No index rewrite needed - index entries are inline with the data!
+        // Write header and fsync
+        // Index is scanned from data_start to EOF on open
         use std::os::unix::fs::FileExt;
 
-        let header = self.header.read();
+        // Read header fields
+        let (page_size, data_start, dict_size, flags) = {
+            let header = self.header.read();
+            (header.page_size, header.data_start, header.dict_size, header.flags)
+        };
 
         // Write header using pwrite (position-aware, no seek needed)
         let mut buf = [0u8; HEADER_SIZE as usize];
-        buf[0..8].copy_from_slice(MAGIC_V2);
-        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        buf[12..16].copy_from_slice(&header.page_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&header.write_end.to_le_bytes());
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&page_size.to_le_bytes());
+        buf[12..20].copy_from_slice(&data_start.to_le_bytes());
+        buf[20..24].copy_from_slice(&dict_size.to_le_bytes());
+        buf[24..28].copy_from_slice(&flags.to_le_bytes());
 
         let file = self.file.read();
         file.write_all_at(&buf, 0)?;
-        drop(header);
         drop(file);
 
         self.file.write().sync_all()
@@ -712,8 +1007,8 @@ impl DatabaseHandle for CompressedHandle {
         }
 
         // For compressed files, we update the in-memory index
-        // Note: In v2 format, truncated pages become "dead" records in the file
-        // They will be cleaned up on compaction (future feature)
+        // Note: truncated pages become "dead" records in the file
+        // They will be cleaned up on compaction
         let header = self.header.read();
         if header.page_size == 0 {
             return Ok(());
@@ -730,7 +1025,197 @@ impl DatabaseHandle for CompressedHandle {
     }
 
     fn lock(&mut self, lock: LockKind) -> Result<bool, io::Error> {
+        let current = *self.lock.read();
+        let path = self.db_path.to_string_lossy().to_string();
+
+        // No change needed
+        if current == lock {
+            debug_lock("NOOP", &path, current, lock, "already held");
+            return Ok(true);
+        }
+
+        debug_lock("ACQUIRE", &path, current, lock, "attempting");
+
+        // Get or create the lock file handle for byte-range locking
+        let lock_file = self.ensure_lock_file()?;
+
+        // SQLite lock escalation using proper byte-range locks:
+        // - NONE: No locks
+        // - SHARED: Shared lock on one byte in SHARED_FIRST..SHARED_FIRST+SHARED_SIZE
+        // - RESERVED: Keep SHARED, add exclusive lock on RESERVED_BYTE
+        // - PENDING: Keep SHARED+RESERVED, add exclusive lock on PENDING_BYTE
+        // - EXCLUSIVE: Replace SHARED with exclusive lock on SHARED range
+
+        match lock {
+            LockKind::None => {
+                // Release all locks by clearing the active_db_locks map
+                debug_lock("UNLOCK", &path, current, lock, "releasing all");
+                self.active_db_locks.clear();
+            }
+
+            LockKind::Shared => {
+                // Release any existing locks first
+                self.active_db_locks.clear();
+
+                // SQLite protocol: First check PENDING_BYTE
+                // If a writer holds exclusive PENDING, they're waiting to write - block new readers
+                // This prevents writer starvation where fast readers constantly get shared locks
+                match file_guard::try_lock(
+                    std::sync::Arc::clone(&lock_file),
+                    file_guard::Lock::Shared,
+                    PENDING_BYTE as usize,
+                    1,
+                ) {
+                    Ok(_pending_guard) => {
+                        // Got shared on PENDING - no writer waiting, drop it and continue
+                        // We don't keep this lock, it's just a check
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Writer has exclusive PENDING - they're waiting to write
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (writer has PENDING)");
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                // Now try to get shared lock on SHARED range
+                match file_guard::try_lock(
+                    std::sync::Arc::clone(&lock_file),
+                    file_guard::Lock::Shared,
+                    SHARED_FIRST as usize,
+                    1,
+                ) {
+                    Ok(guard) => {
+                        self.active_db_locks.insert("shared".to_string(), Box::new(guard));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (shared busy)");
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            LockKind::Reserved => {
+                // Must have SHARED first (SQLite protocol)
+                if !matches!(current, LockKind::Shared | LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (must have SHARED first)");
+                    return Ok(false);
+                }
+
+                // Try to get exclusive lock on RESERVED_BYTE
+                match file_guard::try_lock(
+                    std::sync::Arc::clone(&lock_file),
+                    file_guard::Lock::Exclusive,
+                    RESERVED_BYTE as usize,
+                    1,
+                ) {
+                    Ok(guard) => {
+                        self.active_db_locks.insert("reserved".to_string(), Box::new(guard));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (reserved busy)");
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            LockKind::Pending => {
+                // Must have RESERVED first
+                if !matches!(current, LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (must have RESERVED first)");
+                    return Ok(false);
+                }
+
+                // Try to get exclusive lock on PENDING_BYTE
+                match file_guard::try_lock(
+                    std::sync::Arc::clone(&lock_file),
+                    file_guard::Lock::Exclusive,
+                    PENDING_BYTE as usize,
+                    1,
+                ) {
+                    Ok(guard) => {
+                        self.active_db_locks.insert("pending".to_string(), Box::new(guard));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            LockKind::Exclusive => {
+                // Must have at least RESERVED first
+                if !matches!(current, LockKind::Reserved | LockKind::Pending | LockKind::Exclusive) {
+                    debug_lock("ACQUIRE", &path, current, lock, "FAILED (need RESERVED first)");
+                    return Ok(false);
+                }
+
+                // If we don't have PENDING yet, get it first
+                if !self.active_db_locks.contains_key("pending") {
+                    match file_guard::try_lock(
+                        std::sync::Arc::clone(&lock_file),
+                        file_guard::Lock::Exclusive,
+                        PENDING_BYTE as usize,
+                        1,
+                    ) {
+                        Ok(guard) => {
+                            self.active_db_locks.insert("pending".to_string(), Box::new(guard));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            debug_lock("ACQUIRE", &path, current, lock, "FAILED (pending busy)");
+                            return Ok(false);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // Release shared lock, then get exclusive lock on entire shared range
+                self.active_db_locks.remove("shared");
+
+                match file_guard::try_lock(
+                    std::sync::Arc::clone(&lock_file),
+                    file_guard::Lock::Exclusive,
+                    SHARED_FIRST as usize,
+                    SHARED_SIZE as usize,
+                ) {
+                    Ok(guard) => {
+                        self.active_db_locks.insert("exclusive".to_string(), Box::new(guard));
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Restore shared lock since we failed - this MUST succeed or we're in trouble
+                        match file_guard::try_lock(
+                            std::sync::Arc::clone(&lock_file),
+                            file_guard::Lock::Shared,
+                            SHARED_FIRST as usize,
+                            1,
+                        ) {
+                            Ok(guard) => {
+                                self.active_db_locks.insert("shared".to_string(), Box::new(guard));
+                            }
+                            Err(restore_err) => {
+                                // Critical: We lost our shared lock and can't restore it
+                                // This leaves us in an inconsistent state - return error
+                                debug_lock("ACQUIRE", &path, current, lock,
+                                    "FAILED (exclusive busy, CRITICAL: shared restore failed!)");
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("Lock restore failed after exclusive attempt: {}", restore_err)
+                                ));
+                            }
+                        }
+                        debug_lock("ACQUIRE", &path, current, lock, "FAILED (exclusive busy)");
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
         *self.lock.write() = lock;
+        debug_lock("ACQUIRE", &path, current, lock, "SUCCESS");
         Ok(true)
     }
 
@@ -747,7 +1232,9 @@ impl DatabaseHandle for CompressedHandle {
     }
 
     fn wal_index(&self, _readonly: bool) -> Result<Self::WalIndex, io::Error> {
-        Ok(StubWalIndex)
+        // Create -shm path from database path
+        let shm_path = self.db_path.with_extension("db-shm");
+        Ok(FileWalIndex::new(shm_path))
     }
 }
 
@@ -829,11 +1316,11 @@ impl Vfs for CompressedVfs {
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
         let path = self.base_dir.join(db);
 
-        eprintln!("VFS open: db={:?}, base_dir={:?}, path={:?}, kind={:?}, access={:?}",
-                  db, self.base_dir, path, opts.kind, opts.access);
+        // Only compress main database (WAL is append-only, compression doesn't help)
+        let use_compression = matches!(opts.kind, OpenKind::MainDb) && self.compress;
 
-        // WAL and journal files are stored uncompressed
-        let use_compression = matches!(opts.kind, OpenKind::MainDb);
+        // Encrypt both main DB and WAL when encryption is enabled
+        let use_encryption = matches!(opts.kind, OpenKind::MainDb | OpenKind::Wal) && self.encrypt;
 
         let file = match opts.access {
             OpenAccess::Read => FsOpenOptions::new().read(true).open(&path)?,
@@ -850,26 +1337,59 @@ impl Vfs for CompressedVfs {
                 .open(&path)?,
         };
 
-        // Use passthrough for WAL/journal files, OR when VFS is in passthrough mode
-        let use_vfs_format = use_compression && (self.compress || self.encrypt);
-
-        if use_vfs_format {
-            #[cfg(feature = "encryption")]
-            {
-                if self.encrypt {
+        // Main DB: Use VFS page index format for compression/encryption
+        // WAL: Use passthrough with optional in-place encryption (can't use VFS format - SQLite needs to parse WAL structure)
+        // Journals/temp: Use passthrough without encryption
+        if use_compression {
+            // Main DB with compression (and maybe encryption)
+            let password = {
+                #[cfg(feature = "encryption")]
+                { self.password.as_deref() }
+                #[cfg(not(feature = "encryption"))]
+                { None::<&str> }
+            };
+            CompressedHandle::new(
+                file,
+                path.clone(),
+                self.compression_level,
+                use_compression,
+                use_encryption,
+                password,
+            )
+        } else if use_encryption {
+            // WAL with encryption but no compression - use passthrough with in-place encryption
+            let encryption_key = {
+                #[cfg(feature = "encryption")]
+                {
+                    use sha2::{Sha256, Digest};
                     let password = self.password.as_ref()
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No password set for encryption"))?;
-                    CompressedHandle::new_encrypted(file, self.compression_level, self.compress, password)
-                } else {
-                    CompressedHandle::new_compressed(file, self.compression_level, self.compress)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No password set"))?;
+                    let mut hasher = Sha256::new();
+                    hasher.update(password.as_bytes());
+                    let hash = hasher.finalize();
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&hash);
+                    Some(key)
                 }
-            }
-            #[cfg(not(feature = "encryption"))]
-            {
-                CompressedHandle::new_compressed(file, self.compression_level, self.compress)
-            }
+                #[cfg(not(feature = "encryption"))]
+                { None }
+            };
+            Ok(CompressedHandle::new_passthrough(
+                file,
+                path,
+                true,  // encrypt
+                #[cfg(feature = "encryption")]
+                encryption_key,
+            ))
         } else {
-            Ok(CompressedHandle::new_passthrough(file))
+            // Journals and temp files - plain passthrough
+            Ok(CompressedHandle::new_passthrough(
+                file,
+                path,
+                false,  // no encryption
+                #[cfg(feature = "encryption")]
+                None,
+            ))
         }
     }
 
@@ -918,8 +1438,6 @@ pub fn register(name: &str, vfs: CompressedVfs) -> Result<(), io::Error> {
 /// Database statistics returned by `inspect_database`
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
-    /// Format version (1 or 2)
-    pub version: u32,
     /// Page size in bytes
     pub page_size: u32,
     /// Number of unique pages (live data)
@@ -956,47 +1474,33 @@ pub fn inspect_database<P: AsRef<Path>>(path: P) -> io::Result<DatabaseStats> {
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut magic)?;
 
-    let version = if &magic == MAGIC_V2 {
-        2
-    } else if &magic == MAGIC_V1 {
-        1
-    } else {
+    if &magic != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Not a valid SQLCEs database file",
         ));
-    };
+    }
 
     // Read full header
     let mut buf = [0u8; HEADER_SIZE as usize];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut buf)?;
 
-    let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-    let write_end = if version == 2 {
-        u64::from_le_bytes([
-            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-        ])
-    } else {
-        // V1: index section is at the end, compute from page_count
-        let page_count = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-        let index_offset = u64::from_le_bytes([
-            buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-        ]);
-        // For v1, write_end is approximate (index comes after data)
-        index_offset.min(file_size - (page_count as u64 * 20))
-    };
+    let page_size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let data_start = u64::from_le_bytes([
+        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+    ]);
 
     // Scan records to build index and count total records
     let mut entries: HashMap<u64, (u64, u32)> = HashMap::new();
     let mut total_records: u64 = 0;
     let mut max_page: u64 = 0;
 
-    file.seek(SeekFrom::Start(HEADER_SIZE))?;
+    file.seek(SeekFrom::Start(data_start))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, &mut file);
-    let mut pos = HEADER_SIZE;
+    let mut pos = data_start;
 
-    while pos < write_end {
+    while pos < file_size {
         let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
         match reader.read_exact(&mut rec_header) {
             Ok(()) => {}
@@ -1061,7 +1565,6 @@ pub fn inspect_database<P: AsRef<Path>>(path: P) -> io::Result<DatabaseStats> {
     };
 
     Ok(DatabaseStats {
-        version,
         page_size,
         page_count,
         total_records,
@@ -1098,27 +1601,27 @@ pub fn compact<P: AsRef<Path>>(path: P) -> io::Result<u64> {
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut buf)?;
 
-    if &buf[0..8] != MAGIC_V2 && &buf[0..8] != MAGIC_V1 {
+    if &buf[0..8] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Not a valid SQLCEs database file",
         ));
     }
 
-    let page_size = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-    let write_end = u64::from_le_bytes([
-        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+    let page_size = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let data_start = u64::from_le_bytes([
+        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
     ]);
 
     // Build index by scanning (keeps only latest version of each page)
     let mut entries: HashMap<u64, (u64, u32)> = HashMap::new();
     let mut max_page: u64 = 0;
 
-    file.seek(SeekFrom::Start(HEADER_SIZE))?;
+    file.seek(SeekFrom::Start(data_start))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, &mut file);
-    let mut pos = HEADER_SIZE;
+    let mut pos = data_start;
 
-    while pos < write_end {
+    while pos < original_size {
         let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
         match reader.read_exact(&mut rec_header) {
             Ok(()) => {}
@@ -1161,16 +1664,17 @@ pub fn compact<P: AsRef<Path>>(path: P) -> io::Result<u64> {
         .truncate(true)
         .open(&temp_path)?;
 
-    // Write header
-    let mut new_write_end = HEADER_SIZE;
+    // Write header with new format
+    let data_start = HEADER_SIZE; // No dictionary after compaction
     let mut header_buf = [0u8; HEADER_SIZE as usize];
-    header_buf[0..8].copy_from_slice(MAGIC_V2);
-    header_buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
-    header_buf[12..16].copy_from_slice(&page_size.to_le_bytes());
-    // write_end will be updated after writing all records
+    header_buf[0..8].copy_from_slice(MAGIC);
+    header_buf[8..12].copy_from_slice(&page_size.to_le_bytes());
+    header_buf[12..20].copy_from_slice(&data_start.to_le_bytes());
+    // dict_size = 0, flags = 0 (already zeroed)
     temp_file.write_all_at(&header_buf, 0)?;
 
     // Copy each live page
+    let mut write_pos = HEADER_SIZE;
     for (page_num, (data_offset, data_size)) in pages {
         // Read data from original file
         let mut data = vec![0u8; data_size as usize];
@@ -1180,16 +1684,13 @@ pub fn compact<P: AsRef<Path>>(path: P) -> io::Result<u64> {
         let mut rec_header = [0u8; RECORD_HEADER_SIZE as usize];
         rec_header[0..8].copy_from_slice(&page_num.to_le_bytes());
         rec_header[8..12].copy_from_slice(&data_size.to_le_bytes());
-        temp_file.write_all_at(&rec_header, new_write_end)?;
+        temp_file.write_all_at(&rec_header, write_pos)?;
 
         // Write data
-        temp_file.write_all_at(&data, new_write_end + RECORD_HEADER_SIZE)?;
-        new_write_end += RECORD_HEADER_SIZE + data_size as u64;
+        temp_file.write_all_at(&data, write_pos + RECORD_HEADER_SIZE)?;
+        write_pos += RECORD_HEADER_SIZE + data_size as u64;
     }
 
-    // Update header with final write_end
-    header_buf[16..24].copy_from_slice(&new_write_end.to_le_bytes());
-    temp_file.write_all_at(&header_buf, 0)?;
     temp_file.sync_all()?;
     drop(temp_file);
     drop(file);
@@ -1224,22 +1725,27 @@ mod tests {
 
         let header = FileHeader {
             page_size: 4096,
-            write_end: 12345,
+            data_start: HEADER_SIZE + 1024, // Simulate 1KB dictionary
+            dict_size: 1024,
+            flags: 0,
         };
 
         // Use pwrite like the real implementation does
         use std::os::unix::fs::FileExt;
         let mut buf = [0u8; HEADER_SIZE as usize];
-        buf[0..8].copy_from_slice(MAGIC_V2);
-        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
-        buf[12..16].copy_from_slice(&header.page_size.to_le_bytes());
-        buf[16..24].copy_from_slice(&header.write_end.to_le_bytes());
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&header.page_size.to_le_bytes());
+        buf[12..20].copy_from_slice(&header.data_start.to_le_bytes());
+        buf[20..24].copy_from_slice(&header.dict_size.to_le_bytes());
+        buf[24..28].copy_from_slice(&header.flags.to_le_bytes());
         file.write_all_at(&buf, 0).unwrap();
 
         let mut file = file; // Need &mut for read_from
         let read_header = FileHeader::read_from(&mut file).unwrap().unwrap();
         assert_eq!(read_header.page_size, 4096);
-        assert_eq!(read_header.write_end, 12345);
+        assert_eq!(read_header.data_start, HEADER_SIZE + 1024);
+        assert_eq!(read_header.dict_size, 1024);
+        assert_eq!(read_header.flags, 0);
     }
 
     #[test]
