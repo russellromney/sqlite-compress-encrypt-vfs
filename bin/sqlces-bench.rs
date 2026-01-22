@@ -2,12 +2,16 @@
 //!
 //! Benchmarks VFS modes using real corpus data
 //!
+//! Subcommands:
+//!   bench-db        Benchmark VFS modes (read/write throughput)
+//!   bench-compact   Benchmark parallel vs serial compaction
+//!
 //! Presets:
 //!   --preset 100mb    100MB Gutenberg corpus, 10MB cache, 20MB mmap
 //!   --preset 50mb     50MB Gutenberg corpus, 5MB cache, 10MB mmap
 //!   --preset 10mb     10MB quick test, 1MB cache, 2MB mmap
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sqlite_compress_encrypt_vfs::{register, CompressedVfs};
@@ -55,8 +59,11 @@ fn get_preset(name: &str) -> Option<PresetConfig> {
 
 #[derive(Parser)]
 #[command(name = "sqlces-bench")]
-#[command(about = "SQLite Compression+Encryption Benchmark CLI\n\nPresets: 10mb, 50mb, 100mb, 500mb")]
+#[command(about = "SQLite Compression+Encryption Benchmark CLI\n\nSubcommands: bench-db, bench-compact\nPresets: 10mb, 50mb, 100mb, 500mb")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Use a preset configuration (10mb, 50mb, 100mb, 500mb)
     #[arg(short, long)]
     preset: Option<String>,
@@ -110,6 +117,26 @@ struct Cli {
     output_file: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Benchmark VFS modes (read/write throughput)
+    BenchDb,
+    /// Benchmark parallel vs serial compaction
+    BenchCompact {
+        /// Number of rows to insert (more rows = longer compaction)
+        #[arg(long, default_value = "1000")]
+        rows: usize,
+
+        /// Number of iterations for averaging
+        #[arg(long, default_value = "3")]
+        iterations: usize,
+
+        /// Compression level (1-22)
+        #[arg(long, default_value = "3")]
+        compression_level: i32,
+    },
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct BenchmarkResult {
     mode: String,
@@ -127,6 +154,16 @@ struct BenchmarkResult {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Handle subcommands
+    match &cli.command {
+        Some(Commands::BenchCompact { rows, iterations, compression_level }) => {
+            return bench_compact_command(*rows, *iterations, *compression_level);
+        }
+        Some(Commands::BenchDb) | None => {
+            // Default behavior: bench-db
+        }
+    }
 
     // Resolve database path and settings from preset or CLI args
     let (database, duration_secs, cache_kb, mmap_kb) = if let Some(preset_name) = &cli.preset {
@@ -727,4 +764,117 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
     }
 
     output
+}
+
+/// Benchmark parallel vs serial compaction
+fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32) -> Result<(), Box<dyn std::error::Error>> {
+    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    println!("=== SQLCEs Parallel Compaction Benchmark ===");
+    println!("Rows: {}, Iterations: {}, Compression level: {}", rows, iterations, compression_level);
+    println!();
+
+    let mut parallel_times = Vec::new();
+    let mut serial_times = Vec::new();
+
+    for iter in 0..iterations {
+        println!("Iteration {}/{}...", iter + 1, iterations);
+
+        // Create test databases for this iteration
+        for (mode, times) in [("parallel", &mut parallel_times), ("serial", &mut serial_times)] {
+            let dir = tempfile::tempdir()?;
+            let vfs_id = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let vfs_name = format!("compact_bench_{}_{}", mode, vfs_id);
+
+            let vfs = CompressedVfs::new(dir.path(), compression_level);
+            register(&vfs_name, vfs)?;
+
+            let db_path = dir.path().join("bench.db");
+
+            // Create database and insert data
+            {
+                let conn = Connection::open_with_flags_and_vfs(
+                    &db_path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+                    &vfs_name,
+                )?;
+
+                conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+                conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])?;
+
+                let test_data = "benchmark_data_for_compaction_".repeat(50);
+                conn.execute("BEGIN", [])?;
+                for i in 0..rows {
+                    conn.execute(
+                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                        rusqlite::params![i as i64, &test_data],
+                    )?;
+                }
+                conn.execute("COMMIT", [])?;
+
+                // Create dead space with updates (50% of rows)
+                let updated = "updated_data_for_compaction_test_".repeat(50);
+                conn.execute("BEGIN", [])?;
+                for i in 0..(rows / 2) {
+                    conn.execute(
+                        "UPDATE data SET value = ?1 WHERE id = ?2",
+                        rusqlite::params![&updated, i as i64],
+                    )?;
+                }
+                conn.execute("COMMIT", [])?;
+
+                // Checkpoint WAL to main file
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            }
+
+            let stats_before = inspect_database(&db_path)?;
+
+            // Run compaction
+            let start = Instant::now();
+            let config = CompactionConfig::new(compression_level)
+                .with_parallel(mode == "parallel");
+            let _freed = compact_with_recompression(&db_path, config)?;
+            let elapsed = start.elapsed();
+
+            times.push(elapsed.as_secs_f64());
+
+            if iter == 0 {
+                let stats_after = inspect_database(&db_path)?;
+                println!("  {} mode: {:.3}s (before: {:.2} MB, after: {:.2} MB, dead: {:.1}% -> {:.1}%)",
+                    mode,
+                    elapsed.as_secs_f64(),
+                    stats_before.file_size as f64 / (1024.0 * 1024.0),
+                    stats_after.file_size as f64 / (1024.0 * 1024.0),
+                    stats_before.dead_space_pct,
+                    stats_after.dead_space_pct);
+            }
+        }
+    }
+
+    println!();
+    println!("=== Results ===");
+    println!();
+
+    let parallel_avg = parallel_times.iter().sum::<f64>() / parallel_times.len() as f64;
+    let serial_avg = serial_times.iter().sum::<f64>() / serial_times.len() as f64;
+    let speedup = serial_avg / parallel_avg;
+
+    println!("{:<12} {:>12} {:>12}", "Mode", "Avg Time", "Speedup");
+    println!("{:-<12} {:->12} {:->12}", "", "", "");
+    println!("{:<12} {:>10.3}s {:>12}", "parallel", parallel_avg, format!("{:.2}x", speedup));
+    println!("{:<12} {:>10.3}s {:>12}", "serial", serial_avg, "baseline");
+
+    println!();
+    if speedup > 1.5 {
+        println!("Parallel compaction is {:.1}x faster!", speedup);
+    } else if speedup > 1.0 {
+        println!("Parallel compaction provides {:.0}% speedup.", (speedup - 1.0) * 100.0);
+    } else {
+        println!("Serial compaction is faster for this workload (try more rows).");
+    }
+
+    Ok(())
 }

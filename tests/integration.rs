@@ -424,3 +424,232 @@ fn test_all_four_modes_comparison() {
         assert_eq!(retrieved, test_data);
     }
 }
+
+/// Test compact_with_recompression with parallel compression
+#[test]
+fn test_compact_with_recompression() {
+    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vfs = CompressedVfs::new(dir.path(), 3);
+    register("recompress_test", vfs).unwrap();
+
+    let db_path = dir.path().join("recompress.db");
+
+    // Create database and insert data
+    {
+        let conn = Connection::open_with_flags_and_vfs(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            "recompress_test",
+        )
+        .unwrap();
+
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+
+        // Insert data and update it multiple times to create dead space
+        let test_data = "x".repeat(1000);
+        for i in 0..100 {
+            conn.execute(
+                "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                rusqlite::params![i, &test_data],
+            )
+            .unwrap();
+        }
+
+        // Update rows to create dead space (superseded records)
+        let updated_data = "y".repeat(1000);
+        for i in 0..50 {
+            conn.execute(
+                "UPDATE data SET value = ?1 WHERE id = ?2",
+                rusqlite::params![&updated_data, i],
+            )
+            .unwrap();
+        }
+    }
+
+    // Check initial stats
+    let stats_before = inspect_database(&db_path).unwrap();
+    println!(
+        "Before recompression: file_size={}, dead_space={} ({:.1}%)",
+        stats_before.file_size, stats_before.dead_space, stats_before.dead_space_pct
+    );
+    assert!(stats_before.dead_space > 0, "Should have dead space from updates");
+
+    // Compact with recompression (parallel by default when feature enabled)
+    let config = CompactionConfig::new(3).with_parallel(true);
+    let freed = compact_with_recompression(&db_path, config).unwrap();
+    println!("Freed {} bytes", freed);
+
+    // Check stats after
+    let stats_after = inspect_database(&db_path).unwrap();
+    println!(
+        "After recompression: file_size={}, dead_space={} ({:.1}%)",
+        stats_after.file_size, stats_after.dead_space, stats_after.dead_space_pct
+    );
+    assert!(
+        stats_after.file_size <= stats_before.file_size,
+        "File should not be larger after compaction"
+    );
+    assert!(
+        stats_after.dead_space_pct < 5.0,
+        "Dead space should be minimal after compaction"
+    );
+
+    // Verify data integrity
+    let vfs2 = CompressedVfs::new(dir.path(), 3);
+    register("recompress_verify", vfs2).unwrap();
+
+    let conn = Connection::open_with_flags_and_vfs(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        "recompress_verify",
+    )
+    .unwrap();
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 100);
+
+    // Verify updated rows have new value
+    let value: String = conn
+        .query_row("SELECT value FROM data WHERE id = 25", [], |r| r.get(0))
+        .unwrap();
+    assert!(value.starts_with("y"), "Updated rows should have new value");
+
+    // Verify non-updated rows have original value
+    let value: String = conn
+        .query_row("SELECT value FROM data WHERE id = 75", [], |r| r.get(0))
+        .unwrap();
+    assert!(value.starts_with("x"), "Non-updated rows should have original value");
+}
+
+/// Test compact_if_needed helper
+#[test]
+fn test_compact_if_needed() {
+    use sqlite_compress_encrypt_vfs::{compact_if_needed, inspect_database};
+
+    let dir = tempfile::tempdir().unwrap();
+    let vfs = CompressedVfs::new(dir.path(), 3);
+    register("compact_needed_test", vfs).unwrap();
+
+    let db_path = dir.path().join("compact_needed.db");
+
+    // Create database with some dead space
+    {
+        let conn = Connection::open_with_flags_and_vfs(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            "compact_needed_test",
+        )
+        .unwrap();
+
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+
+        let test_data = "z".repeat(500);
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                rusqlite::params![i, &test_data],
+            )
+            .unwrap();
+        }
+
+        // Create dead space with updates
+        let updated = "w".repeat(500);
+        for i in 0..25 {
+            conn.execute(
+                "UPDATE data SET value = ?1 WHERE id = ?2",
+                rusqlite::params![&updated, i],
+            )
+            .unwrap();
+        }
+    }
+
+    let stats = inspect_database(&db_path).unwrap();
+    println!("Dead space: {:.1}%", stats.dead_space_pct);
+
+    // With very high threshold, should not compact
+    let result = compact_if_needed(&db_path, 99.0).unwrap();
+    assert!(result.is_none(), "Should not compact when below threshold");
+
+    // With low threshold, should compact
+    let result = compact_if_needed(&db_path, 1.0).unwrap();
+    assert!(result.is_some(), "Should compact when above threshold");
+    println!("Freed {} bytes", result.unwrap());
+
+    // After compaction, dead space should be minimal
+    let stats_after = inspect_database(&db_path).unwrap();
+    assert!(
+        stats_after.dead_space_pct < 5.0,
+        "Dead space should be minimal after compaction"
+    );
+}
+
+/// Test parallel vs serial compaction produces same results
+#[test]
+fn test_parallel_serial_consistency() {
+    use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create two identical databases
+    for (vfs_name, db_name) in [("par_test1", "parallel.db"), ("par_test2", "serial.db")] {
+        let vfs = CompressedVfs::new(dir.path(), 3);
+        register(vfs_name, vfs).unwrap();
+
+        let db_path = dir.path().join(db_name);
+        let conn = Connection::open_with_flags_and_vfs(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            vfs_name,
+        )
+        .unwrap();
+
+        conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+
+        let test_data = "test_data_".repeat(100);
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                rusqlite::params![i, &test_data],
+            )
+            .unwrap();
+        }
+
+        // Create dead space
+        let updated = "updated___".repeat(100);
+        for i in 0..25 {
+            conn.execute(
+                "UPDATE data SET value = ?1 WHERE id = ?2",
+                rusqlite::params![&updated, i],
+            )
+            .unwrap();
+        }
+    }
+
+    // Compact parallel.db with parallel=true
+    let config_parallel = CompactionConfig::new(3).with_parallel(true);
+    compact_with_recompression(dir.path().join("parallel.db"), config_parallel).unwrap();
+
+    // Compact serial.db with parallel=false
+    let config_serial = CompactionConfig::new(3).with_parallel(false);
+    compact_with_recompression(dir.path().join("serial.db"), config_serial).unwrap();
+
+    // Both should have similar stats (may differ slightly due to compression variance)
+    let stats_parallel = inspect_database(dir.path().join("parallel.db")).unwrap();
+    let stats_serial = inspect_database(dir.path().join("serial.db")).unwrap();
+
+    assert_eq!(stats_parallel.page_count, stats_serial.page_count);
+    // File sizes should be very close (within 5% due to compression non-determinism)
+    let size_diff = (stats_parallel.file_size as f64 - stats_serial.file_size as f64).abs();
+    let max_diff = stats_parallel.file_size as f64 * 0.05;
+    assert!(
+        size_diff <= max_diff,
+        "Parallel and serial compaction should produce similar file sizes"
+    );
+}

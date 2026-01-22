@@ -39,52 +39,40 @@ data_start  varies   Page records (page_num:8 + size:4 + data)
 
 ---
 
-## Phase 2: Parallel Compression in Compaction
+## Phase 2: Parallel Compression in Compaction ✅
 
-### Goal
-Speed up `compact()` by compressing pages in parallel using rayon. Currently compaction is CPU-bound (zstd ~300 MB/s vs NVMe ~3000 MB/s).
+### Completed
+- [x] Added `rayon` as optional dependency with `parallel` feature flag
+- [x] Implemented `compact_with_recompression()` function:
+  - Reads all pages sequentially (I/O)
+  - Decompresses and recompresses in parallel with rayon (CPU-bound)
+  - Writes sequentially
+- [x] Added `CompactionConfig` struct for options:
+  - `compression_level`: 1-22 for zstd
+  - `dictionary`: Optional compression dictionary
+  - `parallel`: Enable/disable parallel compression
+- [x] Integration tests for parallel compaction
+- [x] Benchmarks comparing parallel vs serial compaction
 
-### Design
+### Usage
 ```rust
-// Current (serial):
-for (page_num, (offset, size)) in pages {
-    let data = read_page(offset, size);
-    let compressed = compress(data);  // CPU bottleneck
-    write_record(page_num, compressed);
-}
+use sqlite_compress_encrypt_vfs::{compact_with_recompression, CompactionConfig};
 
-// Parallel (with rayon):
-let work: Vec<_> = pages.iter()
-    .map(|(page_num, (offset, size))| {
-        let data = read_page(offset, size);  // I/O - can't parallelize
-        (*page_num, data)
-    })
-    .collect();
+// Parallel compaction with default settings (enabled when parallel feature is on)
+let config = CompactionConfig::new(3);
+let freed = compact_with_recompression("database.db", config)?;
 
-let compressed: Vec<_> = work.par_iter()  // rayon parallel
-    .map(|(page_num, data)| (*page_num, compress(data)))
-    .collect();
+// Force serial mode
+let config = CompactionConfig::new(3).with_parallel(false);
 
-for (page_num, data) in compressed {
-    write_record(page_num, data);  // Sequential writes (fine)
-}
+// With custom dictionary
+let config = CompactionConfig::new(3).with_dictionary(dict_bytes);
 ```
 
-### Tasks
-1. Add `rayon` as optional dependency (`parallel` feature)
-2. Modify `compact()` to use `par_iter()` for compression
-3. Benchmark: measure speedup on multi-core systems
-4. Consider chunk size tuning for memory efficiency
-
-### Expected Speedup
-- 4-8x on typical 4-8 core machines
-- Memory: ~page_count * avg_page_size during compaction
-
-### Locking Analysis
-- No locking issues: compression is pure computation
-- Reads are sequential (disk seek optimization)
-- Writes are sequential (already the case)
-- Only change is CPU parallelism during compression phase
+### Notes
+- Original `compact()` preserved for simple dead-space removal (no recompression)
+- `compact_with_recompression()` enables changing compression level or dictionary
+- Expected 4-8x speedup on multi-core systems for large databases
 
 ---
 
@@ -97,13 +85,24 @@ for (page_num, data) in compressed {
 - Note: AES-GCM already provides authentication for encrypted databases
 - Decision: Implement only if users request it
 
-### Phase 4: Client-Controlled Compaction Helpers
-- `compact_if_needed(path, threshold_pct)` - compact if dead_space exceeds threshold
+### Phase 4: Client-Controlled Compaction Helpers ✅
+- [x] `compact_if_needed(path, threshold_pct)` - compact if dead_space exceeds threshold
+  - Returns `Ok(Some(bytes_freed))` if compaction ran
+  - Returns `Ok(None)` if below threshold
 - Document recommended patterns for embedded use:
   - On startup (check + compact if needed)
   - On graceful shutdown
   - Periodic (client's choice)
 - Library provides tools, client decides policy
+
+```rust
+use sqlite_compress_encrypt_vfs::compact_if_needed;
+
+// Compact if dead space exceeds 20%
+if let Some(freed) = compact_if_needed("database.db", 20.0)? {
+    println!("Freed {} bytes", freed);
+}
+```
 
 ---
 
@@ -119,3 +118,5 @@ for (page_num, data) in compressed {
 - [x] Atomic write_end for concurrent access
 - [x] Debug lock tracing (SQLCES_DEBUG_LOCKS=1)
 - [x] Dictionary compression integration (Phase 1)
+- [x] Parallel compression in compaction (Phase 2)
+- [x] compact_if_needed helper (Phase 4)
