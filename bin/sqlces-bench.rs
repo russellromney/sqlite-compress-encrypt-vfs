@@ -123,7 +123,7 @@ enum Commands {
     BenchDb,
     /// Benchmark parallel vs serial compaction
     BenchCompact {
-        /// Number of rows to insert (more rows = longer compaction)
+        /// Number of rows to insert (more rows = longer compaction, ignored with --gutenberg)
         #[arg(long, default_value = "1000")]
         rows: usize,
 
@@ -134,6 +134,14 @@ enum Commands {
         /// Compression level (1-22)
         #[arg(long, default_value = "3")]
         compression_level: i32,
+
+        /// Use Project Gutenberg texts for realistic compression benchmarks
+        #[arg(long)]
+        gutenberg: bool,
+
+        /// Corpus size in MB when using --gutenberg (default: 10)
+        #[arg(long, default_value = "10")]
+        corpus_size_mb: usize,
     },
 }
 
@@ -157,8 +165,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle subcommands
     match &cli.command {
-        Some(Commands::BenchCompact { rows, iterations, compression_level }) => {
-            return bench_compact_command(*rows, *iterations, *compression_level);
+        Some(Commands::BenchCompact { rows, iterations, compression_level, gutenberg, corpus_size_mb }) => {
+            return bench_compact_command(*rows, *iterations, *compression_level, *gutenberg, *corpus_size_mb);
         }
         Some(Commands::BenchDb) | None => {
             // Default behavior: bench-db
@@ -691,15 +699,196 @@ fn format_markdown_report(results: &[BenchmarkResult]) -> String {
     output
 }
 
+/// Project Gutenberg texts to download (eBook ID, Author, Title)
+const GUTENBERG_TEXTS: &[(u32, &str, &str)] = &[
+    (100, "William Shakespeare", "Complete Works of Shakespeare"),
+    (2701, "Herman Melville", "Moby Dick"),
+    (1342, "Jane Austen", "Pride and Prejudice"),
+    (84, "Mary Shelley", "Frankenstein"),
+    (1661, "Arthur Conan Doyle", "Sherlock Holmes"),
+    (11, "Lewis Carroll", "Alice in Wonderland"),
+    (1400, "Homer", "The Iliad"),
+    (1727, "Homer", "The Odyssey"),
+    (2600, "Leo Tolstoy", "War and Peace"),
+    (1497, "The Bible", "King James Bible"),
+    (4300, "Charles Darwin", "Origin of Species"),
+    (98, "Charles Dickens", "A Tale of Two Cities"),
+    (1080, "Charles Dickens", "David Copperfield"),
+    (1404, "Fyodor Dostoevsky", "Brothers Karamazov"),
+    (2554, "Fyodor Dostoevsky", "Crime and Punishment"),
+];
+
+/// Download and cache a Gutenberg text
+fn download_gutenberg_text(ebook_id: u32, cache_dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let cache_file = cache_dir.join(format!("{}.txt", ebook_id));
+
+    if cache_file.exists() {
+        return Ok(std::fs::read_to_string(&cache_file)?);
+    }
+
+    // Try UTF-8 version first, then ASCII
+    let urls = [
+        format!("https://www.gutenberg.org/files/{}/{}-0.txt", ebook_id, ebook_id),
+        format!("https://www.gutenberg.org/files/{}/{}.txt", ebook_id, ebook_id),
+    ];
+
+    for url in &urls {
+        match ureq::get(url).call() {
+            Ok(response) => {
+                let text = response.into_string()?;
+                // Clean Gutenberg headers/footers
+                let cleaned = clean_gutenberg_text(&text);
+                std::fs::write(&cache_file, &cleaned)?;
+                return Ok(cleaned);
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err(format!("Failed to download ebook {}", ebook_id).into())
+}
+
+/// Remove Project Gutenberg headers and footers
+fn clean_gutenberg_text(text: &str) -> String {
+    let start_markers = [
+        "*** START OF THIS PROJECT GUTENBERG",
+        "***START OF THE PROJECT GUTENBERG",
+        "*** START OF THE PROJECT GUTENBERG",
+    ];
+    let end_markers = [
+        "*** END OF THIS PROJECT GUTENBERG",
+        "***END OF THE PROJECT GUTENBERG",
+        "*** END OF THE PROJECT GUTENBERG",
+    ];
+
+    let mut result = text.to_string();
+
+    for marker in start_markers {
+        if let Some(pos) = result.find(marker) {
+            if let Some(newline) = result[pos..].find('\n') {
+                result = result[pos + newline + 1..].to_string();
+            }
+            break;
+        }
+    }
+
+    for marker in end_markers {
+        if let Some(pos) = result.find(marker) {
+            result = result[..pos].to_string();
+            break;
+        }
+    }
+
+    result.trim().to_string()
+}
+
+/// Generate corpus from Gutenberg texts
+fn generate_gutenberg_corpus(target_size_mb: usize) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+    let cache_dir = std::env::temp_dir().join("sqlces_gutenberg_cache");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let target_bytes = target_size_mb * 1024 * 1024;
+    let mut corpus = Vec::new();
+    let mut current_size = 0usize;
+
+    println!("Downloading Gutenberg texts (cached in {:?})...", cache_dir);
+
+    for (ebook_id, author, title) in GUTENBERG_TEXTS {
+        if current_size >= target_bytes {
+            break;
+        }
+
+        print!("  {} - {}... ", author, title);
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        match download_gutenberg_text(*ebook_id, &cache_dir) {
+            Ok(text) => {
+                // Split into sections of ~2000 chars each
+                let sections = split_into_sections(&text, author, title);
+                let section_size: usize = sections.iter().map(|(a, t, txt)| a.len() + t.len() + txt.len()).sum();
+                current_size += section_size;
+
+                println!("{} sections, {:.2} MB", sections.len(), section_size as f64 / (1024.0 * 1024.0));
+                corpus.extend(sections);
+            }
+            Err(e) => {
+                println!("FAILED: {}", e);
+            }
+        }
+    }
+
+    // If we need more, repeat texts
+    let mut cycle = 1;
+    while current_size < target_bytes {
+        cycle += 1;
+        for (ebook_id, author, title) in GUTENBERG_TEXTS {
+            if current_size >= target_bytes {
+                break;
+            }
+
+            let cache_file = cache_dir.join(format!("{}.txt", ebook_id));
+            if !cache_file.exists() {
+                continue;
+            }
+
+            let text = std::fs::read_to_string(&cache_file)?;
+            let cycled_author = format!("{} (Cycle {})", author, cycle);
+            let sections = split_into_sections(&text, &cycled_author, title);
+            let section_size: usize = sections.iter().map(|(a, t, txt)| a.len() + t.len() + txt.len()).sum();
+            current_size += section_size;
+            corpus.extend(sections);
+        }
+    }
+
+    println!("Corpus: {} documents, {:.2} MB", corpus.len(), current_size as f64 / (1024.0 * 1024.0));
+    Ok(corpus)
+}
+
+/// Split text into sections for more realistic document sizes
+fn split_into_sections(text: &str, author: &str, title: &str) -> Vec<(String, String, String)> {
+    let section_size = 2000;
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut sections = Vec::new();
+    let words_per_section = section_size / 6; // ~6 chars per word average
+
+    for (i, chunk) in words.chunks(words_per_section).enumerate() {
+        let section_text = chunk.join(" ");
+        if section_text.len() > 500 {
+            sections.push((
+                author.to_string(),
+                format!("{} - Part {}", title, i + 1),
+                section_text,
+            ));
+        }
+    }
+
+    sections
+}
+
 /// Benchmark parallel vs serial compaction
-fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32) -> Result<(), Box<dyn std::error::Error>> {
+fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32, gutenberg: bool, corpus_size_mb: usize) -> Result<(), Box<dyn std::error::Error>> {
     use sqlite_compress_encrypt_vfs::{compact_with_recompression, inspect_database, CompactionConfig};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+    // Load corpus if using Gutenberg
+    let corpus = if gutenberg {
+        Some(generate_gutenberg_corpus(corpus_size_mb)?)
+    } else {
+        None
+    };
+
+    let doc_count = corpus.as_ref().map(|c| c.len()).unwrap_or(rows);
+
+    println!();
     println!("=== SQLCEs Parallel Compaction Benchmark ===");
-    println!("Rows: {}, Iterations: {}, Compression level: {}", rows, iterations, compression_level);
+    if gutenberg {
+        println!("Mode: Gutenberg corpus ({} MB, {} documents)", corpus_size_mb, doc_count);
+    } else {
+        println!("Mode: Synthetic data ({} rows)", rows);
+    }
+    println!("Iterations: {}, Compression level: {}", iterations, compression_level);
     println!();
 
     let mut parallel_times = Vec::new();
@@ -728,28 +917,55 @@ fn bench_compact_command(rows: usize, iterations: usize, compression_level: i32)
                 )?;
 
                 conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-                conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])?;
 
-                let test_data = "benchmark_data_for_compaction_".repeat(50);
-                conn.execute("BEGIN", [])?;
-                for i in 0..rows {
-                    conn.execute(
-                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                        rusqlite::params![i as i64, &test_data],
-                    )?;
-                }
-                conn.execute("COMMIT", [])?;
+                if let Some(ref corpus) = corpus {
+                    // Use Gutenberg corpus
+                    conn.execute("CREATE TABLE articles (id INTEGER PRIMARY KEY, author TEXT, title TEXT, body TEXT)", [])?;
 
-                // Create dead space with updates (50% of rows)
-                let updated = "updated_data_for_compaction_test_".repeat(50);
-                conn.execute("BEGIN", [])?;
-                for i in 0..(rows / 2) {
-                    conn.execute(
-                        "UPDATE data SET value = ?1 WHERE id = ?2",
-                        rusqlite::params![&updated, i as i64],
-                    )?;
+                    conn.execute("BEGIN", [])?;
+                    for (i, (author, title, body)) in corpus.iter().enumerate() {
+                        conn.execute(
+                            "INSERT INTO articles (id, author, title, body) VALUES (?1, ?2, ?3, ?4)",
+                            rusqlite::params![i as i64, author, title, body],
+                        )?;
+                    }
+                    conn.execute("COMMIT", [])?;
+
+                    // Create dead space with updates (50% of documents)
+                    conn.execute("BEGIN", [])?;
+                    for i in 0..(corpus.len() / 2) {
+                        let updated_body = format!("UPDATED: {}", &corpus[i].2);
+                        conn.execute(
+                            "UPDATE articles SET body = ?1 WHERE id = ?2",
+                            rusqlite::params![&updated_body, i as i64],
+                        )?;
+                    }
+                    conn.execute("COMMIT", [])?;
+                } else {
+                    // Use synthetic data
+                    conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT)", [])?;
+
+                    let test_data = "benchmark_data_for_compaction_".repeat(50);
+                    conn.execute("BEGIN", [])?;
+                    for i in 0..rows {
+                        conn.execute(
+                            "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                            rusqlite::params![i as i64, &test_data],
+                        )?;
+                    }
+                    conn.execute("COMMIT", [])?;
+
+                    // Create dead space with updates (50% of rows)
+                    let updated = "updated_data_for_compaction_test_".repeat(50);
+                    conn.execute("BEGIN", [])?;
+                    for i in 0..(rows / 2) {
+                        conn.execute(
+                            "UPDATE data SET value = ?1 WHERE id = ?2",
+                            rusqlite::params![&updated, i as i64],
+                        )?;
+                    }
+                    conn.execute("COMMIT", [])?;
                 }
-                conn.execute("COMMIT", [])?;
 
                 // Checkpoint WAL to main file
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
