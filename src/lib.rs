@@ -48,8 +48,12 @@ use std::time::Duration;
 
 /// Global cache of shared file state (index, header, write_end) per database path.
 /// All handles to the same file share one index to avoid duplicate memory and scans.
-static SHARED_FILE_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, Arc<SharedFileState>>>> =
+static SHARED_FILE_CACHE: once_cell::sync::Lazy<Mutex<HashMap<PathBuf, Arc<SharedWriteState>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Debug flag for shared state operations (set SQLCES_DEBUG_SHARED=1)
+static DEBUG_SHARED: once_cell::sync::Lazy<bool> =
+    once_cell::sync::Lazy::new(|| std::env::var("SQLCES_DEBUG_SHARED").map(|v| v == "1").unwrap_or(false));
 
 /// Invalidate cached state for a file. Call this after modifying a database
 /// file externally (e.g., after compact(), or before deleting/recreating a file).
@@ -228,7 +232,7 @@ impl FileHeader {
 
 /// Page index: maps page number to (file_offset, compressed_size)
 /// file_offset points to the start of the record (page_num field), not the data
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PageIndex {
     /// Maps page_num -> (record_offset, data_size)
     /// record_offset is where the 12-byte header starts
@@ -316,23 +320,24 @@ impl PageIndex {
     }
 }
 
-/// Shared file state across all handles to the same database file.
-/// Contains the page index, header, and write position - the expensive parts to rebuild.
-pub struct SharedFileState {
-    /// File header with page size, data start, etc.
-    header: RwLock<FileHeader>,
-    /// Page index: maps page number to (offset, size)
-    index: RwLock<PageIndex>,
-    /// Current write position (end of data)
+/// Shared write state for lock-free space allocation across connections.
+/// Only contains write_end - the index MUST be per-connection for SQLite isolation.
+pub struct SharedWriteState {
+    /// Current write position (end of data) - used for lock-free space reservation
     write_end: AtomicU64,
+    /// Header info (page_size, data_start) - read-only after init
+    header: RwLock<FileHeader>,
+    /// Snapshot of the index at creation time - used to initialize new connections
+    /// This is NOT used during operation; each connection has its own index copy.
+    initial_index: RwLock<PageIndex>,
 }
 
-impl SharedFileState {
+impl SharedWriteState {
     fn new(header: FileHeader, index: PageIndex, write_end: u64) -> Self {
         Self {
-            header: RwLock::new(header),
-            index: RwLock::new(index),
             write_end: AtomicU64::new(write_end),
+            header: RwLock::new(header),
+            initial_index: RwLock::new(index),
         }
     }
 }
@@ -340,9 +345,15 @@ impl SharedFileState {
 /// Compressed database file handle
 pub struct CompressedHandle {
     file: RwLock<File>,
-    /// Shared state (index, header, write_end) - shared across all handles to same file.
-    /// None for passthrough/auxiliary files that don't use VFS format.
-    shared_state: Option<Arc<SharedFileState>>,
+    /// Per-connection header - contains page_size, data_start, etc.
+    header: RwLock<FileHeader>,
+    /// Per-connection index - MUST be per-connection for SQLite isolation.
+    /// Each connection has its own view of the index to maintain consistency.
+    index: RwLock<PageIndex>,
+    /// Shared write state for lock-free space allocation.
+    /// Contains write_end that's shared across connections to avoid collisions.
+    /// None for passthrough/auxiliary files.
+    shared_write_state: Option<Arc<SharedWriteState>>,
     lock: RwLock<LockKind>,
     compression_level: i32,
     /// Whether this is a main database (uses VFS format) or auxiliary file (passthrough)
@@ -405,43 +416,60 @@ impl CompressedHandle {
             None
         };
 
-        // Check if we have shared state for this file in the cache
+        // Get or create shared write state.
+        // IMPORTANT: Each connection MUST scan the file to build its own index.
+        // The index cannot be shared or cloned from cache because:
+        // 1. SQLite requires each connection to have an isolated view
+        // 2. Other connections may have written data since the cache entry was created
+        //
+        // We only share write_end for lock-free space allocation.
         // Skip caching for anonymous files (empty path - used in tests)
-        let shared_state = if db_path.as_os_str().is_empty() {
+        let (shared_write_state, header, index, file_dictionary) = if db_path.as_os_str().is_empty() {
             // Anonymous file - always create fresh state, no caching
-            let (header, index, initial_write_end, _file_dictionary) = Self::load_file(&mut file)?;
-            Arc::new(SharedFileState::new(header, index, initial_write_end))
+            let (header, index, initial_write_end, file_dict) = Self::load_file(&mut file)?;
+            let shared = Arc::new(SharedWriteState::new(header.clone(), index.clone(), initial_write_end));
+            (shared, header, index, file_dict)
         } else {
+            // Always scan file to build fresh index for this connection
+            let (header, index, initial_write_end, file_dict) = Self::load_file(&mut file)?;
+
             let canonical_path = db_path.canonicalize().unwrap_or_else(|_| db_path.clone());
             let mut cache = SHARED_FILE_CACHE.lock();
 
-            if let Some(existing) = cache.get(&canonical_path) {
-                // Reuse existing shared state - critical for concurrent access!
-                // All handles to the same file MUST share the same state.
+            let shared_write = if let Some(existing) = cache.get(&canonical_path) {
+                // Cache hit: use existing write_end for space allocation
+                // But we already scanned file to get fresh header/index
+                if *DEBUG_SHARED {
+                    eprintln!("[SHARED] CACHE HIT {:?} - {} pages (fresh scan), write_end={}",
+                        canonical_path.file_name(), index.entries.len(),
+                        existing.write_end.load(Ordering::SeqCst));
+                }
+
+                // Update the cached write_end if our scan found more data
+                // This handles the case where another connection wrote data
+                let cached_write_end = existing.write_end.load(Ordering::SeqCst);
+                if initial_write_end > cached_write_end {
+                    existing.write_end.store(initial_write_end, Ordering::SeqCst);
+                }
+
                 Arc::clone(existing)
             } else {
-                // First open of this file - scan and create shared state
-                let (header, index, initial_write_end, _file_dictionary) = Self::load_file(&mut file)?;
-
-                let state = Arc::new(SharedFileState::new(header, index, initial_write_end));
+                // Cache miss: create new shared state
+                if *DEBUG_SHARED {
+                    eprintln!("[SHARED] CACHE MISS {:?} - {} pages, write_end={}",
+                        canonical_path.file_name(), index.entries.len(), initial_write_end);
+                }
+                let state = Arc::new(SharedWriteState::new(header.clone(), index.clone(), initial_write_end));
                 cache.insert(canonical_path.clone(), Arc::clone(&state));
                 state
-            }
+            };
+
+            (shared_write, header, index, file_dict)
         };
 
-        // Load dictionary from file if needed (only on first open, but we need it for compression)
+        // Dictionary handling (for zstd)
         #[cfg(feature = "zstd")]
-        let file_dictionary = {
-            let header = shared_state.header.read();
-            if header.dict_size > 0 {
-                let mut dict_bytes = vec![0u8; header.dict_size as usize];
-                use std::os::unix::fs::FileExt;
-                file.read_exact_at(&mut dict_bytes, HEADER_SIZE)?;
-                Some(dict_bytes)
-            } else {
-                None
-            }
-        };
+        let file_dictionary = file_dictionary;
 
         // Use provided dictionary if given, otherwise use one from file (if any)
         #[cfg(feature = "zstd")]
@@ -461,7 +489,9 @@ impl CompressedHandle {
 
         Ok(Self {
             file: RwLock::new(file),
-            shared_state: Some(shared_state),
+            header: RwLock::new(header),
+            index: RwLock::new(index),
+            shared_write_state: Some(shared_write_state),
             lock: RwLock::new(LockKind::None),
             compression_level,
             compressed: true,
@@ -495,7 +525,9 @@ impl CompressedHandle {
     ) -> Self {
         Self {
             file: RwLock::new(file),
-            shared_state: None, // Passthrough files don't use shared index
+            header: RwLock::new(FileHeader::new()),
+            index: RwLock::new(PageIndex::new()),
+            shared_write_state: None, // Passthrough files don't use shared write state
             lock: RwLock::new(LockKind::None),
             compression_level: 0,
             compressed: false,
@@ -530,10 +562,10 @@ impl CompressedHandle {
         )
     }
 
-    /// Get shared state (panics if called on passthrough handle)
+    /// Get shared write state (panics if called on passthrough handle)
     #[inline]
-    fn shared(&self) -> &SharedFileState {
-        self.shared_state.as_ref().expect("shared_state required for compressed mode")
+    fn shared_write(&self) -> &SharedWriteState {
+        self.shared_write_state.as_ref().expect("shared_write_state required for compressed mode")
     }
 
     /// Create encrypted handle (for tests)
@@ -963,8 +995,8 @@ impl DatabaseHandle for CompressedHandle {
 
         // Return logical size (uncompressed)
         // Use (max_page + 1) * page_size to account for gaps like SQLite's lock page
-        let header = self.shared().header.read();
-        let index = self.shared().index.read();
+        let header = self.header.read();
+        let index = self.index.read();
         if header.page_size > 0 && !index.entries.is_empty() {
             Ok((index.max_page + 1) * header.page_size as u64)
         } else {
@@ -992,7 +1024,7 @@ impl DatabaseHandle for CompressedHandle {
             return file.read_exact_at(buf, offset);
         }
 
-        let header = self.shared().header.read();
+        let header = self.header.read();
         let page_size = if header.page_size > 0 {
             header.page_size as usize
         } else {
@@ -1002,9 +1034,14 @@ impl DatabaseHandle for CompressedHandle {
 
         let page_num = offset / page_size as u64;
 
-        let index = self.shared().index.read();
+        let index = self.index.read();
+        let index_page_count = index.entries.len();
         if let Some(&(file_offset, compressed_size)) = index.entries.get(&page_num) {
             drop(index);
+            if *DEBUG_SHARED {
+                eprintln!("[SHARED] READ page {} from offset {} size {} (index has {} pages)",
+                    page_num, file_offset, compressed_size, index_page_count);
+            }
 
             // Use position-aware read with READ lock instead of write lock
             use std::os::unix::fs::FileExt;
@@ -1038,6 +1075,11 @@ impl DatabaseHandle for CompressedHandle {
 
             Ok(())
         } else {
+            if *DEBUG_SHARED {
+                eprintln!("[SHARED] READ page {} NOT FOUND (index has {} pages)",
+                    page_num, index_page_count);
+            }
+            drop(index);
             buf.fill(0);
             Ok(())
         }
@@ -1062,7 +1104,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Set page size from first write (brief lock)
         {
-            let mut header = self.shared().header.write();
+            let mut header = self.header.write();
             if header.page_size == 0 {
                 header.page_size = buf.len() as u32;
             }
@@ -1070,7 +1112,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Read page_size (brief read lock)
         let page_size = {
-            let header = self.shared().header.read();
+            let header = self.header.read();
             header.page_size as u64
         };
 
@@ -1098,7 +1140,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // ATOMIC SPACE RESERVATION: Reserve space without blocking readers
         // fetch_add returns the OLD value, which is our record offset
-        let record_offset = self.shared().write_end.fetch_add(record_size, Ordering::SeqCst);
+        let record_offset = self.shared_write().write_end.fetch_add(record_size, Ordering::SeqCst);
         let data_offset = record_offset + RECORD_HEADER_SIZE;
 
         // FILE I/O WITHOUT LOCKS: pwrite is thread-safe
@@ -1118,10 +1160,14 @@ impl DatabaseHandle for CompressedHandle {
 
         // BRIEF INDEX UPDATE: Only lock for HashMap insertion
         {
-            let mut index = self.shared().index.write();
+            let mut index = self.index.write();
             index.entries.insert(page_num, (data_offset, data_size));
             if page_num > index.max_page {
                 index.max_page = page_num;
+            }
+            if *DEBUG_SHARED {
+                eprintln!("[SHARED] WRITE page {} at offset {} size {} (index now has {} pages)",
+                    page_num, data_offset, data_size, index.entries.len());
             }
         }
 
@@ -1139,7 +1185,7 @@ impl DatabaseHandle for CompressedHandle {
 
         // Read header fields
         let (page_size, data_start, dict_size, flags) = {
-            let header = self.shared().header.read();
+            let header = self.header.read();
             (header.page_size, header.data_start, header.dict_size, header.flags)
         };
 
@@ -1166,7 +1212,7 @@ impl DatabaseHandle for CompressedHandle {
         // For compressed files, we update the in-memory index
         // Note: truncated pages become "dead" records in the file
         // They will be cleaned up on compaction
-        let header = self.shared().header.read();
+        let header = self.header.read();
         if header.page_size == 0 {
             return Ok(());
         }
@@ -1175,7 +1221,7 @@ impl DatabaseHandle for CompressedHandle {
 
         let max_page = if size == 0 { 0 } else { (size - 1) / page_size };
 
-        let mut index = self.shared().index.write();
+        let mut index = self.index.write();
         index.entries.retain(|&page_num, _| page_num <= max_page);
 
         Ok(())
