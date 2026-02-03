@@ -1,6 +1,6 @@
 # sqlite-compress-encrypt-vfs
 
-**SQLCEs** (pronounced "cinco seis") - SQLite VFS with transparent compression and encryption.
+**SQLCEs** (pronounced "sequel seis" like "cinco seis") - SQLite VFS with page-level compression and encryption.
 
 [![Crates.io](https://img.shields.io/crates/v/sqlite-compress-encrypt-vfs.svg)](https://crates.io/crates/sqlite-compress-encrypt-vfs)
 [![License](https://img.shields.io/crates/l/sqlite-compress-encrypt-vfs.svg)](LICENSE)
