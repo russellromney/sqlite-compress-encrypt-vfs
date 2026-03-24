@@ -4,7 +4,7 @@ turbolite is an experimental SQLite VFS designed from first principles to serve 
 
 > turbolite is **experimental**. It is new and may corrupt your data. Please be careful. 
 
-turbolite also has page-level compression and encryption for efficiency and encryption at-rest and in-transit.
+turbolite also has page-level compression for efficiency and encryption at-rest and in-transit.
 
 The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). 
 
@@ -42,8 +42,11 @@ pip install turbolite
 ```python
 import turbolite
 
-# Local compressed database
-conn = turbolite.connect("my.db")
+# S3 tiered database — serve cold queries from S3
+conn = turbolite.connect("my.db", mode="s3",
+    bucket="my-bucket",
+    endpoint="https://t3.storage.dev")
+
 conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
 conn.execute("INSERT INTO users VALUES (1, 'alice', 'alice@example.com')")
 conn.commit()
@@ -53,25 +56,7 @@ print(alice[1])
 >>> "alice"
 ```
 
-```python
-# S3 tiered database — serve cold queries from S3
-conn = turbolite.connect("my.db", mode="s3",
-    bucket="my-bucket",
-    endpoint="https://t3.storage.dev")
-```
-
-```python
-# Or manually load the extension for full control
-import sqlite3
-conn = sqlite3.connect(":memory:")
-turbolite.load(conn)
-conn.close()
-
-conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
-conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
-```
-
-See (installation details below) for Node, Go, Rust, and using the `.so` loadable extension directly
+See [Installation](#installation) for Node, Go, Rust, local-only mode, and using the `.so` loadable extension directly
 
 
 ## Design
@@ -231,15 +216,49 @@ Page-level operation means most SQLite features still work: FTS, R-tree, JSON, W
 
 **Python**: `pip install turbolite` — see [packages/python/](packages/python/)
 
+```python
+import turbolite
+
+# Local compressed (no S3 needed)
+conn = turbolite.connect("my.db")
+
+# S3 tiered
+conn = turbolite.connect("my.db", mode="s3", bucket="my-bucket", endpoint="https://t3.storage.dev")
+
+# Manual extension loading for full control
+import sqlite3
+conn = sqlite3.connect(":memory:")
+turbolite.load(conn)
+conn.close()
+conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
+conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
+```
+
 **Node.js**: `npm install turbolite` — see [packages/node/](packages/node/)
 
 **Rust**:
 ```toml
 [dependencies]
-turbolite = "0.1"                                              # local compressed VFS
-turbolite = { version = "0.1", features = ["tiered"] }         # + S3 storage
-turbolite = { version = "0.1", features = ["encryption"] }     # + encryption
+turbolite = "0.2"                                              # local compressed VFS
+turbolite = { version = "0.2", features = ["tiered"] }         # + S3 storage
+turbolite = { version = "0.2", features = ["encryption"] }     # + encryption
 ```
+
+**Go** (cgo, links the shared library):
+```bash
+make lib-bundled  # build libturbolite.{so,dylib}
+```
+```go
+// #cgo LDFLAGS: -L/path/to/target/release -lturbolite
+// #include <stdlib.h>
+// extern int turbolite_register_compressed(const char* name, const char* base_dir, int level);
+// extern void* turbolite_open(const char* path, const char* vfs_name);
+// extern int turbolite_exec(void* db, const char* sql);
+// extern char* turbolite_query_json(void* db, const char* sql);
+// extern void turbolite_close(void* db);
+import "C"
+```
+See [examples/go/](examples/go/) for a full HTTP server example.
 
 ### Loadable extension (any language)
 
@@ -253,7 +272,8 @@ make ext  # produces target/release/turbolite.{so,dylib}
 ```c
 sqlite3_enable_load_extension(db, 1);
 sqlite3_load_extension(db, "path/to/turbolite", NULL, NULL);
-// VFS "turbolite" is now registered — open with ?vfs=turbolite
+// "turbolite" VFS (local) is always registered
+// "turbolite-s3" VFS is also registered if TURBOLITE_BUCKET is set
 ``` 
 
 ### Node.js
@@ -388,7 +408,7 @@ Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-thread
 
 ```bash
 cargo test --features zstd                    # local VFS tests
-cargo test --features zstd,tiered             # + S3 integration tests (31 tests)
+cargo test --features zstd,tiered             # + S3 integration tests
 cargo test --features zstd,encryption         # + encryption tests
 ```
 
