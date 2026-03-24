@@ -7,6 +7,17 @@ Cargo.lock
 /benchmark-pages
 /benches/results
 
+# Build artifacts and binaries
+/bootstrap
+/tiered-bench
+*.zip
+
+# Lambda
+Dockerfile.lambda
+Dockerfile.lambda-fast
+/bin/tiered-bench-lambda.rs
+BENCHMARK.md
+
 # Benchmark scripts and results
 /scripts/
 
