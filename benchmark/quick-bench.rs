@@ -1,8 +1,8 @@
 //! Quick benchmark comparing SQLite VFS configurations.
 //!
-//! Run with: cargo run --example quick_bench --features encryption --release
+//! Run with: cargo run --example quick-bench --features encryption --release
 //!
-//! Uses realistic data from examples/corpora/ (sessions, logs, API responses, Redis users)
+//! Uses realistic data from benchmark/corpora/ (sessions, logs, API responses, Redis users)
 
 use rusqlite::Connection;
 use sqlite_compress_encrypt_vfs::{register, CompressedVfs};

@@ -9,7 +9,7 @@
 //!   COLD: clear_cache() before each iteration → measures S3 fetch + decode
 //!
 //! ```bash
-//! TIERED_TEST_BUCKET=sqlces-test \
+//! TIERED_TEST_BUCKET=turbolite-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
 //!   cargo run --release --features tiered,zstd --bin tiered-bench
 //! ```

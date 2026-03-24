@@ -67,20 +67,30 @@ name = "sqlces"
 path = "bin/sqlces.rs"
 
 [[bin]]
-name = "sqlces-bench"
-path = "bin/sqlces-bench.rs"
+name = "turbolite-bench"
+path = "benchmark/turbolite-bench.rs"
 
 [[bin]]
 name = "tiered-bench"
-path = "bin/tiered-bench.rs"
+path = "benchmark/tiered-bench.rs"
 required-features = ["tiered"]
 
 [[bin]]
 name = "tpch-bench"
-path = "bin/tpch-bench.rs"
+path = "benchmark/tpch-bench.rs"
 required-features = ["tiered", "zstd"]
 
 [[bin]]
 name = "tiered-bench-lambda"
-path = "bin/tiered-bench-lambda.rs"
+path = "benchmark/tiered-bench-lambda.rs"
 required-features = ["lambda"]
+
+[[bin]]
+name = "bench-validate"
+path = "benchmark/bench-validate.rs"
+required-features = ["tiered", "zstd"]
+
+[[example]]
+name = "quick-bench"
+path = "benchmark/quick-bench.rs"
+required-features = ["encryption"]

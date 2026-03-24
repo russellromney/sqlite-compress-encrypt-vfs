@@ -21,7 +21,7 @@ Warm/cold benchmark for the S3-backed page-group tiered VFS. Measures query late
 ## 1. Local (against Tigris)
 
 ```bash
-BUCKET_NAME=sqlces-test \
+BUCKET_NAME=turbolite-test \
   AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   BENCH_SIZES=100000 \
   BENCH_NO_CLEANUP=true \
@@ -31,7 +31,7 @@ BUCKET_NAME=sqlces-test \
 To reuse previously uploaded data (skip data generation):
 
 ```bash
-BUCKET_NAME=sqlces-test \
+BUCKET_NAME=turbolite-test \
   AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   BENCH_REUSE=social_100000 \
   BENCH_NO_CLEANUP=true \
@@ -42,7 +42,7 @@ BUCKET_NAME=sqlces-test \
 AWS credentials come from Soup:
 
 ```bash
-soup run -p sqlces -e development -- cargo run --release --features tiered,zstd --bin tiered-bench
+soup run -p turbolite -e development -- cargo run --release --features tiered,zstd --bin tiered-bench
 ```
 
 ## 2. Fly.io (against Tigris)
@@ -58,7 +58,7 @@ fly deploy
 ### Run
 
 ```bash
-fly ssh console -C "BUCKET_NAME=sqlces-test \
+fly ssh console -C "BUCKET_NAME=turbolite-test \
   AWS_ENDPOINT_URL=https://fly.storage.tigris.dev \
   BENCH_REUSE=social_100000 \
   BENCH_NO_CLEANUP=true \
@@ -69,7 +69,7 @@ fly ssh console -C "BUCKET_NAME=sqlces-test \
 Or set env vars on the app and just run:
 
 ```bash
-fly secrets set BUCKET_NAME=sqlces-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev
+fly secrets set BUCKET_NAME=turbolite-test AWS_ENDPOINT_URL=https://fly.storage.tigris.dev
 fly ssh console -C "BENCH_REUSE=social_100000 BENCH_NO_CLEANUP=true BENCH_SIZES=100000 tiered-bench"
 ```
 
@@ -99,6 +99,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
 COPY bin/ bin/
+COPY benchmark/ benchmark/
 RUN cargo build --release --features tiered,zstd --bin tiered-bench
 
 FROM scratch

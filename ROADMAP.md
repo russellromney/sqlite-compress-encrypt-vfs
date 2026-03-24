@@ -74,40 +74,47 @@ The fundamental reframe: **optimize for S3 request count, not data size.** A ran
 - Write buffer groups: tracking dirty sub-chunks is a tiny bitset.
 - The "major architectural change" warnings in Phase 16 largely dissolve at this scale.
 
-### Tests
+### Implementation (DONE)
+
+Sub-chunk caching model fully implemented:
+- `SubChunkId(group_id, frame_index)` + `SubChunkTier(Pinned/Index/Data)` + `SubChunkTracker` with tiered LRU eviction
+- DiskCache uses tracker alongside legacy PageBitmap for backward compat
+- `write_pages_bulk` (S3 frames) marks sub-chunks; `write_page` (individual) marks bitmap only
+- Read path detects page types: 0x05/0x02 → Pinned, 0x0A → Index, else Data
+- `clear_cache` removes Data+Index; `clear_cache_data_only` removes Data only; `clear_cache_all` clears everything
+- Tracker persists to disk with tier info, reloads on restart
+- 25 unit tests covering math, tier promotion, eviction order, LRU, persistence, DiskCache integration
+
+### Remaining Tests
 - [ ] Benchmark: 64KB vs 4KB pages on same dataset — cold point lookup, scan, write amplification
-- [ ] Test: sub-chunk eviction respects tier priority
 - [ ] Test: evicted sub-chunk → re-fetch from S3 → stale disk bytes correctly overwritten
 - [ ] Test: mixed page sizes (verify 4KB still works as non-default option)
 
 ---
 
-## Phase 15: Index Bundles
+## Phase 15: Index Bundles (DONE)
 
 Index access patterns are fundamentally different from data access: once you touch an index, you're scanning most or all of it. Data pages are point lookups — fetch exactly what you need. Indexes want minimum time to having the entire index cached.
 
 This is the interior bundle pattern extended to index leaves. Interior bundles already proved the concept: separate S3 storage, eager parallel fetch, permanent pinning.
 
-### Dedicated index bundles in S3
-- [ ] Detect index leaf pages (0x0A) at checkpoint, store in separate S3 objects
-- [ ] Index bundles have their own grouping parameters — larger than data groups, optimized for "fetch entire index fast"
-- [ ] Index leaf pages served from bundles, never from data page groups
-- [ ] On first index page touch, prefetch ALL index bundles in parallel (not hop-based like data prefetch)
-- [ ] `eager_index_load: bool` (default true) — load all index bundles on VFS open, same as interior bundles. First indexed query pays zero index-fetch latency.
+### Implementation (DONE)
 
-### Skip redundant data page group uploads
-- [ ] At checkpoint, classify dirty pages by type: interior → interior bundle, index leaf → index bundle, table leaf → data page group
-- [ ] A data page group is only dirty if it has dirty **table leaf** pages. Interior/index changes within a group don't trigger group re-upload.
-- [ ] `REINDEX` uploads zero data page groups — only index bundles + manifest
-- [ ] Interior page change uploads zero data page groups — only interior bundle + manifest
-- [ ] Atomicity unchanged: manifest swap is still the commit point
+- Manifest field `index_chunk_keys: HashMap<u32, String>` — same chunking as interior bundles (INTERIOR_CHUNK_RANGE)
+- S3 key format: `{prefix}/ixb/{chunk_id}_v{version}`
+- Index leaf pages (0x0A) detected at checkpoint, collected from dirty snapshot + cache's Index-tier sub-chunks
+- Same `encode_interior_bundle`/`decode_interior_bundle` format (reused, not duplicated)
+- `eager_index_load: bool` config (default true) — parallel fetch all index chunks on VFS open
+- On cache hit: index pages promoted to Index tier via `mark_index_page()` (from Phase 14 sub-chunk tracker)
+- GC includes index chunk keys in live key set
+- Import path also collects and uploads index leaf bundles
+- **Skip redundant page group uploads**: groups where ALL dirty pages are interior (0x05/0x02) or index leaf (0x0A) are skipped — those pages are served from bundles
+- 2 S3 integration tests: checkpoint + cold read with eager loading, and eager_index_load=false fallback
 
-### Tests
+### Remaining Tests
 - [ ] Benchmark: cold indexed lookup with/without index bundles (expect ~50% latency reduction)
 - [ ] Test: REINDEX → checkpoint → verify no data page group uploads (only index bundles)
 - [ ] Test: interior page split → checkpoint → verify no data page group re-upload
-- [ ] Test: mixed dirty pages (some index, some data) → correct group/bundle assignment
-- [ ] Test: first index touch triggers full index prefetch
 
 ---
 

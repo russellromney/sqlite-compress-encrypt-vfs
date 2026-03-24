@@ -7,7 +7,7 @@
 //! point lookups, range queries — the random chunk jumps that real workloads cause.
 //!
 //! ```bash
-//! TIERED_TEST_BUCKET=sqlces-test AWS_ENDPOINT_URL=https://t3.storage.dev \
+//! TIERED_TEST_BUCKET=turbolite-test AWS_ENDPOINT_URL=https://t3.storage.dev \
 //!   cargo run --release --features tiered,zstd --bin tpch-bench -- --scale 0.01
 //! ```
 

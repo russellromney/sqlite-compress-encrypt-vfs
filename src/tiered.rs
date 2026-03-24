@@ -5,31 +5,32 @@
 //! - Local NVMe disk is a page-level cache (uncompressed, direct pread)
 //! - Writes go through WAL (local, fast), checkpoint flushes dirty pages to S3 as page groups
 //! - Any instance with the VFS + S3 credentials can read the database
-//! - A page group = 2048 contiguous compressed pages in a single S3 object (~8MB at 4KB page size)
+//! - Default: 64KB pages, 256 pages per group (16MB uncompressed, ~8MB compressed)
+//! - Sub-chunk caching: the unit of S3 cost is the sub-chunk (4 pages = 256KB), not the page.
+//!   Cache tracking, eviction, and fetch all operate at sub-chunk granularity.
 //!
 //! S3 layout:
 //! ```text
 //! s3://{bucket}/{prefix}/
 //! ├── manifest.json       # version, page_count, page_size, pages_per_group, page_group_keys
 //! └── pg/
-//!     ├── 0_v1            # Page group 0, manifest version 1 (pages 0-2047)
-//!     ├── 1_v1            # Page group 1 (pages 2048-4095)
+//!     ├── 0_v1            # Page group 0, manifest version 1 (pages 0-255)
+//!     ├── 1_v1            # Page group 1 (pages 256-511)
 //!     └── 0_v2            # Page group 0 updated at version 2
-//! ```
-//!
-//! Page group format (S3 object, compressed):
-//! ```text
-//! [2049 × u32 offsets (8196 bytes)] [compressed page 0] [compressed page 1] ... [compressed page 2047]
 //! ```
 //!
 //! Local cache (single file, uncompressed):
 //! ```text
-//! [page 0 @ offset 0] [page 1 @ offset 4096] ... [page N @ offset N*4096]
+//! [page 0 @ offset 0] [page 1 @ offset 65536] ... [page N @ offset N*65536]
 //! ```
 //! Cache hits are a single pread() with zero CPU overhead (no decompression).
 //!
-//! Page bitmap (1 bit per page, persisted to disk):
-//! Tracks which pages are present in the local cache file.
+//! Sub-chunk tracker (in-memory, per sub-chunk):
+//! Tracks which sub-chunks are present in the local cache file.
+//! Eviction operates on sub-chunks with tiered priority:
+//!   Tier 0 (pinned): interior page sub-chunks — never evicted
+//!   Tier 1 (high):   index leaf sub-chunks — evicted last
+//!   Tier 2 (normal): data sub-chunks — standard LRU
 //!
 //! Interior B-tree pages (type bytes 0x05, 0x02) are pinned permanently — never evicted.
 //! They represent <1% of the database but are hit on every query.
@@ -55,8 +56,13 @@ use crate::FileWalIndex;
 
 // ===== Constants =====
 
-/// Default pages per page group (4096 × 4KB = 16MB uncompressed, ~8MB compressed).
-const DEFAULT_PAGES_PER_GROUP: u32 = 4096;
+/// Default pages per page group (256 × 64KB = 16MB uncompressed, ~8MB compressed).
+/// At 4KB page size this is 1MB per group — increase if using small pages.
+const DEFAULT_PAGES_PER_GROUP: u32 = 256;
+
+/// Default pages per sub-chunk frame for seekable encoding.
+/// At 64KB page size: 4 × 64KB = 256KB per frame, ~128KB compressed per range GET.
+const DEFAULT_SUB_PAGES_PER_FRAME: u32 = 4;
 
 /// Interior chunk range: each chunk covers this many page numbers.
 /// At ~1% interior page density → ~327 interior pages per chunk → ~1.3MB uncompressed.
@@ -123,8 +129,9 @@ pub struct TieredConfig {
     pub read_only: bool,
     /// Tokio runtime handle (pass in, or a new runtime is created)
     pub runtime_handle: Option<TokioHandle>,
-    /// Pages per page group (default 4096 = 16MB uncompressed at 4KB page size, ~8MB compressed).
+    /// Pages per page group (default 256 = 16MB uncompressed at 64KB page size, ~8MB compressed).
     /// Each S3 object contains this many contiguous compressed pages.
+    /// At 4KB page size this is 1MB per group — increase to 4096 for small pages.
     pub pages_per_group: u32,
     /// AWS region (default "us-east-1")
     pub region: Option<String>,
@@ -143,9 +150,9 @@ pub struct TieredConfig {
     /// Zstd compression dictionary (for 2-5x better compression on structured data)
     #[cfg(feature = "zstd")]
     pub dictionary: Option<Vec<u8>>,
-    /// Pages per sub-chunk frame for seekable page groups (default 32).
+    /// Pages per sub-chunk frame for seekable page groups (default 4).
     /// Each page group is encoded as multiple independently-decompressible frames,
-    /// enabling S3 byte-range GETs for point lookups (fetch ~128KB instead of ~10MB).
+    /// enabling S3 byte-range GETs for point lookups (~128KB compressed per range GET at 64KB pages).
     /// Set to 0 to disable seekable encoding (legacy single-frame format).
     pub sub_pages_per_frame: u32,
     /// Enable automatic garbage collection after each checkpoint.
@@ -153,6 +160,11 @@ pub struct TieredConfig {
     /// deleted from S3 immediately after the new manifest is uploaded.
     /// Default: false (old versions accumulate, enabling point-in-time restore).
     pub gc_enabled: bool,
+    /// Load all index leaf bundles on VFS open (default true).
+    /// When true, index leaf pages are fetched in parallel during connection open,
+    /// so the first indexed query pays zero index-fetch latency.
+    /// Same pattern as interior bundle loading.
+    pub eager_index_load: bool,
 }
 
 impl Default for TieredConfig {
@@ -180,8 +192,9 @@ impl Default for TieredConfig {
                 }),
             #[cfg(feature = "zstd")]
             dictionary: None,
-            sub_pages_per_frame: 32,
+            sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: false,
+            eager_index_load: true,
         }
     }
 }
@@ -207,6 +220,10 @@ pub struct Manifest {
     /// Fetched in parallel on connection open so B-tree traversal is all cache hits.
     #[serde(default)]
     pub interior_chunk_keys: HashMap<u32, String>,
+    /// Chunked index leaf bundle: chunk_id → S3 key. Same chunking as interior bundles.
+    /// Index leaf pages (0x0A) stored separately from data page groups for eager parallel fetch.
+    #[serde(default)]
+    pub index_chunk_keys: HashMap<u32, String>,
     /// Per-group frame table for seekable page groups (multi-frame encoding).
     /// frame_tables[gid] = vec of FrameEntry for each sub-chunk.
     /// Empty or missing means legacy single-frame format (full download required).
@@ -240,6 +257,7 @@ impl Manifest {
             pages_per_group: 0,
             page_group_keys: Vec::new(),
             interior_chunk_keys: HashMap::new(),
+            index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
         }
@@ -352,6 +370,11 @@ impl S3Client {
     /// Generate versioned S3 key for a chunked interior bundle piece.
     fn interior_chunk_key(&self, chunk_id: u32, version: u64) -> String {
         self.s3_key(&format!("ibc/{}_v{}", chunk_id, version))
+    }
+
+    /// Generate versioned S3 key for a chunked index leaf bundle piece.
+    fn index_chunk_key(&self, chunk_id: u32, version: u64) -> String {
+        self.s3_key(&format!("ixb/{}_v{}", chunk_id, version))
     }
 
     // --- Generic GET/PUT ---
@@ -804,15 +827,311 @@ impl PageBitmap {
     }
 }
 
-// ===== DiskCache (page-level cache with bitmap + TTL eviction) =====
+// ===== Sub-chunk cache tracking =====
 
-/// Local NVMe page cache with TTL-based eviction.
+/// Identifies a sub-chunk within a page group: (group_id, frame_index).
+/// The sub-chunk is the atomic unit of S3 cost — one range GET per sub-chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct SubChunkId {
+    group_id: u32,
+    frame_index: u16,
+}
+
+/// Priority tier for cache eviction. Lower number = higher priority (evicted last).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+enum SubChunkTier {
+    /// Interior page sub-chunks — never evicted.
+    Pinned = 0,
+    /// Index leaf sub-chunks — evicted only when all Data sub-chunks are gone.
+    Index = 1,
+    /// Table leaf / data sub-chunks — standard LRU, evicted first.
+    Data = 2,
+}
+
+/// Tracks which sub-chunks are present in the local cache file.
+/// Replaces per-page PageBitmap with per-sub-chunk granularity.
+/// Eviction operates on sub-chunks with tiered priority (Pinned > Index > Data).
+struct SubChunkTracker {
+    /// Which sub-chunks are currently cached on disk.
+    present: HashSet<SubChunkId>,
+    /// Priority tier per sub-chunk (determines eviction order).
+    tiers: HashMap<SubChunkId, SubChunkTier>,
+    /// Last access time per sub-chunk (for LRU within a tier).
+    access_times: HashMap<SubChunkId, Instant>,
+    /// Config: pages per group.
+    pages_per_group: u32,
+    /// Config: pages per sub-chunk frame.
+    sub_pages_per_frame: u32,
+    /// Path for persistence.
+    path: PathBuf,
+}
+
+impl SubChunkTracker {
+    fn new(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32) -> Self {
+        // Try to load from disk
+        let (present, tiers) = Self::load_from_disk(&path);
+        let now = Instant::now();
+        let access_times: HashMap<SubChunkId, Instant> = present.iter().map(|id| (*id, now)).collect();
+        Self {
+            present,
+            tiers,
+            access_times,
+            pages_per_group,
+            sub_pages_per_frame,
+            path,
+        }
+    }
+
+    /// Compute which sub-chunk a page belongs to.
+    fn sub_chunk_for_page(&self, page_num: u64) -> SubChunkId {
+        let ppg = self.pages_per_group;
+        let spf = self.sub_pages_per_frame;
+        if ppg == 0 || spf == 0 {
+            return SubChunkId { group_id: 0, frame_index: 0 };
+        }
+        let gid = (page_num / ppg as u64) as u32;
+        let page_in_group = (page_num % ppg as u64) as u32;
+        let frame_idx = page_in_group / spf;
+        SubChunkId { group_id: gid, frame_index: frame_idx as u16 }
+    }
+
+    /// Check if the sub-chunk containing this page is cached.
+    fn is_present(&self, page_num: u64) -> bool {
+        let id = self.sub_chunk_for_page(page_num);
+        self.present.contains(&id)
+    }
+
+    /// Check if a specific sub-chunk is cached.
+    fn is_sub_chunk_present(&self, id: &SubChunkId) -> bool {
+        self.present.contains(id)
+    }
+
+    /// Record a sub-chunk as cached with the given tier.
+    /// If already present at a higher priority (lower tier number), keeps the higher priority.
+    fn mark_present(&mut self, id: SubChunkId, tier: SubChunkTier) {
+        self.present.insert(id);
+        let existing = self.tiers.get(&id).copied();
+        match existing {
+            Some(t) if t <= tier => {} // already at equal or higher priority
+            _ => { self.tiers.insert(id, tier); }
+        }
+        self.access_times.insert(id, Instant::now());
+    }
+
+    /// Promote a sub-chunk to Pinned tier (interior pages).
+    /// Also ensures the sub-chunk is in the present set — pages may have been
+    /// written via write_page (bitmap-only), so tracker may not know about them yet.
+    fn mark_pinned(&mut self, id: SubChunkId) {
+        self.present.insert(id);
+        self.tiers.insert(id, SubChunkTier::Pinned);
+        // Ensure access time exists
+        self.access_times.entry(id).or_insert_with(Instant::now);
+    }
+
+    /// Promote a sub-chunk to Index tier (index leaf pages).
+    /// Also ensures the sub-chunk is in the present set.
+    fn mark_index(&mut self, id: SubChunkId) {
+        self.present.insert(id);
+        let existing = self.tiers.get(&id).copied();
+        match existing {
+            Some(SubChunkTier::Pinned) => {} // don't demote from pinned
+            _ => { self.tiers.insert(id, SubChunkTier::Index); }
+        }
+        // Ensure access time exists
+        self.access_times.entry(id).or_insert_with(Instant::now);
+    }
+
+    /// Touch a sub-chunk's access time (for LRU).
+    fn touch(&mut self, id: SubChunkId) {
+        self.access_times.insert(id, Instant::now());
+    }
+
+    /// Touch the sub-chunk containing a page.
+    fn touch_page(&mut self, page_num: u64) {
+        let id = self.sub_chunk_for_page(page_num);
+        self.touch(id);
+    }
+
+    /// Evict one sub-chunk: pick the lowest-priority (highest tier number),
+    /// least-recently-used sub-chunk. Returns the evicted sub-chunk or None if empty.
+    /// Never evicts Pinned (tier 0) sub-chunks.
+    fn evict_one(&mut self) -> Option<SubChunkId> {
+        // Find eviction candidate: highest tier number, oldest access time
+        // Use a single "epoch" instant for sub-chunks missing access times,
+        // so they are treated as the oldest (most evictable) entries.
+        let epoch = Instant::now() - Duration::from_secs(3600);
+        let mut candidate: Option<(SubChunkId, SubChunkTier, Instant)> = None;
+        for id in &self.present {
+            let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+            if tier == SubChunkTier::Pinned {
+                continue; // never evict pinned
+            }
+            let access = self.access_times.get(id).copied().unwrap_or(epoch);
+            match &candidate {
+                None => candidate = Some((*id, tier, access)),
+                Some((_, ct, ca)) => {
+                    // Prefer higher tier number (Data > Index), then older access
+                    if tier > *ct || (tier == *ct && access < *ca) {
+                        candidate = Some((*id, tier, access));
+                    }
+                }
+            }
+        }
+        if let Some((id, _, _)) = candidate {
+            self.remove(id);
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    /// Evict all sub-chunks in a specific tier that are older than `ttl`.
+    fn evict_expired_in_tier(&mut self, tier: SubChunkTier, ttl: Duration) -> Vec<SubChunkId> {
+        let now = Instant::now();
+        let expired: Vec<SubChunkId> = self.present.iter()
+            .filter(|id| {
+                let t = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+                if t != tier { return false; }
+                let access = self.access_times.get(id).copied().unwrap_or(now);
+                now.duration_since(access) > ttl
+            })
+            .copied()
+            .collect();
+        for id in &expired {
+            self.remove(*id);
+        }
+        expired
+    }
+
+    /// Remove a sub-chunk from tracking (does NOT zero disk).
+    fn remove(&mut self, id: SubChunkId) {
+        self.present.remove(&id);
+        self.tiers.remove(&id);
+        self.access_times.remove(&id);
+    }
+
+    /// Remove all sub-chunks for a given group.
+    fn remove_group(&mut self, group_id: u32) {
+        let to_remove: Vec<SubChunkId> = self.present.iter()
+            .filter(|id| id.group_id == group_id)
+            .copied()
+            .collect();
+        for id in to_remove {
+            self.remove(id);
+        }
+    }
+
+    /// Clear all non-pinned sub-chunks (for cold benchmarks).
+    fn clear_data(&mut self) {
+        let to_remove: Vec<SubChunkId> = self.present.iter()
+            .filter(|id| {
+                let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+                tier != SubChunkTier::Pinned
+            })
+            .copied()
+            .collect();
+        for id in to_remove {
+            self.remove(id);
+        }
+    }
+
+    /// Clear all non-pinned, non-index sub-chunks (data only).
+    fn clear_data_only(&mut self) {
+        let to_remove: Vec<SubChunkId> = self.present.iter()
+            .filter(|id| {
+                let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+                tier == SubChunkTier::Data
+            })
+            .copied()
+            .collect();
+        for id in to_remove {
+            self.remove(id);
+        }
+    }
+
+    /// Clear everything including pinned (full reset).
+    fn clear_all(&mut self) {
+        self.present.clear();
+        self.tiers.clear();
+        self.access_times.clear();
+    }
+
+    /// Number of tracked sub-chunks.
+    fn len(&self) -> usize {
+        self.present.len()
+    }
+
+    /// Number of sub-chunks in a specific tier.
+    fn count_tier(&self, tier: SubChunkTier) -> usize {
+        self.present.iter()
+            .filter(|id| self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data) == tier)
+            .count()
+    }
+
+    /// Persist tracker state to disk for crash recovery.
+    /// Serializes as JSON: vec of (SubChunkId, tier).
+    fn persist(&self) -> io::Result<()> {
+        let entries: Vec<(SubChunkId, u8)> = self.present.iter()
+            .map(|id| {
+                let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data) as u8;
+                (*id, tier)
+            })
+            .collect();
+        let data = serde_json::to_vec(&entries).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("serialize sub-chunk tracker: {}", e))
+        })?;
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, &data)?;
+        fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Load tracker state from disk.
+    fn load_from_disk(path: &Path) -> (HashSet<SubChunkId>, HashMap<SubChunkId, SubChunkTier>) {
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return (HashSet::new(), HashMap::new()),
+        };
+        let entries: Vec<(SubChunkId, u8)> = match serde_json::from_slice(&data) {
+            Ok(e) => e,
+            Err(_) => return (HashSet::new(), HashMap::new()),
+        };
+        let mut present = HashSet::new();
+        let mut tiers = HashMap::new();
+        for (id, tier_byte) in entries {
+            present.insert(id);
+            let tier = match tier_byte {
+                0 => SubChunkTier::Pinned,
+                1 => SubChunkTier::Index,
+                _ => SubChunkTier::Data,
+            };
+            tiers.insert(id, tier);
+        }
+        (present, tiers)
+    }
+
+    /// Get all pages covered by a sub-chunk (for cache invalidation / hole punching).
+    fn pages_for_sub_chunk(&self, id: SubChunkId, page_count: u64) -> std::ops::Range<u64> {
+        let start = id.group_id as u64 * self.pages_per_group as u64
+            + id.frame_index as u64 * self.sub_pages_per_frame as u64;
+        let end = std::cmp::min(
+            start + self.sub_pages_per_frame as u64,
+            page_count,
+        );
+        start..end
+    }
+}
+
+// ===== DiskCache (sub-chunk-level cache with tiered eviction) =====
+
+/// Local NVMe page cache with sub-chunk-level tracking and tiered eviction.
 ///
 /// Pages are stored **uncompressed** in a single cache file at natural offsets.
 /// Cache hits are a single `pread()` — zero CPU overhead (no decompression).
-/// A page bitmap tracks which pages are present.
+/// A SubChunkTracker tracks which sub-chunks are present (replaces per-page bitmap).
 ///
-/// Interior B-tree pages are pinned permanently (never evicted).
+/// Eviction tiers: Pinned (interior) > Index (index leaf) > Data (table leaf).
 struct DiskCache {
     #[allow(dead_code)] // retained for debugging
     cache_dir: PathBuf,
@@ -820,7 +1139,10 @@ struct DiskCache {
     /// RwLock: read lock for concurrent pread/pwrite (thread-safe on Unix),
     /// write lock only for set_len (extending the file).
     cache_file: parking_lot::RwLock<File>,
-    /// 1 bit per page: is this page present in cache_file?
+    /// Sub-chunk-level tracking: which sub-chunks are cached + eviction tiers.
+    tracker: parking_lot::Mutex<SubChunkTracker>,
+    /// Legacy page bitmap — kept for backward compatibility during migration.
+    /// TODO: remove once all code paths use tracker exclusively.
     bitmap: parking_lot::Mutex<PageBitmap>,
     /// Per-group state: 0=None, 1=Fetching, 2=Present
     group_states: parking_lot::Mutex<Vec<std::sync::atomic::AtomicU8>>,
@@ -835,6 +1157,7 @@ struct DiskCache {
     group_access: parking_lot::Mutex<HashMap<u64, Instant>>,
     ttl_secs: u64,
     pages_per_group: u32,
+    sub_pages_per_frame: u32,
     page_size: std::sync::atomic::AtomicU32,
 }
 
@@ -842,7 +1165,7 @@ struct DiskCache {
 static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl DiskCache {
-    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, page_size: u32, page_count: u64) -> io::Result<Self> {
+    fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64) -> io::Result<Self> {
         fs::create_dir_all(cache_dir)?;
 
         let cache_file_path = cache_dir.join("data.cache");
@@ -861,6 +1184,12 @@ impl DiskCache {
             }
         }
 
+        // Sub-chunk tracker (primary tracking mechanism)
+        let spf = if sub_pages_per_frame > 0 { sub_pages_per_frame } else { pages_per_group };
+        let tracker_path = cache_dir.join("sub_chunk_tracker");
+        let tracker = SubChunkTracker::new(tracker_path, pages_per_group, spf);
+
+        // Legacy bitmap (kept for backward compat during migration)
         let bitmap_path = cache_dir.join("page_bitmap");
         let mut bitmap = PageBitmap::new(bitmap_path);
         if page_count > 0 {
@@ -873,13 +1202,24 @@ impl DiskCache {
             0
         };
 
-        // Initialize group states — mark as Present for groups where bitmap shows all pages
+        // Initialize group states — mark as Present for groups where tracker shows coverage
         let group_states: Vec<std::sync::atomic::AtomicU8> = (0..total_groups)
             .map(|gid| {
-                let start = gid as u64 * pages_per_group as u64;
-                let end = (start + pages_per_group as u64).min(page_count);
-                let all_present = (start..end).all(|p| bitmap.is_present(p));
-                let state = if all_present && end > start {
+                // Check if all sub-chunks in this group are present in tracker
+                let frames_per_group = if spf > 0 { (pages_per_group + spf - 1) / spf } else { 1 };
+                let all_sub_chunks = (0..frames_per_group).all(|fi| {
+                    let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
+                    tracker.is_sub_chunk_present(&id)
+                });
+                // Fallback: check legacy bitmap (all pages in group present)
+                let all_bitmap = if !all_sub_chunks {
+                    let group_start = gid as u64 * pages_per_group as u64;
+                    let group_end = std::cmp::min(group_start + pages_per_group as u64, page_count);
+                    group_end > group_start && (group_start..group_end).all(|p| bitmap.is_present(p))
+                } else {
+                    false
+                };
+                let state = if (all_sub_chunks || all_bitmap) && page_count > 0 {
                     GroupState::Present as u8
                 } else {
                     GroupState::None as u8
@@ -891,6 +1231,7 @@ impl DiskCache {
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
             cache_file: parking_lot::RwLock::new(cache_file),
+            tracker: parking_lot::Mutex::new(tracker),
             bitmap: parking_lot::Mutex::new(bitmap),
             group_states: parking_lot::Mutex::new(group_states),
             group_condvar: parking_lot::Condvar::new(),
@@ -900,6 +1241,7 @@ impl DiskCache {
             group_access: parking_lot::Mutex::new(HashMap::new()),
             ttl_secs,
             pages_per_group,
+            sub_pages_per_frame: spf,
             page_size: std::sync::atomic::AtomicU32::new(page_size),
         })
     }
@@ -934,6 +1276,9 @@ impl DiskCache {
             }
         }
         self.bitmap.lock().mark_present(page_num);
+        // Do NOT mark sub-chunk tracker here — write_page writes a single page,
+        // not a complete sub-chunk. Sub-chunk tracker is only updated by
+        // write_pages_bulk() which writes complete frames fetched from S3.
         Ok(())
     }
 
@@ -960,10 +1305,23 @@ impl DiskCache {
             }
         }
 
-        // Mark all pages present in one lock acquisition
+        // Mark all pages present in legacy bitmap
         let mut bitmap = self.bitmap.lock();
         for i in 0..num_pages {
             bitmap.mark_present(start_page + i);
+        }
+        drop(bitmap);
+
+        // Mark sub-chunks present in tracker
+        {
+            let mut tracker = self.tracker.lock();
+            let mut seen = HashSet::new();
+            for i in 0..num_pages {
+                let id = tracker.sub_chunk_for_page(start_page + i);
+                if seen.insert(id) {
+                    tracker.mark_present(id, SubChunkTier::Data);
+                }
+            }
         }
         Ok(())
     }
@@ -974,7 +1332,14 @@ impl DiskCache {
     }
 
     /// Check if a page is present in the local cache.
+    /// Uses sub-chunk tracker as primary, falls back to legacy bitmap.
     fn is_present(&self, page_num: u64) -> bool {
+        let tracker = self.tracker.lock();
+        if tracker.is_present(page_num) {
+            return true;
+        }
+        drop(tracker);
+        // Fallback to legacy bitmap (for pages cached before tracker was introduced)
         self.bitmap.lock().is_present(page_num)
     }
 
@@ -1075,12 +1440,33 @@ impl DiskCache {
     /// Touch a group's access time for TTL tracking.
     fn touch_group(&self, gid: u64) {
         self.group_access.lock().insert(gid, Instant::now());
+        // Also touch all sub-chunks in this group
+        let mut tracker = self.tracker.lock();
+        let frames = if self.sub_pages_per_frame > 0 {
+            (self.pages_per_group + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
+        } else { 1 };
+        for fi in 0..frames {
+            let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
+            tracker.touch(id);
+        }
     }
 
     /// Mark a page group as containing B-tree interior pages (permanently pinned).
     fn mark_interior_group(&self, gid: u64, page_num: u64) {
         self.interior_groups.lock().insert(gid);
         self.interior_pages.lock().insert(page_num);
+        // Promote sub-chunk to Pinned tier
+        let mut tracker = self.tracker.lock();
+        let id = tracker.sub_chunk_for_page(page_num);
+        tracker.mark_pinned(id);
+    }
+
+    /// Mark a page's sub-chunk as Index tier (evicted after Data, before Pinned).
+    /// Called when we detect an index leaf page (0x0A) during page scanning.
+    fn mark_index_page(&self, page_num: u64) {
+        let mut tracker = self.tracker.lock();
+        let id = tracker.sub_chunk_for_page(page_num);
+        tracker.mark_index(id);
     }
 
     /// Evict page groups that haven't been accessed within TTL.
@@ -1117,6 +1503,8 @@ impl DiskCache {
         let start = gid * self.pages_per_group as u64;
         let count = self.pages_per_group as u64;
         self.bitmap.lock().clear_range(start, count);
+        // Also remove all sub-chunks for this group from tracker
+        self.tracker.lock().remove_group(gid as u32);
 
         // On Linux: hole punch to reclaim NVMe blocks
         #[cfg(target_os = "linux")]
@@ -1143,9 +1531,10 @@ impl DiskCache {
         }
     }
 
-    /// Persist the page bitmap to disk.
+    /// Persist the page bitmap and sub-chunk tracker to disk.
     fn persist_bitmap(&self) -> io::Result<()> {
-        self.bitmap.lock().persist()
+        self.bitmap.lock().persist()?;
+        self.tracker.lock().persist()
     }
 }
 
@@ -1682,7 +2071,7 @@ impl PrefetchPool {
                     }
                     let write_ms = write_start.elapsed().as_millis();
 
-                    // Scan pages for interior B-tree types
+                    // Scan pages for page types and set sub-chunk tier
                     {
                         let ps = _pg_size as usize;
                         for i in 0..actual_pages as usize {
@@ -1695,6 +2084,8 @@ impl PrefetchPool {
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
                                     cache.mark_interior_group(job.gid, pnum);
+                                } else if b == 0x0A {
+                                    cache.mark_index_page(pnum);
                                 }
                             }
                         }
@@ -1827,6 +2218,7 @@ impl TieredHandle {
         prefetch_hops: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
         gc_enabled: bool,
+        eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     ) -> Self {
         let page_size = manifest.page_size;
@@ -1900,6 +2292,43 @@ impl TieredHandle {
                     );
                 }
                 Err(e) => eprintln!("[tiered] interior chunk fetch failed: {}", e),
+            }
+        }
+
+        // Eagerly fetch index leaf bundles (same pattern as interior).
+        // Index pages are fetched in parallel so the first indexed query pays zero latency.
+        if eager_index_load && !manifest.index_chunk_keys.is_empty() {
+            let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
+            eprintln!("[tiered] fetching {} index leaf chunks in parallel...", chunk_keys.len());
+            match s3.get_page_groups_by_key(&chunk_keys) {
+                Ok(results) => {
+                    #[cfg(feature = "zstd")]
+                    let ix_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
+                    let mut total_pages = 0usize;
+                    let mut total_bytes = 0usize;
+                    for (key, data) in &results {
+                        total_bytes += data.len();
+                        match decode_interior_bundle(
+                            data,
+                            #[cfg(feature = "zstd")]
+                            ix_decoder.as_ref(),
+                        ) {
+                            Ok(pages) => {
+                                total_pages += pages.len();
+                                for (pnum, pdata) in &pages {
+                                    let _ = cache.write_page(*pnum, pdata);
+                                    cache.mark_index_page(*pnum);
+                                }
+                            }
+                            Err(e) => eprintln!("[tiered] index chunk {} decode failed: {}", key, e),
+                        }
+                    }
+                    eprintln!(
+                        "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
+                        total_pages, results.len(), total_bytes as f64 / 1024.0,
+                    );
+                }
+                Err(e) => eprintln!("[tiered] index chunk fetch failed: {}", e),
             }
         }
 
@@ -2083,12 +2512,17 @@ impl TieredHandle {
     }
 
     /// Check if a page is a B-tree interior page and mark its group.
+    /// Detect page type and set sub-chunk tier accordingly:
+    /// - 0x05 (table interior) / 0x02 (index interior) → Pinned (never evicted)
+    /// - 0x0A (index leaf) → Index tier (evicted after data, before pinned)
     fn detect_interior_page(&self, buf: &[u8], page_num: u64, cache: &DiskCache) {
         let type_byte = if page_num == 0 { buf.get(100) } else { buf.get(0) };
         if let Some(&b) = type_byte {
             if b == 0x05 || b == 0x02 {
                 let gid = group_id(page_num, self.pages_per_group);
                 cache.mark_interior_group(gid, page_num);
+            } else if b == 0x0A {
+                cache.mark_index_page(page_num);
             }
         }
     }
@@ -2327,7 +2761,7 @@ impl DatabaseHandle for TieredHandle {
                             }
                         }
 
-                        // Scan for interior B-tree pages in the sub-chunk
+                        // Scan for page types in the sub-chunk and set tier
                         for i in 0..pages_in_frame as usize {
                             let pnum = frame_start_page + i as u64;
                             let type_byte = if pnum == 0 {
@@ -2338,6 +2772,8 @@ impl DatabaseHandle for TieredHandle {
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
                                     cache.mark_interior_group(gid, pnum);
+                                } else if b == 0x0A {
+                                    cache.mark_index_page(pnum);
                                 }
                             }
                         }
@@ -2643,8 +3079,41 @@ impl DatabaseHandle for TieredHandle {
 
         let page_size = *self.page_size.read();
 
-        // For each dirty page group: read all raw pages, encode as whole-group compressed
-        for (&gid, _dirty_pages) in &groups_dirty {
+        // Skip page groups where ALL dirty pages are interior (0x05/0x02) or index leaf (0x0A).
+        // Those pages are served from their respective bundles — no need to re-upload the data group.
+        let mut skipped_groups = 0usize;
+        let groups_needing_upload: Vec<u64> = groups_dirty.keys()
+            .filter(|&&gid| {
+                let dirty_pages = &groups_dirty[&gid];
+                if dirty_pages.is_empty() {
+                    return true; // s3_dirty_groups entry — must upload (stale from prior local checkpoint)
+                }
+                let all_bundle_pages = dirty_pages.iter().all(|&pnum| {
+                    if let Some(data) = dirty_snapshot.get(&pnum) {
+                        let type_byte = if pnum == 0 { data.get(100).copied() } else { data.get(0).copied() };
+                        matches!(type_byte, Some(0x05) | Some(0x02) | Some(0x0A))
+                    } else {
+                        false // can't determine type — upload to be safe
+                    }
+                });
+                if all_bundle_pages {
+                    skipped_groups += 1;
+                    false // skip: all dirty pages are in bundles
+                } else {
+                    true // has table leaf or other data pages — must upload
+                }
+            })
+            .copied()
+            .collect();
+        if skipped_groups > 0 {
+            eprintln!(
+                "[sync] skipping {} page groups (all dirty pages are interior/index, served from bundles)",
+                skipped_groups,
+            );
+        }
+
+        // For each dirty page group that needs uploading: read all raw pages, encode as whole-group compressed
+        for &gid in &groups_needing_upload {
             let mut pages: Vec<Option<Vec<u8>>> = vec![None; ppg as usize];
             let start = group_start_page(gid, ppg);
             let mut need_s3_merge = false;
@@ -2818,11 +3287,132 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
+        // GC orphaned interior chunks: old chunks with no current interior pages
+        for (old_chunk_id, old_key) in &old_chunk_keys {
+            if !chunks.contains_key(old_chunk_id) {
+                // This chunk had interior pages before but has none now (e.g., after VACUUM/REINDEX)
+                replaced_keys.push(old_key.clone());
+                eprintln!("[sync] orphaned interior chunk {} scheduled for GC", old_chunk_id);
+            }
+        }
+
         // Parallel upload all dirty interior chunks
         if !chunk_uploads.is_empty() {
             eprintln!("[sync] uploading {} interior chunks...", chunk_uploads.len());
             s3.put_page_groups(&chunk_uploads)?;
             eprintln!("[sync] interior chunks uploaded");
+        }
+
+        // ── Index leaf bundles (same pattern as interior) ──
+        eprintln!("[sync] building index leaf bundles...");
+        let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
+        {
+            let mut dirty_index_count = 0usize;
+            for (&pnum, data) in &dirty_snapshot {
+                let type_byte = if pnum == 0 { data.get(100) } else { data.get(0) };
+                if let Some(&b) = type_byte {
+                    if b == 0x0A {
+                        all_index_leaves.insert(pnum, data.clone());
+                        dirty_index_count += 1;
+                    }
+                }
+            }
+            // Also include previously-cached index leaf pages (read from cache)
+            // We don't have a separate "known index pages" set like interior, so
+            // we rely on the sub-chunk tracker's Index tier entries.
+            let tracker = cache.tracker.lock();
+            let index_sub_chunks: Vec<SubChunkId> = tracker.present.iter()
+                .filter(|id| tracker.tiers.get(id).copied() == Some(SubChunkTier::Index))
+                .copied()
+                .collect();
+            drop(tracker);
+
+            let mut cache_read_ok = 0usize;
+            for sc in &index_sub_chunks {
+                let tracker = cache.tracker.lock();
+                let page_range = tracker.pages_for_sub_chunk(*sc, page_count);
+                drop(tracker);
+                for pnum in page_range {
+                    if pnum >= page_count || all_index_leaves.contains_key(&pnum) || dirty_snapshot.contains_key(&pnum) {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut buf).is_ok() {
+                        // Verify it's actually an index leaf page
+                        let tb = if pnum == 0 { buf.get(100).copied() } else { buf.get(0).copied() };
+                        if tb == Some(0x0A) {
+                            all_index_leaves.insert(pnum, buf);
+                            cache_read_ok += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[sync] index leaf collection: dirty={}, cache_read_ok={}, total={}",
+                dirty_index_count, cache_read_ok, all_index_leaves.len(),
+            );
+        }
+
+        // Group index leaf pages by chunk_id
+        let mut index_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        for (pnum, data) in all_index_leaves {
+            let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+            index_chunks.entry(chunk_id).or_default().push((pnum, data));
+        }
+        for pages in index_chunks.values_mut() {
+            pages.sort_by_key(|(pnum, _)| *pnum);
+        }
+
+        // Determine dirty index chunks
+        let dirty_index_chunk_ids: HashSet<u32> = dirty_snapshot.keys()
+            .filter(|&&pnum| {
+                let type_byte = if pnum == 0 { dirty_snapshot[&pnum].get(100) } else { dirty_snapshot[&pnum].get(0) };
+                type_byte.map_or(false, |&b| b == 0x0A)
+            })
+            .map(|&pnum| (pnum / INTERIOR_CHUNK_RANGE) as u32)
+            .collect();
+
+        let old_index_chunk_keys = self.manifest.read().index_chunk_keys.clone();
+        let mut new_index_chunk_keys: HashMap<u32, String> = HashMap::new();
+        let mut index_chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for (&chunk_id, pages) in &index_chunks {
+            if dirty_index_chunk_ids.contains(&chunk_id) || !old_index_chunk_keys.contains_key(&chunk_id) {
+                let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+                let encoded = encode_interior_bundle(
+                    &refs,
+                    page_size,
+                    self.compression_level,
+                    #[cfg(feature = "zstd")]
+                    self.encoder_dict.as_ref(),
+                )?;
+                let key = s3.index_chunk_key(chunk_id, next_version);
+                eprintln!(
+                    "[sync] index chunk {}: {} pages, {:.1}KB compressed",
+                    chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
+                );
+                index_chunk_uploads.push((key.clone(), encoded));
+                if let Some(old_key) = old_index_chunk_keys.get(&chunk_id) {
+                    replaced_keys.push(old_key.clone());
+                }
+                new_index_chunk_keys.insert(chunk_id, key);
+            } else {
+                new_index_chunk_keys.insert(chunk_id, old_index_chunk_keys[&chunk_id].clone());
+            }
+        }
+
+        // GC orphaned index chunks: old chunks with no current index leaf pages
+        for (old_chunk_id, old_key) in &old_index_chunk_keys {
+            if !index_chunks.contains_key(old_chunk_id) {
+                replaced_keys.push(old_key.clone());
+                eprintln!("[sync] orphaned index chunk {} scheduled for GC", old_chunk_id);
+            }
+        }
+
+        if !index_chunk_uploads.is_empty() {
+            eprintln!("[sync] uploading {} index chunks...", index_chunk_uploads.len());
+            s3.put_page_groups(&index_chunk_uploads)?;
+            eprintln!("[sync] index chunks uploaded");
         }
 
         // Update manifest atomically
@@ -2833,6 +3423,7 @@ impl DatabaseHandle for TieredHandle {
             pages_per_group: ppg,
             page_group_keys: new_keys,
             interior_chunk_keys: new_chunk_keys,
+            index_chunk_keys: new_index_chunk_keys,
             // VFS sync path uses legacy single-frame encoding for now
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
@@ -3146,6 +3737,7 @@ impl TieredVfs {
             &config.cache_dir,
             config.cache_ttl_secs,
             ppg,
+            config.sub_pages_per_frame,
             page_size,
             manifest.page_count,
         )?;
@@ -3221,9 +3813,15 @@ impl TieredVfs {
             let _ = bitmap.persist();
         }
 
-        // Don't truncate cache file — bitmap controls what's "present".
+        // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
+        {
+            let mut tracker = self.cache.tracker.lock();
+            tracker.clear_data_only();
+        }
+
+        // Don't truncate cache file — bitmap/tracker control what's "present".
         // Pinned page data stays in the file at correct offsets.
-        // Non-pinned pages are bitmap-absent so reads will re-fetch from S3.
+        // Non-pinned pages are absent so reads will re-fetch from S3.
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
@@ -3258,6 +3856,9 @@ impl TieredVfs {
             }
         }
         for key in manifest.interior_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+        for key in manifest.index_chunk_keys.values() {
             live_keys.insert(key.clone());
         }
 
@@ -3384,6 +3985,7 @@ impl Vfs for TieredVfs {
                 self.config.prefetch_hops.clone(),
                 Some(Arc::clone(&self.prefetch_pool)),
                 self.config.gc_enabled,
+                self.config.eager_index_load,
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
             ))
@@ -3489,6 +4091,12 @@ impl TieredBenchHandle {
             }
             let _ = bitmap.persist();
         }
+
+        // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
+        {
+            let mut tracker = self.cache.tracker.lock();
+            tracker.clear_data_only();
+        }
     }
 
     /// Evict everything — interior pages, group 0, all data. Nothing cached.
@@ -3510,6 +4118,12 @@ impl TieredBenchHandle {
             let mut bitmap = self.cache.bitmap.lock();
             bitmap.bits.fill(0);
             let _ = bitmap.persist();
+        }
+
+        // Clear ALL sub-chunk tracker entries including Pinned and Index
+        {
+            let mut tracker = self.cache.tracker.lock();
+            tracker.clear_all();
         }
     }
 
@@ -3588,6 +4202,7 @@ pub fn import_sqlite_file(
     let mut frame_tables: Vec<Vec<FrameEntry>> = Vec::with_capacity(total_groups as usize);
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut interior_pages: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut index_leaf_pages: Vec<(u64, Vec<u8>)> = Vec::new();
     let version = 1u64;
 
     eprintln!(
@@ -3610,10 +4225,12 @@ pub fn import_sqlite_file(
             let mut buf = vec![0u8; page_size as usize];
             file.read_exact_at(&mut buf, pnum * page_size as u64)?;
 
-            // Detect interior B-tree pages
+            // Detect interior B-tree pages and index leaf pages
             let type_byte = if pnum == 0 { buf[100] } else { buf[0] };
             if type_byte == 0x05 || type_byte == 0x02 {
                 interior_pages.push((pnum, buf.clone()));
+            } else if type_byte == 0x0A {
+                index_leaf_pages.push((pnum, buf.clone()));
             }
 
             pages.push(Some(buf));
@@ -3696,6 +4313,41 @@ pub fn import_sqlite_file(
         eprintln!("[import] uploaded {} interior chunks", chunk_uploads.len());
     }
 
+    // Build index leaf chunks (same pattern as interior)
+    let mut ix_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
+    for (pnum, data) in index_leaf_pages {
+        let chunk_id = (pnum / INTERIOR_CHUNK_RANGE) as u32;
+        ix_chunks.entry(chunk_id).or_default().push((pnum, data));
+    }
+    for pages in ix_chunks.values_mut() {
+        pages.sort_by_key(|(pnum, _)| *pnum);
+    }
+
+    let mut index_chunk_keys: HashMap<u32, String> = HashMap::new();
+    let mut ix_chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
+    for (&chunk_id, pages) in &ix_chunks {
+        let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+        let encoded = encode_interior_bundle(
+            &refs,
+            page_size,
+            compression_level,
+            #[cfg(feature = "zstd")]
+            None,
+        )?;
+        let key = s3.index_chunk_key(chunk_id, version);
+        eprintln!(
+            "[import] index chunk {}: {} pages, {:.1}KB",
+            chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
+        );
+        ix_chunk_uploads.push((key.clone(), encoded));
+        index_chunk_keys.insert(chunk_id, key);
+    }
+
+    if !ix_chunk_uploads.is_empty() {
+        s3.put_page_groups(&ix_chunk_uploads)?;
+        eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
+    }
+
     // Build and upload manifest
     let manifest = Manifest {
         version,
@@ -3704,6 +4356,7 @@ pub fn import_sqlite_file(
         pages_per_group: ppg,
         page_group_keys,
         interior_chunk_keys,
+        index_chunk_keys,
         frame_tables,
         sub_pages_per_frame: if use_seekable { sub_ppf } else { 0 },
     };
@@ -4195,7 +4848,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_and_read_page() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 8, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
         let data = vec![42u8; 64];
         cache.write_page(5, &data).unwrap();
         assert!(cache.is_present(5));
@@ -4208,7 +4861,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_multiple_pages() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         for i in 0..16u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
         }
@@ -4223,7 +4876,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_page_overwrite() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         cache.write_page(3, &vec![0xAA; 64]).unwrap();
         cache.write_page(3, &vec![0xBB; 64]).unwrap(); // overwrite
         let mut buf = vec![0u8; 64];
@@ -4234,7 +4887,7 @@ mod tests {
     #[test]
     fn test_disk_cache_write_extends_file() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 0).unwrap(); // page_count=0
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0).unwrap(); // page_count=0
         // Writing page 10 should extend the file
         cache.write_page(10, &vec![42u8; 64]).unwrap();
         assert!(cache.is_present(10));
@@ -4246,7 +4899,7 @@ mod tests {
     #[test]
     fn test_disk_cache_read_uncached_page_returns_zeros() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         // Page exists in sparse file but not marked in bitmap
         let mut buf = vec![0xFFu8; 64];
         cache.read_page(0, &mut buf).unwrap();
@@ -4256,7 +4909,7 @@ mod tests {
     #[test]
     fn test_disk_cache_creates_cache_file() {
         let dir = TempDir::new().unwrap();
-        let _cache = DiskCache::new(dir.path(), 3600, 4, 64, 100).unwrap();
+        let _cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 100).unwrap();
         assert!(dir.path().join("data.cache").exists());
         let meta = std::fs::metadata(dir.path().join("data.cache")).unwrap();
         assert_eq!(meta.len(), 100 * 64); // page_count * page_size
@@ -4266,14 +4919,14 @@ mod tests {
     fn test_disk_cache_creates_dir_if_missing() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("a").join("b").join("c");
-        let _cache = DiskCache::new(&nested, 3600, 4, 64, 8).unwrap();
+        let _cache = DiskCache::new(&nested, 3600, 4, 2, 64, 8).unwrap();
         assert!(nested.join("data.cache").exists());
     }
 
     #[test]
     fn test_disk_cache_group_states() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         assert_eq!(cache.group_state(0), GroupState::None);
         assert_eq!(cache.group_state(1), GroupState::None);
         assert!(cache.try_claim_group(0));
@@ -4286,7 +4939,7 @@ mod tests {
     #[test]
     fn test_disk_cache_try_claim_present_fails() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         assert!(!cache.try_claim_group(0)); // Already Present
@@ -4295,7 +4948,7 @@ mod tests {
     #[test]
     fn test_disk_cache_group_state_out_of_bounds() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap(); // 2 groups
         // Out of bounds should return None
         assert_eq!(cache.group_state(100), GroupState::None);
         assert_eq!(cache.group_state(u64::MAX), GroupState::None);
@@ -4304,7 +4957,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_present() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         cache.try_claim_group(0);
         cache.mark_group_present(0);
         // Should return immediately
@@ -4314,7 +4967,7 @@ mod tests {
     #[test]
     fn test_disk_cache_wait_for_group_none() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         // State is None — should return immediately
         cache.wait_for_group(0);
     }
@@ -4322,7 +4975,7 @@ mod tests {
     #[test]
     fn test_disk_cache_touch_group_updates_access() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         assert!(!cache.group_access.lock().contains_key(&0));
         cache.touch_group(0);
         assert!(cache.group_access.lock().contains_key(&0));
@@ -4333,7 +4986,7 @@ mod tests {
     #[test]
     fn test_disk_cache_mark_interior_group() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         assert!(!cache.interior_groups.lock().contains(&0));
         cache.mark_interior_group(0, 0);
         assert!(cache.interior_groups.lock().contains(&0));
@@ -4345,7 +4998,7 @@ mod tests {
     #[test]
     fn test_disk_cache_eviction_skips_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 0, 4, 64, 8).unwrap(); // TTL=0 = disabled
+        let cache = DiskCache::new(dir.path(), 0, 4, 2, 64, 8).unwrap(); // TTL=0 = disabled
         cache.mark_interior_group(0, 0);
         cache.touch_group(0);
         cache.touch_group(1);
@@ -4357,7 +5010,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_clears_bitmap_and_state() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         // Write pages in group 0 (pages 0-3)
         for i in 0..4u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -4380,7 +5033,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_group_preserves_other_groups() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         // Write pages in groups 0 and 1
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -4395,7 +5048,7 @@ mod tests {
     fn test_disk_cache_evict_expired_with_real_ttl() {
         let dir = TempDir::new().unwrap();
         // TTL = 1 second
-        let cache = DiskCache::new(dir.path(), 1, 4, 64, 16).unwrap();
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16).unwrap();
 
         // Write and touch group 0
         for i in 0..4u64 {
@@ -4418,7 +5071,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_expired_protects_interior() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 1, 4, 64, 16).unwrap(); // TTL = 1s
+        let cache = DiskCache::new(dir.path(), 1, 4, 2, 64, 16).unwrap(); // TTL = 1s
 
         for i in 0..8u64 {
             cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -4442,7 +5095,7 @@ mod tests {
     #[test]
     fn test_disk_cache_evict_expired_skips_recent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 10, 4, 64, 8).unwrap(); // TTL = 10s
+        let cache = DiskCache::new(dir.path(), 10, 4, 2, 64, 8).unwrap(); // TTL = 10s
         cache.touch_group(0);
         cache.evict_expired();
         // Group should NOT be evicted (only 0ms elapsed, TTL = 10s)
@@ -4452,7 +5105,7 @@ mod tests {
     #[test]
     fn test_disk_cache_ensure_group_capacity() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap(); // 2 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap(); // 2 groups
         assert_eq!(cache.group_states.lock().len(), 2);
         cache.ensure_group_capacity(10);
         assert_eq!(cache.group_states.lock().len(), 10);
@@ -4464,11 +5117,11 @@ mod tests {
     fn test_disk_cache_bitmap_persistence() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
             cache.write_page(3, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 64, 8).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
         assert!(cache2.is_present(3));
         assert!(!cache2.is_present(4));
     }
@@ -4477,7 +5130,7 @@ mod tests {
     fn test_disk_cache_reopen_initializes_group_states_from_bitmap() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
             // Write ALL pages in group 0 (pages 0-3)
             for i in 0..4u64 {
                 cache.write_page(i, &vec![i as u8; 64]).unwrap();
@@ -4485,7 +5138,7 @@ mod tests {
             cache.persist_bitmap().unwrap();
         }
         // Reopen — group 0 should be Present (all 4 pages marked)
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         assert_eq!(cache2.group_state(0), GroupState::Present);
         // Group 1 should be None (no pages)
         assert_eq!(cache2.group_state(1), GroupState::None);
@@ -4495,13 +5148,13 @@ mod tests {
     fn test_disk_cache_reopen_partial_group_is_none() {
         let dir = TempDir::new().unwrap();
         {
-            let cache = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+            let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
             // Write only 2 of 4 pages in group 0
             cache.write_page(0, &vec![0u8; 64]).unwrap();
             cache.write_page(1, &vec![1u8; 64]).unwrap();
             cache.persist_bitmap().unwrap();
         }
-        let cache2 = DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap();
+        let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap();
         // Partial group should be None (not all pages present)
         assert_eq!(cache2.group_state(0), GroupState::None);
         // But individual pages should still be present
@@ -4513,7 +5166,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_page_count() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 0).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 0).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
         assert_eq!(cache.group_state(0), GroupState::None);
     }
@@ -4521,7 +5174,7 @@ mod tests {
     #[test]
     fn test_disk_cache_zero_ppg() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 0, 64, 100).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 0, 0, 64, 100).unwrap();
         assert_eq!(cache.group_states.lock().len(), 0);
     }
 
@@ -4538,6 +5191,7 @@ mod tests {
             pages_per_group: 2048,
             page_group_keys: vec![],
             interior_chunk_keys: HashMap::new(),
+            index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
         };
@@ -4599,6 +5253,7 @@ mod tests {
                 "pg/2_v1".to_string(),
             ],
             interior_chunk_keys: HashMap::new(),
+            index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
         };
@@ -4743,6 +5398,7 @@ mod tests {
             pages_per_group: 64,
             page_group_keys: vec!["pg/0_v1".to_string(), "pg/1_v1".to_string()],
             interior_chunk_keys: HashMap::new(),
+            index_chunk_keys: HashMap::new(),
             frame_tables: vec![
                 vec![
                     FrameEntry { offset: 0, len: 500 },
@@ -4798,9 +5454,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tiered_config_default_pages_per_group_is_4096() {
-        assert_eq!(DEFAULT_PAGES_PER_GROUP, 4096);
-        assert_eq!(TieredConfig::default().pages_per_group, 4096);
+    fn test_tiered_config_default_pages_per_group() {
+        assert_eq!(DEFAULT_PAGES_PER_GROUP, 256);
+        assert_eq!(TieredConfig::default().pages_per_group, 256);
     }
 
     // =========================================================================
@@ -4870,7 +5526,7 @@ mod tests {
     #[test]
     fn test_disk_cache_concurrent_claim() {
         let dir = TempDir::new().unwrap();
-        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 64, 16).unwrap());
+        let cache = Arc::new(DiskCache::new(dir.path(), 3600, 4, 2, 64, 16).unwrap());
 
         // Simulate two threads trying to claim the same group
         let claimed1 = cache.try_claim_group(0);
@@ -4882,7 +5538,7 @@ mod tests {
     #[test]
     fn test_disk_cache_multiple_groups_independent() {
         let dir = TempDir::new().unwrap();
-        let cache = DiskCache::new(dir.path(), 3600, 4, 64, 32).unwrap(); // 8 groups
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 32).unwrap(); // 8 groups
 
         // Claim different groups — all should succeed
         for gid in 0..8u64 {
@@ -4903,7 +5559,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ppg = 4u32;
         let page_size = 64u32;
-        let cache = DiskCache::new(dir.path(), 3600, ppg, page_size, ppg as u64).unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, ppg, 2, page_size, ppg as u64).unwrap();
 
         // Create page group with known data
         let pages: Vec<Option<Vec<u8>>> = (0..ppg)
@@ -4995,5 +5651,663 @@ mod tests {
         leaf[0] = 0x0D;
         let b = leaf[0];
         assert!(b != 0x05 && b != 0x02);
+    }
+
+    // =========================================================================
+    // SubChunkTracker — Comprehensive Tests
+    // =========================================================================
+
+    #[test]
+    fn test_sub_chunk_for_page_basic() {
+        let dir = TempDir::new().unwrap();
+        let t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        // ppg=8, spf=2: group has 4 frames (0..3), each covering 2 pages
+        // Page 0,1 → group 0, frame 0
+        assert_eq!(t.sub_chunk_for_page(0), SubChunkId { group_id: 0, frame_index: 0 });
+        assert_eq!(t.sub_chunk_for_page(1), SubChunkId { group_id: 0, frame_index: 0 });
+        // Page 2,3 → group 0, frame 1
+        assert_eq!(t.sub_chunk_for_page(2), SubChunkId { group_id: 0, frame_index: 1 });
+        assert_eq!(t.sub_chunk_for_page(3), SubChunkId { group_id: 0, frame_index: 1 });
+        // Page 6,7 → group 0, frame 3
+        assert_eq!(t.sub_chunk_for_page(6), SubChunkId { group_id: 0, frame_index: 3 });
+        assert_eq!(t.sub_chunk_for_page(7), SubChunkId { group_id: 0, frame_index: 3 });
+        // Page 8 → group 1, frame 0
+        assert_eq!(t.sub_chunk_for_page(8), SubChunkId { group_id: 1, frame_index: 0 });
+        // Page 15 → group 1, frame 3
+        assert_eq!(t.sub_chunk_for_page(15), SubChunkId { group_id: 1, frame_index: 3 });
+    }
+
+    #[test]
+    fn test_sub_chunk_for_page_large_config() {
+        let dir = TempDir::new().unwrap();
+        // 64KB pages: ppg=256, spf=4 (production defaults)
+        let t = SubChunkTracker::new(dir.path().join("t"), 256, 4);
+        // Page 0 → group 0, frame 0
+        assert_eq!(t.sub_chunk_for_page(0), SubChunkId { group_id: 0, frame_index: 0 });
+        // Page 3 → group 0, frame 0 (still within first 4 pages)
+        assert_eq!(t.sub_chunk_for_page(3), SubChunkId { group_id: 0, frame_index: 0 });
+        // Page 4 → group 0, frame 1
+        assert_eq!(t.sub_chunk_for_page(4), SubChunkId { group_id: 0, frame_index: 1 });
+        // Page 255 → group 0, frame 63
+        assert_eq!(t.sub_chunk_for_page(255), SubChunkId { group_id: 0, frame_index: 63 });
+        // Page 256 → group 1, frame 0
+        assert_eq!(t.sub_chunk_for_page(256), SubChunkId { group_id: 1, frame_index: 0 });
+    }
+
+    #[test]
+    fn test_sub_chunk_for_page_zero_config() {
+        let dir = TempDir::new().unwrap();
+        let t = SubChunkTracker::new(dir.path().join("t"), 0, 0);
+        // Edge: zero config should not panic, returns (0, 0)
+        assert_eq!(t.sub_chunk_for_page(100), SubChunkId { group_id: 0, frame_index: 0 });
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_mark_and_present() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let id = SubChunkId { group_id: 0, frame_index: 1 };
+        assert!(!t.is_sub_chunk_present(&id));
+        assert!(!t.is_present(2)); // page 2 maps to this sub-chunk
+
+        t.mark_present(id, SubChunkTier::Data);
+        assert!(t.is_sub_chunk_present(&id));
+        assert!(t.is_present(2));
+        assert!(t.is_present(3)); // same sub-chunk
+        assert!(!t.is_present(0)); // different sub-chunk (frame 0)
+        assert!(!t.is_present(4)); // different sub-chunk (frame 2)
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_tier_promotion_respects_priority() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+
+        // Start as Data
+        t.mark_present(id, SubChunkTier::Data);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Data));
+
+        // Promote to Index
+        t.mark_index(id);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Index));
+
+        // Promote to Pinned
+        t.mark_pinned(id);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Pinned));
+
+        // Cannot demote from Pinned via mark_present
+        t.mark_present(id, SubChunkTier::Data);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Pinned));
+
+        // Cannot demote from Pinned via mark_index
+        t.mark_index(id);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Pinned));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_mark_present_does_not_demote() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+
+        // Set as Index
+        t.mark_present(id, SubChunkTier::Index);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Index));
+
+        // mark_present with Data should NOT demote to Data
+        t.mark_present(id, SubChunkTier::Data);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Index));
+
+        // mark_present with Index (same level) should keep Index
+        t.mark_present(id, SubChunkTier::Index);
+        assert_eq!(t.tiers.get(&id), Some(&SubChunkTier::Index));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_evict_one_prefers_data_over_index() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let data_id = SubChunkId { group_id: 0, frame_index: 0 };
+        let index_id = SubChunkId { group_id: 0, frame_index: 1 };
+
+        t.mark_present(index_id, SubChunkTier::Index);
+        t.mark_present(data_id, SubChunkTier::Data);
+
+        // Should evict Data first (higher tier number)
+        let evicted = t.evict_one().unwrap();
+        assert_eq!(evicted, data_id);
+        assert!(t.is_sub_chunk_present(&index_id));
+        assert!(!t.is_sub_chunk_present(&data_id));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_evict_one_never_evicts_pinned() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let data = SubChunkId { group_id: 0, frame_index: 1 };
+
+        t.mark_present(pinned, SubChunkTier::Data);
+        t.mark_pinned(pinned);
+        t.mark_present(data, SubChunkTier::Data);
+
+        // Should evict data, not pinned
+        let evicted = t.evict_one().unwrap();
+        assert_eq!(evicted, data);
+        assert!(t.is_sub_chunk_present(&pinned));
+
+        // With only pinned left, evict_one returns None
+        assert!(t.evict_one().is_none());
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_evict_one_lru_within_tier() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let old = SubChunkId { group_id: 0, frame_index: 0 };
+        let new = SubChunkId { group_id: 0, frame_index: 1 };
+
+        t.mark_present(old, SubChunkTier::Data);
+        std::thread::sleep(Duration::from_millis(10));
+        t.mark_present(new, SubChunkTier::Data);
+
+        // Should evict the older one
+        let evicted = t.evict_one().unwrap();
+        assert_eq!(evicted, old);
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_evict_cascade_data_then_index() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let index = SubChunkId { group_id: 0, frame_index: 1 };
+        let data1 = SubChunkId { group_id: 0, frame_index: 2 };
+        let data2 = SubChunkId { group_id: 0, frame_index: 3 };
+
+        t.mark_present(pinned, SubChunkTier::Data);
+        t.mark_pinned(pinned);
+        t.mark_present(index, SubChunkTier::Index);
+        std::thread::sleep(Duration::from_millis(5));
+        t.mark_present(data1, SubChunkTier::Data);
+        std::thread::sleep(Duration::from_millis(5));
+        t.mark_present(data2, SubChunkTier::Data);
+
+        // First two evictions should be Data tier (oldest first)
+        assert_eq!(t.evict_one().unwrap(), data1);
+        assert_eq!(t.evict_one().unwrap(), data2);
+        // Then Index tier
+        assert_eq!(t.evict_one().unwrap(), index);
+        // Pinned never evicted
+        assert!(t.evict_one().is_none());
+        assert!(t.is_sub_chunk_present(&pinned));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_evict_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        assert!(t.evict_one().is_none());
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_remove_group() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        // Add sub-chunks across two groups
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Pinned);
+        t.mark_present(SubChunkId { group_id: 1, frame_index: 0 }, SubChunkTier::Data);
+
+        t.remove_group(0);
+        // Group 0 sub-chunks gone (even pinned)
+        assert!(!t.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 0 }));
+        assert!(!t.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 1 }));
+        // Group 1 unaffected
+        assert!(t.is_sub_chunk_present(&SubChunkId { group_id: 1, frame_index: 0 }));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_clear_data_keeps_pinned() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let index = SubChunkId { group_id: 0, frame_index: 1 };
+        let data = SubChunkId { group_id: 0, frame_index: 2 };
+
+        t.mark_present(pinned, SubChunkTier::Data);
+        t.mark_pinned(pinned);
+        t.mark_present(index, SubChunkTier::Index);
+        t.mark_present(data, SubChunkTier::Data);
+
+        t.clear_data();
+        // Pinned survives
+        assert!(t.is_sub_chunk_present(&pinned));
+        // Index and Data are gone
+        assert!(!t.is_sub_chunk_present(&index));
+        assert!(!t.is_sub_chunk_present(&data));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_clear_data_only_keeps_index_and_pinned() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let index = SubChunkId { group_id: 0, frame_index: 1 };
+        let data = SubChunkId { group_id: 0, frame_index: 2 };
+
+        t.mark_present(pinned, SubChunkTier::Data);
+        t.mark_pinned(pinned);
+        t.mark_present(index, SubChunkTier::Index);
+        t.mark_present(data, SubChunkTier::Data);
+
+        t.clear_data_only();
+        // Pinned and Index survive
+        assert!(t.is_sub_chunk_present(&pinned));
+        assert!(t.is_sub_chunk_present(&index));
+        // Data is gone
+        assert!(!t.is_sub_chunk_present(&data));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_clear_all() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Data);
+        t.mark_pinned(SubChunkId { group_id: 0, frame_index: 0 });
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 2 }, SubChunkTier::Data);
+
+        t.clear_all();
+        assert_eq!(t.present.len(), 0);
+        assert_eq!(t.tiers.len(), 0);
+        assert_eq!(t.access_times.len(), 0);
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_persist_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tracker_persist");
+        {
+            let mut t = SubChunkTracker::new(path.clone(), 8, 2);
+            t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
+            t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
+            t.mark_present(SubChunkId { group_id: 1, frame_index: 2 }, SubChunkTier::Data);
+            t.persist().unwrap();
+        }
+        // Reload
+        let t2 = SubChunkTracker::new(path, 8, 2);
+        assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 0 }));
+        assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 0, frame_index: 1 }));
+        assert!(t2.is_sub_chunk_present(&SubChunkId { group_id: 1, frame_index: 2 }));
+        // Tiers survive persistence
+        assert_eq!(t2.tiers.get(&SubChunkId { group_id: 0, frame_index: 0 }), Some(&SubChunkTier::Pinned));
+        assert_eq!(t2.tiers.get(&SubChunkId { group_id: 0, frame_index: 1 }), Some(&SubChunkTier::Index));
+        assert_eq!(t2.tiers.get(&SubChunkId { group_id: 1, frame_index: 2 }), Some(&SubChunkTier::Data));
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_len_and_count_tier() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        assert_eq!(t.len(), 0);
+
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 0 }, SubChunkTier::Pinned);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 1 }, SubChunkTier::Index);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 2 }, SubChunkTier::Data);
+        t.mark_present(SubChunkId { group_id: 0, frame_index: 3 }, SubChunkTier::Data);
+
+        assert_eq!(t.len(), 4);
+        assert_eq!(t.count_tier(SubChunkTier::Pinned), 1);
+        assert_eq!(t.count_tier(SubChunkTier::Index), 1);
+        assert_eq!(t.count_tier(SubChunkTier::Data), 2);
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_touch_updates_lru_order() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let old = SubChunkId { group_id: 0, frame_index: 0 };
+        let new = SubChunkId { group_id: 0, frame_index: 1 };
+
+        t.mark_present(old, SubChunkTier::Data);
+        std::thread::sleep(Duration::from_millis(10));
+        t.mark_present(new, SubChunkTier::Data);
+
+        // Touch the old one to make it "new"
+        std::thread::sleep(Duration::from_millis(10));
+        t.touch(old);
+
+        // Now `new` is the least recently used
+        let evicted = t.evict_one().unwrap();
+        assert_eq!(evicted, new);
+    }
+
+    #[test]
+    fn test_sub_chunk_tracker_pages_for_sub_chunk() {
+        let dir = TempDir::new().unwrap();
+        let t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let page_count = 16u64;
+        // Frame 0 of group 0: pages 0..2
+        let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 0, frame_index: 0 }, page_count);
+        assert_eq!(pages, 0..2);
+        // Frame 2 of group 0: pages 4..6
+        let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 0, frame_index: 2 }, page_count);
+        assert_eq!(pages, 4..6);
+        // Frame 0 of group 1: pages 8..10
+        let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 1, frame_index: 0 }, page_count);
+        assert_eq!(pages, 8..10);
+        // Boundary: last frame clamped to page_count
+        let pages = t.pages_for_sub_chunk(SubChunkId { group_id: 1, frame_index: 3 }, page_count);
+        assert_eq!(pages, 14..16);
+    }
+
+    // =========================================================================
+    // DiskCache + SubChunkTracker integration
+    // =========================================================================
+
+    #[test]
+    fn test_disk_cache_write_pages_bulk_marks_sub_chunks() {
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=2, page_size=64, page_count=16
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        // Write 2 pages (a complete sub-chunk frame)
+        let data = vec![42u8; 128]; // 2 pages * 64 bytes
+        cache.write_pages_bulk(0, &data, 2).unwrap();
+
+        // Both pages in the sub-chunk should be present
+        assert!(cache.is_present(0));
+        assert!(cache.is_present(1));
+        // Pages in other sub-chunks should not
+        assert!(!cache.is_present(2));
+        assert!(!cache.is_present(8));
+    }
+
+    #[test]
+    fn test_disk_cache_write_page_does_not_mark_sub_chunk() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let data = vec![42u8; 64];
+        cache.write_page(0, &data).unwrap();
+
+        // Page 0 is present (via bitmap)
+        assert!(cache.is_present(0));
+        // Page 1 is in the same sub-chunk but was not written — should NOT be present
+        assert!(!cache.is_present(1));
+    }
+
+    #[test]
+    fn test_disk_cache_mark_interior_promotes_to_pinned() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        // Write a complete sub-chunk
+        let data = vec![42u8; 128];
+        cache.write_pages_bulk(0, &data, 2).unwrap();
+
+        // Initially Data tier
+        {
+            let tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(0);
+            assert_eq!(tracker.tiers.get(&id), Some(&SubChunkTier::Data));
+        }
+
+        // Mark as interior
+        cache.mark_interior_group(0, 0);
+
+        // Now Pinned
+        {
+            let tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(0);
+            assert_eq!(tracker.tiers.get(&id), Some(&SubChunkTier::Pinned));
+        }
+    }
+
+    #[test]
+    fn test_disk_cache_mark_index_promotes_to_index_tier() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        let data = vec![42u8; 128];
+        cache.write_pages_bulk(2, &data, 2).unwrap();
+
+        // Initially Data tier
+        {
+            let tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(2);
+            assert_eq!(tracker.tiers.get(&id), Some(&SubChunkTier::Data));
+        }
+
+        cache.mark_index_page(2);
+
+        // Now Index tier
+        {
+            let tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(2);
+            assert_eq!(tracker.tiers.get(&id), Some(&SubChunkTier::Index));
+        }
+    }
+
+    #[test]
+    fn test_disk_cache_evict_group_clears_tracker() {
+        let dir = TempDir::new().unwrap();
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+        // Write all sub-chunks in group 0 (4 frames * 2 pages = 8 pages)
+        let data = vec![42u8; 512]; // 8 pages * 64 bytes
+        cache.write_pages_bulk(0, &data, 8).unwrap();
+
+        // All pages present
+        for p in 0..8 {
+            assert!(cache.is_present(p));
+        }
+
+        cache.evict_group(0);
+
+        // All pages gone from tracker
+        let tracker = cache.tracker.lock();
+        for p in 0..8u64 {
+            assert!(!tracker.is_present(p));
+        }
+    }
+
+    #[test]
+    fn test_disk_cache_sub_chunk_boundary_pages() {
+        // Test that pages at sub-chunk boundaries are correctly assigned
+        let dir = TempDir::new().unwrap();
+        // ppg=4, spf=2: 2 frames per group
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8).unwrap();
+
+        // Write frame 0 of group 0 (pages 0,1)
+        cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();
+        assert!(cache.is_present(0));
+        assert!(cache.is_present(1));
+        assert!(!cache.is_present(2)); // frame 1
+
+        // Write frame 1 of group 0 (pages 2,3)
+        cache.write_pages_bulk(2, &vec![2u8; 128], 2).unwrap();
+        assert!(cache.is_present(2));
+        assert!(cache.is_present(3));
+
+        // Write frame 0 of group 1 (pages 4,5)
+        cache.write_pages_bulk(4, &vec![3u8; 128], 2).unwrap();
+        assert!(cache.is_present(4));
+        assert!(cache.is_present(5));
+        assert!(!cache.is_present(6)); // frame 1 of group 1
+    }
+
+    // ===== Regression tests for review bugs =====
+
+    #[test]
+    fn test_evict_one_no_access_time_treated_as_oldest() {
+        // Regression: evict_one() used Instant::now() per-iteration for missing access times,
+        // making those entries effectively unevictable. Now uses a fixed epoch (1hr ago).
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        // Insert a sub-chunk via present set and tier, but no access time
+        let orphan = SubChunkId { group_id: 0, frame_index: 0 };
+        t.present.insert(orphan);
+        t.tiers.insert(orphan, SubChunkTier::Data);
+        // Intentionally no access_times entry
+
+        // Insert a normal sub-chunk with access time
+        let normal = SubChunkId { group_id: 0, frame_index: 1 };
+        t.mark_present(normal, SubChunkTier::Data);
+
+        // The orphan (no access time) should be evicted first — it gets epoch (oldest)
+        let evicted = t.evict_one().unwrap();
+        assert_eq!(evicted, orphan, "sub-chunk without access time should be evicted first");
+        // Normal one should still be present
+        assert!(t.is_sub_chunk_present(&normal));
+    }
+
+    #[test]
+    fn test_evict_one_multiple_missing_access_times_all_evictable() {
+        // Regression: with per-iteration Instant::now(), multiple missing-access-time entries
+        // would compete unfairly. With fixed epoch, they're all equally old.
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        // Insert 3 sub-chunks with no access times
+        for i in 0..3u16 {
+            let id = SubChunkId { group_id: 0, frame_index: i };
+            t.present.insert(id);
+            t.tiers.insert(id, SubChunkTier::Data);
+        }
+
+        // All 3 should be evictable
+        assert!(t.evict_one().is_some());
+        assert!(t.evict_one().is_some());
+        assert!(t.evict_one().is_some());
+        assert!(t.evict_one().is_none());
+    }
+
+    #[test]
+    fn test_mark_pinned_adds_to_present_set() {
+        // Regression: mark_pinned() only set tier without adding to present set.
+        // This meant pinned sub-chunks from write_page path weren't tracked.
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+
+        // Before fix: mark_pinned without prior mark_present left sub-chunk not in present
+        t.mark_pinned(id);
+
+        assert!(t.is_sub_chunk_present(&id), "mark_pinned must add to present set");
+        assert_eq!(t.tiers[&id], SubChunkTier::Pinned);
+        assert!(t.access_times.contains_key(&id), "mark_pinned must set access time");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.count_tier(SubChunkTier::Pinned), 1);
+    }
+
+    #[test]
+    fn test_mark_index_adds_to_present_set() {
+        // Regression: mark_index() only set tier without adding to present set.
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+
+        t.mark_index(id);
+
+        assert!(t.is_sub_chunk_present(&id), "mark_index must add to present set");
+        assert_eq!(t.tiers[&id], SubChunkTier::Index);
+        assert!(t.access_times.contains_key(&id), "mark_index must set access time");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.count_tier(SubChunkTier::Index), 1);
+    }
+
+    #[test]
+    fn test_mark_pinned_does_not_duplicate_when_already_present() {
+        // mark_pinned on an already-present sub-chunk should promote tier, not add duplicate.
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        t.mark_present(id, SubChunkTier::Data);
+        assert_eq!(t.len(), 1);
+
+        t.mark_pinned(id);
+        assert_eq!(t.len(), 1); // still just 1 entry
+        assert_eq!(t.tiers[&id], SubChunkTier::Pinned);
+    }
+
+    #[test]
+    fn test_mark_index_respects_pinned_priority() {
+        // mark_index on a Pinned sub-chunk should NOT demote it.
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        let id = SubChunkId { group_id: 0, frame_index: 0 };
+        t.mark_pinned(id);
+        t.mark_index(id);
+
+        assert_eq!(t.tiers[&id], SubChunkTier::Pinned, "mark_index must not demote from Pinned");
+    }
+
+    #[test]
+    fn test_clear_cache_preserves_index_tier_in_tracker() {
+        // Regression: clear_cache() called clear_data() which removed Index tier.
+        // Should call clear_data_only() to keep Index + Pinned.
+        let dir = TempDir::new().unwrap();
+        // ppg=8, spf=2, page_size=64, page_count=16
+        let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16).unwrap();
+
+        // Write some frames via bulk (marks tracker)
+        cache.write_pages_bulk(0, &vec![1u8; 128], 2).unwrap();  // frame (0,0) - pages 0,1
+        cache.write_pages_bulk(2, &vec![2u8; 128], 2).unwrap();  // frame (0,1) - pages 2,3
+        cache.write_pages_bulk(4, &vec![3u8; 128], 2).unwrap();  // frame (0,2) - pages 4,5
+
+        // Promote one to Index, one to Pinned
+        cache.mark_index_page(2); // frame (0,1) → Index
+        {
+            let mut tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(0);
+            tracker.mark_pinned(id); // frame (0,0) → Pinned
+        }
+
+        // Verify pre-state
+        {
+            let tracker = cache.tracker.lock();
+            assert_eq!(tracker.count_tier(SubChunkTier::Pinned), 1);
+            assert_eq!(tracker.count_tier(SubChunkTier::Index), 1);
+            assert_eq!(tracker.count_tier(SubChunkTier::Data), 1);
+        }
+
+        // Simulate clear_cache tracker behavior (same as TieredVfs::clear_cache)
+        {
+            let mut tracker = cache.tracker.lock();
+            tracker.clear_data_only();
+        }
+
+        // After: Pinned and Index survive, Data is gone
+        {
+            let tracker = cache.tracker.lock();
+            assert_eq!(tracker.count_tier(SubChunkTier::Pinned), 1, "Pinned must survive clear_data_only");
+            assert_eq!(tracker.count_tier(SubChunkTier::Index), 1, "Index must survive clear_data_only");
+            assert_eq!(tracker.count_tier(SubChunkTier::Data), 0, "Data must be cleared");
+        }
+    }
+
+    #[test]
+    fn test_clear_data_removes_index_and_data() {
+        // Verify clear_data() removes both Data and Index, keeps only Pinned.
+        // (Used by clear_cache_all-like scenarios, not by clear_cache.)
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let index = SubChunkId { group_id: 0, frame_index: 1 };
+        let data = SubChunkId { group_id: 0, frame_index: 2 };
+
+        t.mark_present(pinned, SubChunkTier::Pinned);
+        t.mark_present(index, SubChunkTier::Index);
+        t.mark_present(data, SubChunkTier::Data);
+
+        t.clear_data();
+
+        assert!(t.is_sub_chunk_present(&pinned), "Pinned must survive clear_data");
+        assert!(!t.is_sub_chunk_present(&index), "Index must be removed by clear_data");
+        assert!(!t.is_sub_chunk_present(&data), "Data must be removed by clear_data");
     }
 }

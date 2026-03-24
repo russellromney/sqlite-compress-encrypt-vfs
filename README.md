@@ -1,33 +1,22 @@
 # turbolite
 
-S3-native SQLite VFS with sub-50ms cold queries on multi-GB SQLite databases served cold from S3.
+turbolite is an experimental SQLite VFS designed from first principles to serve cold queries from S3. 
 
-turbolite is an experimental SQLite VFS that persistes a SQLite database to S3. Spin up compute, point it at a bucket, and query immediately without downloading the database first. Point lookups fetch only the pages they need while scans are parallelized and/or prefetched. You can do point queries even if the database doesn't fit in memory or on local disk.
+Current performance is sub-50ms cold queries on a multi-GB SQLite database, with sub-500ms filter queries and subsecond full scans (depending on bandwidth and threads). Indexed filter/scan are even faster.
 
-It also offers page-level compression and encryption, enabling full-text search over compressed and encrypted databases. 
+turbolite also has page-level compression (speed) and encryption, enabling full-text search with small on-disk size databases and encryption in-transit and at-rest.
 
-This is for workloads where data outlives or outgrows compute: per-tenant databases, agent memory, analytics results, anything where you'd rather store $0.02/GB/month in S3 than keep a server running. Writes are local-speed while checkpoint persists to S3.
+Much of the design is inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. 
 
-Much of the design is inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 is not a filesystem — it has its own economics (PUTs are expensive, GETs are cheap, objects are immutable, bandwidth is practically free) and turbolite's architecture is shaped by them rather than traditional server constraints. 
+The result
 
 turbolite is a Rust library. Loadable extension (`.so`/`.dylib`) is planned.
 
-```
-Cold point lookup on 812MB database: 40ms (2 S3 range GETs, 400KB transferred)
-Warm queries: 37 microseconds
-Storage at rest: ~$0.02/month per GB
-(see benchmarking section)
-```
+turbolite is a standard VFS - operating at the page level, so all SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.  
 
-turbolite has **three features that compose at the page level:**
+> turbolite is experimental. It is new and it may have bugs that could corrupt your data.. Please don't use this on any data that matters unless it matures. 
 
-| Feature | What it does |
-|---------|-------------|
-| **S3 storage** | Checkpoint to S3 as immutable compressed page groups. Open cold from S3 with no local state. |
-| **Seekable compression** | Multi-frame zstd with per-frame byte offsets. Point lookups fetch the minimum necessary from S3, while scans are parallel and (relatively) fast |
-| **Page-level encryption** | AES-256-GCM per page. Composes with compression. |
-
-Because these operate at the page level, all SQLite features work transparently — FTS, R-tree, JSON, WAL mode. turbolite is a standard VFS. SQLite doesn't know the difference.
+> turbolite used to be named "sqlite-compress-encrypt-vfs (sqlces)
 
 ## Quick Start
 
@@ -235,6 +224,8 @@ turbolite aims to be the most efficient S3-native SQLite VFS.
 
 ## Benchmarking
 
+All benchmarks live in [`benchmark/`](benchmark/). See [`benchmark/README.md`](benchmark/README.md) for deployment scenarios (local, Fly.io, EC2).
+
 The `tiered-bench` binary generates a social media dataset (users, posts, likes, friendships) and benchmarks warm/cold/arctic queries against S3.
 
 ```bash
@@ -247,10 +238,8 @@ TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://t3.storage.dev \
 cargo run --features zstd,tiered --bin tiered-bench --release -- \
     --sizes 1000000 --prefetch-threads 8 --queries post --modes cold
 
-# Tiny machine config: 1 thread, conservative prefetch
-cargo run --features zstd,tiered --bin tiered-bench --release -- \
-    --sizes 100000 --prefetch-threads 1 --prefetch-hops 0.01,0.02,0.97 \
-    --queries post --modes cold --skip-verify
+# Quick local VFS comparison (no S3 needed)
+cargo run --example quick-bench --features encryption --release
 ```
 
 Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-hops`, `--queries` (post/profile/who-liked/mutual), `--modes` (warm/cold/arctic), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`.

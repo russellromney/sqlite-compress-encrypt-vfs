@@ -1,4 +1,4 @@
-//! sqlces-bench - SQLite Compression+Encryption Benchmark CLI
+//! turbolite-bench - turbolite Benchmark CLI
 //!
 //! Benchmarks VFS modes using real corpus data
 //!
@@ -58,7 +58,7 @@ fn get_preset(name: &str) -> Option<PresetConfig> {
 }
 
 #[derive(Parser)]
-#[command(name = "sqlces-bench")]
+#[command(name = "turbolite-bench")]
 #[command(about = "SQLite Compression+Encryption Benchmark CLI\n\nSubcommands: bench-db, bench-compact\nPresets: 10mb, 50mb, 100mb, 500mb")]
 struct Cli {
     #[command(subcommand)]
@@ -135,11 +135,11 @@ struct Cli {
 
 /// Get the cache directory for benchmark data
 fn get_cache_dir() -> PathBuf {
-    // Use ~/.cache/sqlces-bench/ on Unix, or temp dir on other platforms
+    // Use ~/.cache/turbolite-bench/ on Unix, or temp dir on other platforms
     if let Some(home) = dirs_home() {
-        home.join(".cache").join("sqlces-bench")
+        home.join(".cache").join("turbolite-bench")
     } else {
-        std::env::temp_dir().join("sqlces-bench")
+        std::env::temp_dir().join("turbolite-bench")
     }
 }
 
@@ -242,9 +242,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (db_path.clone(), cli.duration_secs, cli.cache_kb.unwrap_or(0), cli.mmap_kb.unwrap_or(0))
     } else {
         eprintln!("Error: Either --preset, --database, or --gutenberg is required");
-        eprintln!("  Example: sqlces-bench --preset 50mb");
-        eprintln!("  Example: sqlces-bench --database path/to/db.db");
-        eprintln!("  Example: sqlces-bench --gutenberg --corpus-size-mb 20");
+        eprintln!("  Example: turbolite-bench --preset 50mb");
+        eprintln!("  Example: turbolite-bench --database path/to/db.db");
+        eprintln!("  Example: turbolite-bench --gutenberg --corpus-size-mb 20");
         std::process::exit(1);
     };
 

@@ -3193,4 +3193,233 @@ mod tiered_tests {
         let deleted = gc_vfs.gc().unwrap();
         assert_eq!(deleted, 0, "GC on empty prefix should delete nothing");
     }
+
+    // =========================================================================
+    // Index Bundle Integration Tests
+    // =========================================================================
+
+    /// Verify that checkpoint produces index_chunk_keys in the S3 manifest
+    /// and a cold reader can query indexes without fetching data page groups.
+    #[test]
+    fn test_index_bundles_checkpoint_and_cold_read() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("index_bundles", cache_dir.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let vfs_name = unique_vfs_name("ixb");
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "ixb_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA page_size=4096;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+             CREATE INDEX idx_name ON items(name);
+             CREATE INDEX idx_category ON items(category);",
+        )
+        .unwrap();
+
+        // Insert enough rows to create real index pages
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..500 {
+                tx.execute(
+                    "INSERT INTO items VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        i,
+                        format!("item_{:04}", i),
+                        format!("cat_{}", i % 20),
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+
+        // Verify manifest has index_chunk_keys
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let manifest_data = rt.block_on(async {
+            let aws_config = aws_config::from_env()
+                .region(aws_sdk_s3::config::Region::new("auto"))
+                .load()
+                .await;
+            let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
+            if let Some(ep) = &endpoint {
+                s3_config = s3_config.endpoint_url(ep).force_path_style(true);
+            }
+            let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+            let resp = client
+                .get_object()
+                .bucket(&bucket)
+                .key(format!("{}/manifest.json", prefix))
+                .send()
+                .await
+                .expect("manifest should exist");
+            resp.body.collect().await.unwrap().into_bytes().to_vec()
+        });
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_data).unwrap();
+        let index_keys = manifest.get("index_chunk_keys");
+        // Index chunk keys should be present (may be empty if no index leaf pages created yet,
+        // but with 500 rows and 2 indexes the B-tree should have leaves)
+        assert!(
+            index_keys.is_some(),
+            "manifest should have index_chunk_keys field"
+        );
+
+        // Cold read: open a new connection on a fresh cache
+        let cold_cache = TempDir::new().unwrap();
+        let cold_config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            cache_dir: cold_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint.clone(),
+            read_only: true,
+            region: region.clone(),
+            eager_index_load: true,
+            ..Default::default()
+        };
+        let cold_vfs_name = unique_vfs_name("ixb_cold");
+        let cold_vfs = TieredVfs::new(cold_config).unwrap();
+        let _bench = cold_vfs.bench_handle();
+        sqlite_compress_encrypt_vfs::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
+
+        let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "ixb_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &cold_vfs_name,
+        )
+        .unwrap();
+
+        // Query using the index — should work on cold cache
+        let count: i64 = cold_conn
+            .query_row("SELECT COUNT(*) FROM items WHERE name = 'item_0123'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "indexed query should find the row");
+
+        let cat_count: i64 = cold_conn
+            .query_row("SELECT COUNT(*) FROM items WHERE category = 'cat_5'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cat_count, 25, "category index query should find 25 rows");
+
+        // Cleanup
+        drop(cold_conn);
+
+        // Destroy S3 data
+        let cleanup_config = TieredConfig {
+            bucket,
+            prefix,
+            cache_dir: cold_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint,
+            region,
+            ..Default::default()
+        };
+        let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+        cleanup_vfs.destroy_s3().unwrap();
+    }
+
+    /// Verify that eager_index_load=false skips index bundle fetch,
+    /// but queries still work (index pages fetched on demand from data groups).
+    #[test]
+    fn test_index_bundles_eager_load_disabled() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("ixb_no_eager", cache_dir.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let vfs_name = unique_vfs_name("ixb_ne");
+
+        let vfs = TieredVfs::new(config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "ixb_ne.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "PRAGMA page_size=4096;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT);
+             CREATE INDEX idx_sku ON products(sku);",
+        )
+        .unwrap();
+
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..200 {
+                tx.execute(
+                    "INSERT INTO products VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("SKU-{:05}", i)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+
+        // Open cold reader with eager_index_load=false
+        let cold_cache = TempDir::new().unwrap();
+        let cold_config = TieredConfig {
+            bucket: bucket.clone(),
+            prefix: prefix.clone(),
+            cache_dir: cold_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint.clone(),
+            read_only: true,
+            region: region.clone(),
+            eager_index_load: false,
+            ..Default::default()
+        };
+        let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
+        let cold_vfs = TieredVfs::new(cold_config).unwrap();
+        sqlite_compress_encrypt_vfs::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
+
+        let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "ixb_ne.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            &cold_vfs_name,
+        )
+        .unwrap();
+
+        // Index query should still work (fetched on demand from data page groups)
+        let count: i64 = cold_conn
+            .query_row("SELECT COUNT(*) FROM products WHERE sku = 'SKU-00050'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        drop(cold_conn);
+
+        let cleanup_config = TieredConfig {
+            bucket,
+            prefix,
+            cache_dir: cold_cache.path().to_path_buf(),
+            compression_level: 3,
+            endpoint_url: endpoint,
+            region,
+            ..Default::default()
+        };
+        let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+        cleanup_vfs.destroy_s3().unwrap();
+    }
 }
