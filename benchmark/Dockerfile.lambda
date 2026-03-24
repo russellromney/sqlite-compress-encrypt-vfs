@@ -10,6 +10,6 @@ RUN cargo build --release --features tiered,zstd --bin tiered-bench
 
 FROM public.ecr.aws/lambda/provided:al2023
 COPY --from=builder /app/target/release/tiered-bench /var/task/tiered-bench
-COPY lambda-bootstrap.sh /var/runtime/bootstrap
+COPY benchmark/lambda-bootstrap.sh /var/runtime/bootstrap
 RUN chmod +x /var/runtime/bootstrap /var/task/tiered-bench
 CMD ["handler"]
