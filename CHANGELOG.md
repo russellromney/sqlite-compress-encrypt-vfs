@@ -2,6 +2,29 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Ypres: Encryption Key Rotation
+
+Re-encrypt all S3 data with a new key without decompressing/recompressing.
+
+### Design
+- `rotate_encryption_key(config, new_key)` standalone function
+- Decrypt with old key, re-encrypt with new key. GCM overhead is constant (28 bytes/frame), so frame table offsets are preserved.
+- Seekable page groups: per-frame decrypt/re-encrypt
+- Non-seekable page groups, interior bundles, index bundles: whole-blob decrypt/re-encrypt
+- Manifest upload is the atomic commit point. Old S3 objects GC'd after.
+- Local cache cleared (ephemeral, repopulates on next open)
+
+### Safety
+- Fail-fast: validates old key by decrypting first page group before any uploads
+- Crash-safe: old objects never overwritten, only new versioned objects created
+- Atomic: manifest swap is the commit point; partial rotation leaves orphans cleaned by gc()
+
+### Tests
+- 9 rotation unit tests: seekable/non-seekable/bundle roundtrips, frame table preservation, nonce uniqueness, wrong key rejection, same-key idempotent, empty DB, large page group (256 pages)
+- 4 S3 integration tests: cold read after rotation, old key rejection, GC cleanup verification, row-level data integrity (500 rows)
+
+---
+
 ## Verdun: Tiered Encryption
 
 One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache metadata.

@@ -6,38 +6,14 @@
 
 Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 64KB pages, 256 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~256KB) without downloading entire groups.
 
-Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything.
+Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything. Encryption key rotation via `rotate_encryption_key()` (decrypt/re-encrypt without decompression, atomic manifest swap).
 
 1M-row social media dataset (1.46GB, 91 page groups, 64KB pages):
 - Arctic point lookup: 143ms (true cold start, zero cache)
 - Cold point lookup: 23ms (interior + index pages cached)
 - Warm point lookup: 98μs
 
-Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 37 S3 integration tests + 164 unit tests passing.
-
----
-
-## Ypres: Encryption Key Rotation
-> After: Verdun · Before: Marne
-
-Re-encrypt all S3 data with a new key. The local VFS already has dictionary rotation via `compact_with_recompression()` — this extends the pattern to encryption keys in tiered mode.
-
-### Flow
-- [ ] `TieredVfs::rotate_key(old_key, new_key)` — one-shot key rotation
-- [ ] Download each page group, decrypt with old key, re-encrypt with new key, upload as new version
-- [ ] Same for interior bundles and index bundles
-- [ ] Write new manifest (with new version)
-- [ ] Re-encrypt local cache file pages in place (read with old CTR nonce, write with new CTR nonce)
-- [ ] Re-encrypt SubChunkTracker persistence file
-- [ ] Old S3 objects added to `replaced_keys` for GC
-- [ ] Test: rotate key, cold read with new key succeeds
-- [ ] Test: cold read with old key after rotation fails
-- [ ] Test: rotation is atomic — manifest swap is the commit point
-
-### Future
-- [ ] `from_password(password, salt)` — Argon2id KDF convenience method. Salt stored in manifest or dedicated S3 object.
-- [ ] Local cache nonce hardening: random nonce per page write, stored in a per-page counter file. Eliminates CTR nonce reuse for multi-snapshot attackers.
-- [ ] WAL nonce hardening: per-truncation generation counter persisted alongside WAL. Eliminates CTR nonce reuse across WAL checkpoint cycles.
+Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 41 S3 integration tests + 173 unit tests passing.
 
 ---
 

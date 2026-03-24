@@ -3937,4 +3937,558 @@ mod tiered_tests {
             cleanup_vfs.destroy_s3().unwrap();
         }
     }
+
+    // ===== Key rotation integration tests =====
+
+    #[cfg(feature = "encryption")]
+    fn test_encryption_key_2() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(0x42);
+        }
+        key
+    }
+
+    /// Write encrypted data with key A, rotate to key B, cold read with key B succeeds.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_rotate_key_cold_read_succeeds() {
+        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("rotate_basic", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_a = test_encryption_key();
+        let key_b = test_encryption_key_2();
+
+        // Write phase with key A
+        {
+            let vfs_name = unique_vfs_name("tiered_rot_wr");
+            let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_test.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);
+                 CREATE INDEX idx_value ON data(value);",
+            )
+            .unwrap();
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..500 {
+                    tx.execute(
+                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("row_{:05}", i)],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // Rotate key A to key B
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+
+            rotate_encryption_key(&rotate_config, key_b)
+                .expect("key rotation failed");
+        }
+
+        // Cold read with key B (fresh cache)
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_rot_rd");
+            let vfs = TieredVfs::new(reader_config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+            // Data pages: COUNT
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 500, "row count mismatch after rotation");
+
+            // Index pages: WHERE value = (uses idx_value)
+            let val: String = conn
+                .query_row(
+                    "SELECT value FROM data WHERE value = 'row_00250'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(val, "row_00250", "index lookup failed after rotation");
+
+            // Interior pages: WHERE id = (PK B-tree traversal)
+            let val: String = conn
+                .query_row("SELECT value FROM data WHERE id = 499", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(val, "row_00499", "PK lookup failed after rotation");
+        }
+
+        // Cleanup
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// After rotation, reading with the OLD key must fail.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_rotate_key_old_key_fails() {
+        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("rotate_old_key", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_a = test_encryption_key();
+        let key_b = test_encryption_key_2();
+
+        // Write with key A
+        {
+            let vfs_name = unique_vfs_name("tiered_rot_old_wr");
+            let vfs = TieredVfs::new(config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_old_key.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY);
+                 INSERT INTO t VALUES (1);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+
+        // Rotate to key B
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+            rotate_encryption_key(&rotate_config, key_b).unwrap();
+        }
+
+        // Cold read with OLD key A must fail
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_rot_old_rd");
+            let vfs = TieredVfs::new(reader_config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_old_key_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            )
+            .unwrap();
+
+            let pragma_result = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            let query_result =
+                conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0));
+            assert!(
+                pragma_result.is_err() || query_result.is_err(),
+                "old key must fail after rotation"
+            );
+        }
+
+        // Cleanup with new key B
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// After rotation, old S3 objects should be cleaned up by GC.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_rotate_key_gc_cleans_old_objects() {
+        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("rotate_gc", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_a = test_encryption_key();
+        let key_b = test_encryption_key_2();
+
+        // Write with key A
+        {
+            let vfs_name = unique_vfs_name("tiered_rot_gc_wr");
+            let vfs = TieredVfs::new(config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_gc.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
+            )
+            .unwrap();
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..100 {
+                    tx.execute(
+                        "INSERT INTO t (id, v) VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("v{}", i)],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // List S3 objects before rotation
+        let keys_before = {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let aws_config = aws_config::from_env()
+                    .region(aws_sdk_s3::config::Region::new("auto"))
+                    .load()
+                    .await;
+                let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
+                if let Some(ep) = &endpoint {
+                    s3_config = s3_config.endpoint_url(ep);
+                }
+                let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+                let resp = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+                    .unwrap();
+                resp.contents()
+                    .iter()
+                    .filter_map(|o| o.key().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Rotate to key B (includes GC of old objects)
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+            rotate_encryption_key(&rotate_config, key_b).unwrap();
+        }
+
+        // List S3 objects after rotation
+        let keys_after = {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let aws_config = aws_config::from_env()
+                    .region(aws_sdk_s3::config::Region::new("auto"))
+                    .load()
+                    .await;
+                let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
+                if let Some(ep) = &endpoint {
+                    s3_config = s3_config.endpoint_url(ep);
+                }
+                let client = aws_sdk_s3::Client::from_conf(s3_config.build());
+                let resp = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .send()
+                    .await
+                    .unwrap();
+                resp.contents()
+                    .iter()
+                    .filter_map(|o| o.key().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Old v1 keys should be gone, new v2 keys should exist
+        for old_key in &keys_before {
+            if old_key.contains("_v1") {
+                assert!(
+                    !keys_after.contains(old_key),
+                    "old S3 object {} should have been deleted by GC",
+                    old_key,
+                );
+            }
+        }
+
+        // Manifest still exists (it's the same key, not versioned)
+        let manifest_key = format!("{}/manifest.json", prefix);
+        assert!(
+            keys_after.contains(&manifest_key),
+            "manifest must still exist after rotation"
+        );
+
+        // New versioned objects exist
+        let has_v2 = keys_after.iter().any(|k| k.contains("_v2"));
+        assert!(has_v2, "new v2 objects must exist after rotation");
+
+        // Cleanup with new key
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// Data integrity: row-level verification that rotation preserves all data.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_rotate_key_data_integrity() {
+        use sqlite_compress_encrypt_vfs::tiered::rotate_encryption_key;
+        use std::collections::HashMap;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("rotate_integrity", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_a = test_encryption_key();
+        let key_b = test_encryption_key_2();
+
+        // Write data and collect checksums
+        let mut expected_rows: HashMap<i64, String> = HashMap::new();
+        {
+            let vfs_name = unique_vfs_name("tiered_rot_int_wr");
+            let vfs = TieredVfs::new(config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_integrity.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE INDEX idx_data_value ON data(value);",
+            )
+            .unwrap();
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..500 {
+                    let value = format!("integrity_check_{:05}_{}", i, "x".repeat((i % 50) as usize));
+                    tx.execute(
+                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                        rusqlite::params![i, value],
+                    )
+                    .unwrap();
+                    expected_rows.insert(i, value);
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // Rotate
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+            rotate_encryption_key(&rotate_config, key_b).unwrap();
+        }
+
+        // Verify every row matches
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_rot_int_rd");
+            let vfs = TieredVfs::new(reader_config).unwrap();
+            sqlite_compress_encrypt_vfs::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rotate_integrity_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+            let mut stmt = conn.prepare("SELECT id, value FROM data ORDER BY id").unwrap();
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+
+            assert_eq!(rows.len(), expected_rows.len(), "row count mismatch");
+            for (id, value) in &rows {
+                let expected = expected_rows.get(id).expect("unexpected row id");
+                assert_eq!(
+                    value, expected,
+                    "data corruption: row {} has '{}', expected '{}'",
+                    id, value, expected,
+                );
+            }
+        }
+
+        // Cleanup
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
 }
