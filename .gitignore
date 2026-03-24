@@ -12,12 +12,6 @@ Cargo.lock
 /tiered-bench
 *.zip
 
-# Lambda
-Dockerfile.lambda
-Dockerfile.lambda-fast
-/bin/tiered-bench-lambda.rs
-BENCHMARK.md
-
 # Benchmark scripts and results
 /scripts/
 
