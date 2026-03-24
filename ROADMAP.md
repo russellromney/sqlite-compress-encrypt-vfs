@@ -146,7 +146,31 @@ Low priority for databases under a few GB (group count is naturally small). Matt
 
 ---
 
-## Phase 17: Rename to turbolite
+## Phase 17: Shared Library Distribution (.so / .dylib)
+
+Offer turbolite as a shared library for C FFI consumers (Python ctypes, Go cgo, Node ffi-napi, etc.).
+
+### C FFI layer (DONE)
+- [x] `src/ffi.rs` — `extern "C"` functions for VFS registration + error handling
+- [x] `turbolite_register_compressed`, `turbolite_register_passthrough`, `turbolite_register_encrypted`
+- [x] `turbolite_register_tiered` (feature-gated)
+- [x] `turbolite_last_error` — thread-local error string
+- [x] `turbolite_clear_caches`, `turbolite_invalidate_cache`
+
+### Build infrastructure (DONE)
+- [x] `Cargo.toml`: `crate-type = ["lib", "cdylib"]`, `bundled-sqlite` feature flag
+- [x] `cbindgen.toml` + `make header` → generates `turbolite.h`
+- [x] `Makefile`: `make lib` (system SQLite), `make lib-bundled` (self-contained), `make install`
+
+### Remaining
+- [ ] SQLite loadable extension (`sqlite3_turbolite_init` entry point) — enables `SELECT load_extension('turbolite')`
+- [ ] Cross-compile CI: build .so/.dylib for linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
+- [ ] Python wheel wrapping the .so (turbolite-python)
+- [ ] pkg-config `.pc` file for system install discovery
+
+---
+
+## Phase 18: Rename to turbolite
 
 Rename project from `sqlite-compress-encrypt-vfs` / `sqlces` to `turbolite`.
 

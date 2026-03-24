@@ -101,6 +101,43 @@ pub fn group_start_page(gid: u64, ppg: u32) -> u64 {
     gid * ppg as u64
 }
 
+/// Validate that a page with a B-tree type byte actually has a valid B-tree header.
+/// Prevents false-positive classification of overflow/freelist pages whose first byte
+/// coincidentally matches a B-tree type (especially 0x0A = 10, a common byte value).
+///
+/// SQLite B-tree page header (at hdr_offset):
+///   byte 0: type flag (0x02, 0x05, 0x0A, 0x0D)
+///   bytes 1-2: first freeblock offset (u16 BE, 0 = none)
+///   bytes 3-4: cell count (u16 BE)
+///   bytes 5-6: cell content area start (u16 BE, 0 = 65536)
+///   byte 7: fragmented free bytes count
+fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
+    // Need at least 8 bytes of header
+    if buf.len() < hdr_offset + 8 {
+        return false;
+    }
+    let cell_count = u16::from_be_bytes([buf[hdr_offset + 3], buf[hdr_offset + 4]]);
+    let content_area = u16::from_be_bytes([buf[hdr_offset + 5], buf[hdr_offset + 6]]);
+    let frag_bytes = buf[hdr_offset + 7];
+
+    // Cell count must be > 0 (a real B-tree page has at least one cell)
+    // and reasonable (at 4KB pages, max ~500 cells; at 64KB, max ~8000)
+    if cell_count == 0 || cell_count > 10000 {
+        return false;
+    }
+    // Content area must be within the page (0 means 65536 for large pages)
+    // and past the header (header is at least 8 bytes + 2*cell_count cell pointer bytes)
+    let min_content_offset = hdr_offset as u16 + 8 + 2 * cell_count;
+    if content_area != 0 && (content_area < min_content_offset || content_area as usize > buf.len()) {
+        return false;
+    }
+    // Fragment bytes must be < 255 (at most 60 in practice)
+    if frag_bytes > 128 {
+        return false;
+    }
+    true
+}
+
 // ===== Group state for prefetch coordination =====
 
 #[repr(u8)]
@@ -194,7 +231,13 @@ impl Default for TieredConfig {
             dictionary: None,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: false,
-            eager_index_load: true,
+            // TODO: eager index loading causes "database disk image is malformed" on warm queries
+            // with databases > ~40K pages (100K posts). Works fine for small databases (10K posts)
+            // and works fine in cold mode (cache cleared between queries). Suspect cache file
+            // corruption when writing many index leaf pages to high offsets in sparse cache file.
+            // Disable until root cause is found. Index pages are still stored as S3 bundles and
+            // loaded on each cold-start connection open (after clear_cache).
+            eager_index_load: false,
         }
     }
 }
@@ -2076,16 +2119,18 @@ impl PrefetchPool {
                         let ps = _pg_size as usize;
                         for i in 0..actual_pages as usize {
                             let pnum = start_page + i as u64;
-                            let type_byte = if pnum == 0 {
-                                page_data.get(i * ps + 100).copied()
-                            } else {
-                                page_data.get(i * ps).copied()
-                            };
+                            let hdr_off = if pnum == 0 { 100 } else { 0 };
+                            let page_start = i * ps;
+                            let type_byte = page_data.get(page_start + hdr_off).copied();
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
                                     cache.mark_interior_group(job.gid, pnum);
                                 } else if b == 0x0A {
-                                    cache.mark_index_page(pnum);
+                                    if let Some(page_slice) = page_data.get(page_start..page_start + ps) {
+                                        if is_valid_btree_page(page_slice, hdr_off) {
+                                            cache.mark_index_page(pnum);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2516,12 +2561,13 @@ impl TieredHandle {
     /// - 0x05 (table interior) / 0x02 (index interior) → Pinned (never evicted)
     /// - 0x0A (index leaf) → Index tier (evicted after data, before pinned)
     fn detect_interior_page(&self, buf: &[u8], page_num: u64, cache: &DiskCache) {
-        let type_byte = if page_num == 0 { buf.get(100) } else { buf.get(0) };
-        if let Some(&b) = type_byte {
+        let hdr_offset = if page_num == 0 { 100 } else { 0 };
+        let type_byte = buf.get(hdr_offset).copied();
+        if let Some(b) = type_byte {
             if b == 0x05 || b == 0x02 {
                 let gid = group_id(page_num, self.pages_per_group);
                 cache.mark_interior_group(gid, page_num);
-            } else if b == 0x0A {
+            } else if b == 0x0A && is_valid_btree_page(buf, hdr_offset) {
                 cache.mark_index_page(page_num);
             }
         }
@@ -2764,16 +2810,18 @@ impl DatabaseHandle for TieredHandle {
                         // Scan for page types in the sub-chunk and set tier
                         for i in 0..pages_in_frame as usize {
                             let pnum = frame_start_page + i as u64;
-                            let type_byte = if pnum == 0 {
-                                decompressed.get(i * ps + 100).copied()
-                            } else {
-                                decompressed.get(i * ps).copied()
-                            };
+                            let hdr_off = if pnum == 0 { 100 } else { 0 };
+                            let page_start = i * ps;
+                            let type_byte = decompressed.get(page_start + hdr_off).copied();
                             if let Some(b) = type_byte {
                                 if b == 0x05 || b == 0x02 {
                                     cache.mark_interior_group(gid, pnum);
                                 } else if b == 0x0A {
-                                    cache.mark_index_page(pnum);
+                                    if let Some(page_slice) = decompressed.get(page_start..page_start + ps) {
+                                        if is_valid_btree_page(page_slice, hdr_off) {
+                                            cache.mark_index_page(pnum);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3090,8 +3138,13 @@ impl DatabaseHandle for TieredHandle {
                 }
                 let all_bundle_pages = dirty_pages.iter().all(|&pnum| {
                     if let Some(data) = dirty_snapshot.get(&pnum) {
-                        let type_byte = if pnum == 0 { data.get(100).copied() } else { data.get(0).copied() };
-                        matches!(type_byte, Some(0x05) | Some(0x02) | Some(0x0A))
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let type_byte = data.get(hdr_off).copied();
+                        match type_byte {
+                            Some(0x05) | Some(0x02) => true,
+                            Some(0x0A) => is_valid_btree_page(data, hdr_off),
+                            _ => false,
+                        }
                     } else {
                         false // can't determine type — upload to be safe
                     }
@@ -3309,9 +3362,10 @@ impl DatabaseHandle for TieredHandle {
         {
             let mut dirty_index_count = 0usize;
             for (&pnum, data) in &dirty_snapshot {
-                let type_byte = if pnum == 0 { data.get(100) } else { data.get(0) };
+                let hdr_off = if pnum == 0 { 100 } else { 0 };
+                let type_byte = data.get(hdr_off);
                 if let Some(&b) = type_byte {
-                    if b == 0x0A {
+                    if b == 0x0A && is_valid_btree_page(data, hdr_off) {
                         all_index_leaves.insert(pnum, data.clone());
                         dirty_index_count += 1;
                     }
@@ -3338,9 +3392,10 @@ impl DatabaseHandle for TieredHandle {
                     }
                     let mut buf = vec![0u8; page_size as usize];
                     if cache.read_page(pnum, &mut buf).is_ok() {
-                        // Verify it's actually an index leaf page
-                        let tb = if pnum == 0 { buf.get(100).copied() } else { buf.get(0).copied() };
-                        if tb == Some(0x0A) {
+                        // Verify it's actually an index leaf page (not overflow with 0x0A first byte)
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let tb = buf.get(hdr_off).copied();
+                        if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
                             all_index_leaves.insert(pnum, buf);
                             cache_read_ok += 1;
                         }
@@ -3366,8 +3421,10 @@ impl DatabaseHandle for TieredHandle {
         // Determine dirty index chunks
         let dirty_index_chunk_ids: HashSet<u32> = dirty_snapshot.keys()
             .filter(|&&pnum| {
-                let type_byte = if pnum == 0 { dirty_snapshot[&pnum].get(100) } else { dirty_snapshot[&pnum].get(0) };
-                type_byte.map_or(false, |&b| b == 0x0A)
+                let data = &dirty_snapshot[&pnum];
+                let hdr_off = if pnum == 0 { 100 } else { 0 };
+                let type_byte = data.get(hdr_off);
+                type_byte.map_or(false, |&b| b == 0x0A && is_valid_btree_page(data, hdr_off))
             })
             .map(|&pnum| (pnum / INTERIOR_CHUNK_RANGE) as u32)
             .collect();
@@ -4226,10 +4283,11 @@ pub fn import_sqlite_file(
             file.read_exact_at(&mut buf, pnum * page_size as u64)?;
 
             // Detect interior B-tree pages and index leaf pages
-            let type_byte = if pnum == 0 { buf[100] } else { buf[0] };
+            let hdr_off = if pnum == 0 { 100 } else { 0 };
+            let type_byte = buf[hdr_off];
             if type_byte == 0x05 || type_byte == 0x02 {
                 interior_pages.push((pnum, buf.clone()));
-            } else if type_byte == 0x0A {
+            } else if type_byte == 0x0A && is_valid_btree_page(&buf, hdr_off) {
                 index_leaf_pages.push((pnum, buf.clone()));
             }
 
@@ -6309,5 +6367,82 @@ mod tests {
         assert!(t.is_sub_chunk_present(&pinned), "Pinned must survive clear_data");
         assert!(!t.is_sub_chunk_present(&index), "Index must be removed by clear_data");
         assert!(!t.is_sub_chunk_present(&data), "Data must be removed by clear_data");
+    }
+
+    // ===== is_valid_btree_page tests =====
+
+    #[test]
+    fn test_valid_btree_page_real_index_leaf() {
+        // Simulate a real 0x0A (leaf index) page: type=0x0A, cell_count=5, content_area=3950
+        let mut page = vec![0u8; 4096];
+        page[0] = 0x0A; // type
+        page[1] = 0; page[2] = 0; // freeblock = 0
+        page[3] = 0; page[4] = 5; // cell_count = 5
+        page[5] = 0x0F; page[6] = 0x6E; // content_area = 3950
+        page[7] = 0; // frag = 0
+        assert!(is_valid_btree_page(&page, 0));
+    }
+
+    #[test]
+    fn test_valid_btree_page_overflow_false_positive() {
+        // Overflow page: first 4 bytes are next-page pointer, rest is payload.
+        // If the pointer happens to start with 0x0A, the type byte check passes
+        // but the "header" fields are garbage.
+        let mut page = vec![0u8; 4096];
+        page[0] = 0x0A; // coincidental type match
+        // bytes 1-2: "freeblock" = arbitrary
+        page[1] = 0x12; page[2] = 0x34;
+        // bytes 3-4: "cell_count" = 0 (overflow has no cells)
+        page[3] = 0; page[4] = 0;
+        // Invalid: cell_count == 0
+        assert!(!is_valid_btree_page(&page, 0), "overflow page with 0 cells must fail");
+    }
+
+    #[test]
+    fn test_valid_btree_page_overflow_nonzero_cells() {
+        // Overflow page where next-page pointer bytes 3-4 happen to be nonzero
+        let mut page = vec![0u8; 4096];
+        page[0] = 0x0A;
+        page[3] = 0xFF; page[4] = 0xFF; // "cell_count" = 65535
+        // Invalid: cell_count > 10000
+        assert!(!is_valid_btree_page(&page, 0), "overflow with 65535 cells must fail");
+    }
+
+    #[test]
+    fn test_valid_btree_page_content_area_too_small() {
+        // Page with valid-looking cell count but content_area in the header
+        let mut page = vec![0u8; 4096];
+        page[0] = 0x0A;
+        page[3] = 0; page[4] = 10; // cell_count = 10
+        page[5] = 0; page[6] = 5; // content_area = 5 (way too small, header alone is 28 bytes)
+        assert!(!is_valid_btree_page(&page, 0));
+    }
+
+    #[test]
+    fn test_valid_btree_page_page_zero_offset() {
+        // Page 0 has 100-byte SQLite header, so B-tree header starts at offset 100
+        let mut page = vec![0u8; 4096];
+        page[100] = 0x0A;
+        page[103] = 0; page[104] = 3; // cell_count = 3
+        // min content = 100 + 8 + 2*3 = 114
+        page[105] = 0; page[106] = 120; // content_area = 120 (valid, > 114)
+        page[107] = 0;
+        assert!(is_valid_btree_page(&page, 100));
+    }
+
+    #[test]
+    fn test_valid_btree_page_buffer_too_short() {
+        let page = vec![0x0A, 0, 0, 0, 5]; // only 5 bytes, need at least 8
+        assert!(!is_valid_btree_page(&page, 0));
+    }
+
+    #[test]
+    fn test_valid_btree_page_high_frag_bytes() {
+        let mut page = vec![0u8; 4096];
+        page[0] = 0x0A;
+        page[3] = 0; page[4] = 1;
+        page[5] = 0x0F; page[6] = 0xF0;
+        page[7] = 200; // frag > 128
+        assert!(!is_valid_btree_page(&page, 0));
     }
 }

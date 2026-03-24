@@ -8,7 +8,7 @@ turbolite also has page-level compression (speed) and encryption, enabling full-
 
 Much of the design is inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. 
 
-The result
+The result is that it enables serving a 
 
 turbolite is a Rust library. Loadable extension (`.so`/`.dylib`) is planned.
 
@@ -70,11 +70,15 @@ Benchmarked on Fly.io (iad region) against Tigris S3, 1M-row social media datase
 
 ### When turbolite is slow
 
-**Scans on small machines.** With 1 prefetch thread, a cold scan over 812MB takes seconds, not milliseconds. The bottleneck is S3 round trips — each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful.
+**Scans on small machines.** With 1 prefetch thread, a cold scan over 812MB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful, as in many seconds to minutes. 
 
-**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need 8+ threads.
+**Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need a lot of CPUs
 
 **First query penalty.** The first query on a cold cache always pays for interior page loading (~50-200ms depending on database size) plus at least one data fetch. Subsequent queries benefit from pinned interior pages.
+
+### When turbolite is bad
+
+**Concurrent writes.** tubolite has only been tested with a single writer.
 
 ## Design
 
@@ -98,7 +102,7 @@ This is the killer feature for point queries.
 
 Each page group is encoded as multiple zstd frames (one per ~32 pages). The manifest stores a frame table with byte offsets and sizes. On a cache miss, turbolite issues an S3 byte-range GET for just the frame containing the needed page (~100KB) instead of downloading the entire group (~8MB).
 
-A range GET costs the same as a full GET ($0.40/M requests) — you pay per request, not per byte. So seekable compression gives you the write efficiency of large objects (fewer PUTs) with the read granularity of small ones (fewer bytes per point lookup).
+A range GET costs the same as a full GET ($0.40/M requests) as you pay per request, not per byte. So seekable compression gives you the write efficiency of large objects (fewer PUTs) with the read granularity of small ones (fewer bytes per point lookup).
 
 ### 4. Aggressive Prefetch with Minimal Hops
 
@@ -116,13 +120,13 @@ The prefetch pool is a fixed set of worker threads (default: `num_cpus + 1`), ea
 
 ### 6. Interior Page Bundles
 
-B-tree interior pages (type 0x05, 0x02) are the pages SQLite touches on every single query — they're the index nodes that route lookups to leaf pages. Normally, these pages are distributed randomly throughout the pages (and thus the page groups). This means that top-leaf operations would constantly have to fetch random page groups (prefetch is sequential, note). turbolite detects interior pages at read time using the data vs interior page bit and:
+B-tree interior pages (type 0x05, 0x02) are the pages SQLite touches on every single query. They're the index nodes that route lookups to leaf pages. Normally, these pages are distributed randomly throughout the pages (and thus the page groups). This means that top-leaf operations would constantly have to fetch random page groups (prefetch is sequential, note). turbolite detects interior pages at read time using the data vs interior page bit and:
 
 - **Pins them** so they survive cache evictions
 - **Stores them separately** in compressed bundles in S3 (not mixed into data page groups)
-- **Loads them eagerly** on VFS open — one parallel fetch of all interior bundles
+- **Loads them eagerly** on VFS open (one parallel fetch of all interior bundles)
 
-After this initial load, every B-tree traversal is a cache hit. Cold queries only need to fetch leaf data from S3. Interior pages within data groups are just ignored — they're already cached from the bundles.
+After this initial load, every B-tree traversal is a cache hit. Cold queries only need to fetch leaf data from S3. Interior pages within data groups are just ignored, as they're already cached from the bundles.
 
 ### Read Path
 

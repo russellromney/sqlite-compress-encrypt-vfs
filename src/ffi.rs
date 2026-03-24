@@ -1,0 +1,301 @@
+//! C FFI interface for turbolite.
+//!
+//! Builds as a shared library (.so on Linux, .dylib on macOS) that can be loaded
+//! by any language with C FFI support (Python ctypes, Go cgo, Node ffi-napi, etc.).
+//!
+//! # Building
+//!
+//! ```sh
+//! # Shared library linking system SQLite (for use by apps that already link SQLite):
+//! make lib
+//!
+//! # Generate C header:
+//! make header
+//! ```
+//!
+//! # Usage from C
+//!
+//! ```c
+//! #include "turbolite.h"
+//! #include <sqlite3.h>
+//!
+//! // Register the VFS
+//! int rc = turbolite_register_compressed("turbolite", "/tmp/db", 3);
+//! if (rc != 0) {
+//!     fprintf(stderr, "error: %s\n", turbolite_last_error());
+//! }
+//!
+//! // Open a database using the registered VFS
+//! sqlite3 *db;
+//! sqlite3_open_v2("mydb.sqlite", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "turbolite");
+//! ```
+
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int};
+
+// --- Error handling ---
+
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = CString::new(msg).ok();
+    });
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = None;
+    });
+}
+
+/// Get the last error message, or NULL if no error occurred.
+///
+/// The returned pointer is valid until the next turbolite_* call on this thread.
+#[no_mangle]
+pub extern "C" fn turbolite_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| match &*e.borrow() {
+        Some(s) => s.as_ptr(),
+        None => std::ptr::null(),
+    })
+}
+
+// --- Version ---
+
+/// Get the turbolite version string. Always returns a valid pointer.
+#[no_mangle]
+pub extern "C" fn turbolite_version() -> *const c_char {
+    // Null-terminated static byte string — no allocation, lives forever.
+    static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+    VERSION.as_ptr() as *const c_char
+}
+
+// --- VFS registration ---
+
+/// Register a compressed VFS with SQLite.
+///
+/// After registration, open databases with `sqlite3_open_v2(..., name)`.
+///
+/// # Parameters
+/// - `name`:  VFS name (e.g. `"turbolite"`). Must be unique.
+/// - `base_dir`: Directory where database files are stored.
+/// - `compression_level`: zstd level 1-22 (3 is a good default).
+///
+/// # Returns
+/// 0 on success, -1 on error. Call `turbolite_last_error()` for details.
+#[no_mangle]
+pub extern "C" fn turbolite_register_compressed(
+    name: *const c_char,
+    base_dir: *const c_char,
+    compression_level: c_int,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let base_dir = match cstr_to_str(base_dir, "base_dir") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let vfs = crate::CompressedVfs::new(base_dir, compression_level);
+    match crate::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register a passthrough VFS (no compression, no encryption).
+///
+/// Pages are stored in the VFS index format but without transformation.
+/// Useful for benchmarking or data that doesn't benefit from compression.
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn turbolite_register_passthrough(
+    name: *const c_char,
+    base_dir: *const c_char,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let base_dir = match cstr_to_str(base_dir, "base_dir") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let vfs = crate::CompressedVfs::passthrough(base_dir);
+    match crate::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register an encrypted + compressed VFS.
+///
+/// Pages are compressed with zstd then encrypted with AES-256-GCM.
+/// Requires the `encryption` feature at build time.
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[cfg(feature = "encryption")]
+#[no_mangle]
+pub extern "C" fn turbolite_register_encrypted(
+    name: *const c_char,
+    base_dir: *const c_char,
+    compression_level: c_int,
+    password: *const c_char,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let base_dir = match cstr_to_str(base_dir, "base_dir") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let password = match cstr_to_str(password, "password") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let vfs = crate::CompressedVfs::compressed_encrypted(base_dir, compression_level, password);
+    match crate::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("register failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Register a tiered S3-backed VFS.
+///
+/// The VFS stores data in S3 with a local NVMe cache. Requires the `tiered`
+/// feature at build time.
+///
+/// # Parameters
+/// - `name`: VFS name.
+/// - `bucket`: S3 bucket name.
+/// - `prefix`: S3 key prefix (e.g. `"databases/tenant-123"`).
+/// - `cache_dir`: Local cache directory path.
+/// - `endpoint_url`: Custom S3 endpoint (for MinIO/Tigris), or NULL for AWS default.
+/// - `region`: AWS region, or NULL for `"auto"`.
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_register_tiered(
+    name: *const c_char,
+    bucket: *const c_char,
+    prefix: *const c_char,
+    cache_dir: *const c_char,
+    endpoint_url: *const c_char,
+    region: *const c_char,
+) -> c_int {
+    clear_last_error();
+    let name = match cstr_to_str(name, "name") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let bucket = match cstr_to_str(bucket, "bucket") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let prefix = match cstr_to_str(prefix, "prefix") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let cache_dir = match cstr_to_str(cache_dir, "cache_dir") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let endpoint_url = nullable_cstr_to_option(endpoint_url);
+    let region = nullable_cstr_to_option(region);
+
+    let config = crate::tiered::TieredConfig {
+        bucket: bucket.to_string(),
+        prefix: prefix.to_string(),
+        cache_dir: std::path::PathBuf::from(cache_dir),
+        endpoint_url: endpoint_url.map(|s| s.to_string()),
+        region: region.map(|s| s.to_string()),
+        ..Default::default()
+    };
+
+    let vfs = match crate::tiered::TieredVfs::new(config) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(&format!("tiered vfs creation failed: {}", e));
+            return -1;
+        }
+    };
+    match crate::tiered::register(name, vfs) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(&format!("tiered register failed: {}", e));
+            -1
+        }
+    }
+}
+
+// --- Utilities ---
+
+/// Clear all VFS caches (shared file state, in-process locks).
+///
+/// Call this when running fresh benchmarks or tests to ensure no stale state.
+#[no_mangle]
+pub extern "C" fn turbolite_clear_caches() {
+    crate::clear_all_caches();
+}
+
+/// Invalidate cached state for a specific database file.
+///
+/// Call after modifying a database file externally (e.g. after compaction).
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn turbolite_invalidate_cache(path: *const c_char) -> c_int {
+    clear_last_error();
+    let path = match cstr_to_str(path, "path") {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    crate::invalidate_cache(path);
+    0
+}
+
+// --- Internal helpers ---
+
+fn cstr_to_str<'a>(ptr: *const c_char, param_name: &str) -> Result<&'a str, c_int> {
+    if ptr.is_null() {
+        set_last_error(&format!("{} must not be NULL", param_name));
+        return Err(-1);
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_str().map_err(|_| {
+        set_last_error(&format!("{} is not valid UTF-8", param_name));
+        -1
+    })
+}
+
+fn nullable_cstr_to_option<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_str().ok()
+}

@@ -8,8 +8,12 @@ repository = "https://github.com/russellromney/sqlite-compress-encrypt-vfs"
 keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
 categories = ["database", "compression", "cryptography"]
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [features]
-default = ["zstd"]
+default = ["zstd", "bundled-sqlite"]
+bundled-sqlite = ["rusqlite/bundled"]
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
@@ -54,10 +58,13 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.35" }
 tempfile = "3"
 ureq = "2"
 lambda_runtime = { version = "0.13", optional = true }
+
+[build-dependencies]
+cbindgen = "0.27"
 
 [dev-dependencies]
 rayon = "1.10"

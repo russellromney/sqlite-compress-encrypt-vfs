@@ -35,6 +35,7 @@
 
 pub mod compress;
 pub mod dict;
+pub mod ffi;
 #[cfg(feature = "tiered")]
 pub mod tiered;
 
