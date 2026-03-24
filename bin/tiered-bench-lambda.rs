@@ -62,16 +62,11 @@ async fn handler(event: LambdaEvent<Request>) -> Result<Response, Error> {
     eprintln!("{}", msg);
     output.push_str(&msg);
 
-    // Create a dedicated tokio runtime for VFS S3 operations.
-    // CRITICAL: the VFS must NOT share the Lambda runtime — it would deadlock
-    // because SQLite calls read_exact_at synchronously, which uses block_on
-    // to drive async S3 futures, starving the Lambda runtime's workers.
-    let vfs_runtime = tokio::runtime::Runtime::new()?;
-    let vfs_handle = vfs_runtime.handle().clone();
-
-    // Run on spawn_blocking so the Lambda handler doesn't block a tokio worker
+    // Run on spawn_blocking so the Lambda handler doesn't block a tokio worker.
+    // The VFS creates its own internal tokio runtime for S3 operations —
+    // it must NOT share the Lambda runtime (would deadlock on block_on).
     let result = tokio::task::spawn_blocking(move || {
-        run_benchmark(&bucket, &reuse, endpoint.as_deref(), region.as_deref(), vfs_handle, vfs_runtime)
+        run_benchmark(&bucket, &reuse, endpoint.as_deref(), region.as_deref())
     })
     .await??;
 
@@ -140,7 +135,7 @@ fn run_benchmark(
         let mut cold_times = Vec::with_capacity(iterations);
 
         for i in 0..iterations {
-            bench_handle.clear_cache();
+            bench_handle.clear_cache_all();
 
             let start = Instant::now();
             let _result: Result<Option<String>, _> = if *label == "mutual" {
