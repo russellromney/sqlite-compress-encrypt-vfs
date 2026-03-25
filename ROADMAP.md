@@ -6,14 +6,15 @@
 
 Page-group tiered storage with seekable sub-chunk range GETs. S3/Tigris is source of truth, local disk is a page-level LRU cache. Default 64KB pages, 256 pages per group (~16MB uncompressed, ~8MB compressed). Seekable zstd encoding enables byte-range GETs for individual sub-chunks (~256KB) without downloading entire groups.
 
-Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything. Encryption key rotation via `rotate_encryption_key()` (decrypt/re-encrypt without decompression, atomic manifest swap).
+Two-tier encryption: AES-256-GCM with random nonces for S3 (authenticated, tamper-detecting), AES-256-CTR for local cache/WAL (zero overhead, OS page alignment). One key encrypts everything. `rotate_encryption_key()` supports key rotation, adding encryption, and removing encryption (decrypt/re-encrypt without decompression, atomic manifest swap, post-upload verification).
 
-1M-row social media dataset (1.46GB, 91 page groups, 64KB pages):
-- Arctic point lookup: 143ms (true cold start, zero cache)
-- Cold point lookup: 23ms (interior + index pages cached)
-- Warm point lookup: 98μs
+1M-row social media dataset (1.46GB, 91 page groups, 64KB pages, EC2 c5.2xlarge, S3 Express One Zone, same AZ):
+- Cache: none — point lookup: 75ms, 5-join profile: 202ms
+- Cache: interior — point lookup: 11ms, 5-join profile: 134ms
+- Cache: index — point lookup: 11ms, 5-join profile: 113ms
+- Cache: data — point lookup: 157us, 5-join profile: 301us
 
-Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 41 S3 integration tests + 173 unit tests passing.
+Lazy background index prefetch, page-size-aware bundle chunking (46 index chunks), index page bitmap survival across cache eviction. 43 S3 integration tests + 180 unit tests passing.
 
 ---
 

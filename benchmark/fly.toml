@@ -2,7 +2,7 @@ app = "cinch-tiered-bench"
 primary_region = "iad"
 
 [build]
-  dockerfile = "benchmark/Dockerfile"
+  dockerfile = "Dockerfile"
 
 [env]
   RUST_LOG = "warn"
@@ -12,7 +12,7 @@ primary_region = "iad"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --iterations 5 --skip-verify --import auto"
+  app = "--sizes 1000000 --iterations 10 --skip-verify --modes none,interior,index,data"
 
 [[vm]]
   size = "performance-8x"

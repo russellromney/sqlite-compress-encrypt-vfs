@@ -4016,7 +4016,7 @@ mod tiered_tests {
                 ..Default::default()
             };
 
-            rotate_encryption_key(&rotate_config, key_b)
+            rotate_encryption_key(&rotate_config, Some(key_b))
                 .expect("key rotation failed");
         }
 
@@ -4141,7 +4141,7 @@ mod tiered_tests {
                 encryption_key: Some(key_a),
                 ..Default::default()
             };
-            rotate_encryption_key(&rotate_config, key_b).unwrap();
+            rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
         }
 
         // Cold read with OLD key A must fail
@@ -4287,7 +4287,7 @@ mod tiered_tests {
                 encryption_key: Some(key_a),
                 ..Default::default()
             };
-            rotate_encryption_key(&rotate_config, key_b).unwrap();
+            rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
         }
 
         // List S3 objects after rotation
@@ -4427,7 +4427,7 @@ mod tiered_tests {
                 encryption_key: Some(key_a),
                 ..Default::default()
             };
-            rotate_encryption_key(&rotate_config, key_b).unwrap();
+            rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
         }
 
         // Verify every row matches
@@ -4470,6 +4470,283 @@ mod tiered_tests {
                     value, expected,
                     "data corruption: row {} has '{}', expected '{}'",
                     id, value, expected,
+                );
+            }
+        }
+
+        // Cleanup
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// Write encrypted data, remove encryption (rotate to None), cold read without key.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_remove_encryption_cold_read() {
+        use turbolite::tiered::rotate_encryption_key;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config_encrypted("remove_enc", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_a = test_encryption_key();
+
+        // Write phase with encryption
+        {
+            let vfs_name = unique_vfs_name("tiered_rmenc_wr");
+            let vfs = TieredVfs::new(config).expect("failed to create encrypted TieredVfs");
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rmenc_test.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
+            )
+            .unwrap();
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..100 {
+                    tx.execute(
+                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("val_{:04}", i)],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // Remove encryption (rotate to None)
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_a),
+                ..Default::default()
+            };
+
+            rotate_encryption_key(&rotate_config, None)
+                .expect("remove encryption failed");
+        }
+
+        // Cold read WITHOUT encryption key
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: None, // no key needed
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_rmenc_rd");
+            let vfs = TieredVfs::new(reader_config).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "rmenc_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            )
+            .unwrap();
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 100, "expected 100 rows after removing encryption");
+
+            let val: String = conn
+                .query_row("SELECT value FROM data WHERE id = 42", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(val, "val_0042");
+        }
+
+        // Cleanup
+        {
+            let cleanup_cache = TempDir::new().unwrap();
+            let cleanup_config = TieredConfig {
+                bucket,
+                prefix,
+                cache_dir: cleanup_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint,
+                region,
+                encryption_key: None,
+                ..Default::default()
+            };
+            let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
+            cleanup_vfs.destroy_s3().unwrap();
+        }
+    }
+
+    /// Write unencrypted data, add encryption (rotate from None to Some), cold read with key.
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_add_encryption_cold_read() {
+        use turbolite::tiered::rotate_encryption_key;
+
+        let writer_cache = TempDir::new().unwrap();
+        let config = test_config("add_enc", writer_cache.path());
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+        let region = config.region.clone();
+        let key_b = test_encryption_key();
+
+        // Write phase WITHOUT encryption
+        {
+            let vfs_name = unique_vfs_name("tiered_addenc_wr");
+            let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
+            turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "addenc_test.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                &vfs_name,
+            )
+            .unwrap();
+
+            conn.execute_batch(
+                "PRAGMA page_size=65536;
+                 PRAGMA journal_mode=WAL;
+                 CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
+            )
+            .unwrap();
+
+            {
+                let tx = conn.unchecked_transaction().unwrap();
+                for i in 0..100 {
+                    tx.execute(
+                        "INSERT INTO data (id, value) VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("val_{:04}", i)],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        // Add encryption (rotate from None to Some(key_b))
+        {
+            let rotate_cache = TempDir::new().unwrap();
+            let rotate_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: rotate_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: None, // no old key
+                ..Default::default()
+            };
+
+            rotate_encryption_key(&rotate_config, Some(key_b))
+                .expect("add encryption failed");
+        }
+
+        // Cold read WITH encryption key
+        {
+            let reader_cache = TempDir::new().unwrap();
+            let reader_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: reader_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: Some(key_b),
+                ..Default::default()
+            };
+            let reader_vfs_name = unique_vfs_name("tiered_addenc_rd");
+            let vfs = TieredVfs::new(reader_config).unwrap();
+            turbolite::tiered::register(&reader_vfs_name, vfs).unwrap();
+
+            let conn = rusqlite::Connection::open_with_flags_and_vfs(
+                "addenc_reader.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &reader_vfs_name,
+            )
+            .unwrap();
+
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 100, "expected 100 rows after adding encryption");
+
+            let val: String = conn
+                .query_row("SELECT value FROM data WHERE id = 42", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(val, "val_0042");
+        }
+
+        // Verify old unencrypted read fails
+        {
+            let fail_cache = TempDir::new().unwrap();
+            let fail_config = TieredConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                cache_dir: fail_cache.path().to_path_buf(),
+                compression_level: 3,
+                endpoint_url: endpoint.clone(),
+                region: region.clone(),
+                encryption_key: None, // no key, but data is now encrypted
+                ..Default::default()
+            };
+            let fail_vfs_name = unique_vfs_name("tiered_addenc_fail");
+            let vfs = TieredVfs::new(fail_config).unwrap();
+            turbolite::tiered::register(&fail_vfs_name, vfs).unwrap();
+
+            let result = rusqlite::Connection::open_with_flags_and_vfs(
+                "addenc_fail.db",
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                &fail_vfs_name,
+            );
+            // Opening or reading should fail (encrypted data can't be decompressed)
+            if let Ok(conn) = result {
+                let query_result: Result<i64, _> =
+                    conn.query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0));
+                assert!(
+                    query_result.is_err(),
+                    "unencrypted read of encrypted data must fail"
                 );
             }
         }

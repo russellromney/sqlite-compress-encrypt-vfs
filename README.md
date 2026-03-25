@@ -1,35 +1,51 @@
 # turbolite
 
-turbolite is an experimental SQLite VFS designed from first principles to serve cold queries from S3. 
+turbolite is a SQLite VFS that serves point lookups and joins directly from S3 with millisecond cold latency. 
 
-> turbolite is **experimental**. It is new and may corrupt your data. Please be careful. 
+turbolite also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest.
 
-turbolite also has page-level compression for efficiency and encryption at-rest and in-transit.
+> turbolite is **experimental**. It is new and may corrupt your data. Please be careful.
 
-The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. S3 has distinct constraints (PUTs are expensive, GETs are cheap, objects are immutable, speed is constrained by ping and bandwidth) and turbolite's architecture is shaped by them rather than traditional filesystem constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot). 
+The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/turbopuffer)'s approach of designing for cloud storage constraints. It was also "inspired" by [Neon's "fast" 500ms+ cold starts](https://neon.com/blog/cold-starts-just-got-hot).
 
-turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. It's a standard VFS operating at the page level — most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
+turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Works with any S3-compatible storage (AWS S3, Tigris, R2, MinIO, etc.). It's a standard VFS operating at the page level, so most SQLite features work transparently: FTS, R-tree, JSON, WAL mode, etc.
 
 If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
 ## Performance
 
-| Query | Warm | Cold | Arctic |
-|-------|------|------|--------|
-| Point lookup | 98us | 23ms | 143ms |
-| Profile (5 joins) | 404us | 252ms | 419ms |
-| Who-liked | 203us | 11ms | 221ms |
-| Mutual friends | 100us | 11ms | 142ms |
-| Indexed filter | 65us | 10ms | 155ms |
-| Full scan + filter | 287ms | 642ms | 812ms |
+| Query | Cache: none | Cache: interior | Cache: index | Cache: data |
+|-------|-------------|-----------------|--------------|-------------|
+| Point lookup | 75ms | 11ms | 11ms | 157us |
+| Profile (5 joins) | 202ms | 134ms | 113ms | 301us |
+| Who-liked | 118ms | 51ms | 5ms | 259us |
+| Mutual friends | 82ms | 25ms | 5ms | 116us |
+| Indexed filter | 76ms | 12ms | 5ms | 106us |
+| Full scan + filter | 691ms | 685ms | 562ms | 280ms |
 
-Benchmarked on Fly.io with Tigris with 8 vCPU, 16GB RAM, 8 prefetch threads. 1M-row social media dataset (1.46GB uncompressed with 64KB pages). See [Benchmarking](#Benchmarking).
+1M rows (1.46GB uncompressed) on EC2 c5.2xlarge, S3 Express One Zone, same AZ. 8 dedicated vCPU, 16GB RAM, 8 prefetch threads, 64KB pages. See [Benchmarking](#benchmarking).
 
-**Warm** = all data in local cache, no connection open, no pages in memory. Normal SQLite case.
+Benchmarks are organized by **cache level** (what's already on local disk when the query runs):
 
-**Cold** = data pages evicted from cache, but interior and (optionally) index pages stay cached. Normal turbolite case. 
+| Cache level | What's cached | What's fetched from S3 | When this happens |
+|-------------|--------------|----------------------|-------------------|
+| **none** | nothing | everything | Fresh start, empty cache |
+| **interior** | interior B-tree pages | index + data pages | First query after connection open |
+| **index** | interior + index pages | data pages only | Normal turbolite operation |
+| **data** | everything | nothing | Equivalent to local SQLite |
 
-**Arctic** = everything evicted, including interior and index pages. A new connection is just pointed at an S3 bucket, downloads the manifest and interior pages, then is ready to serve queries. This only happens on a completely fresh start with an empty cache.
+**interior** is the most realistic cold benchmark: interior pages load eagerly on connection open, so by the time you run your first query, they're cached. Index pages prefetch lazily in the background and may not be ready yet.
+
+> Why not just use a volume? If you have one database per server, you should. turbolite is interesting when you have hundreds or thousands of databases and don't want a volume for each one. It's also a fun experiment in what happens when you design a SQLite storage layer around S3's constraints instead of fighting them.
+
+### Cloud storage is getting faster
+
+S3 Express One Zone delivers single-digit millisecond GET latency from the same availability zone. This changes the economics of serving databases from object storage, with PUTs and GETs 10x cheaper than normal S3. A 5-join profile query completes in 134ms with only interior B-tree pages cached (the realistic first-query state). With index pages cached, point lookups take 11ms.
+
+turbolite's seekable zstd encoding and byte-range GETs mean you only download the pages you need, not entire objects. A cache miss fetches one compressed sub-chunk (~256KB), not a 16MB page group.
+
+The trend is clear: object storage is getting faster (S3 Express, Tigris, R2), and the gap between "local disk" and "cloud storage" is shrinking. turbolite is designed to ride this wave. The faster GETs get, the less caching matters, and the more databases you can serve from a single bucket.
+
 
 ## Quick Start
 
@@ -42,7 +58,7 @@ pip install turbolite
 ```python
 import turbolite
 
-# S3 tiered database — serve cold queries from S3
+# tiered database — serve cold queries from S3-compatible storage (Tigris)
 conn = turbolite.connect("my.db", mode="s3",
     bucket="my-bucket",
     endpoint="https://t3.storage.dev")
@@ -66,16 +82,18 @@ turbolite is designed for S3's constraints over filesystem constraints. Every de
 | S3 Constraint | Implication |
 |---------------|-------------|
 | **Round trips are slow** | Minimize request count. Batch writes, prefetch reads aggressively. |
-| **Bandwidth is a bottleneck** | Maximize bandwidth utilitization over a time window. |
-| **PUTs and GETs charge per-operation** | A 64KB GET costs the same as a 16MB GET. Minimize request count, not byte efficiency. |
+| **Bandwidth is a bottleneck** | Maximize bandwidth utilization. |
+| **PUTs and GETs charge per-operation** | A 64KB GET costs the same as a 16MB GET. Optimize request count, not byte efficiency. |
 | **Objects are immutable** | Never update in place. Write new versions, swap a pointer. No partial-write corruption. |
 | **Storage is cheap** | Don't optimize for space. Over-provision, keep old versions, let GC clean up later. |
 
 ### Architecture
 
-SQLite uses a B-Tree index and requests for one page at a time. It knows page N is at byte offset `N * page_size`. But on S3, fetching one page per request would mean thousands of GETs per query.
+SQLite uses a B-Tree index and requests for one page at a time. It knows page N is at byte offset `N * page_size`. But on S3, fetching one page per request would mean thousands of sequential GETs per query.
 
-turbolite adds an indirection layer between SQLite and S3 that groups, compresses, and tracks pages:
+turbolite adds an indirection layer between SQLite and S3 that groups, compresses, and tracks pages. 
+
+**Reads** look like: 
 
 ```
 SQLite: "read page 4,271"
@@ -90,11 +108,26 @@ turbolite: check local storage -> cache miss
 S3: GET for ~256KB compressed sub-chunk → decompress → return page
 ```
 
-The **manifest** is the source of truth for where every page lives. It replaces SQLite's implicit `offset = page * size` with explicit pointers. It's also the durability commit point: at checkpoint, after it uploads page groups, it writes a new manifest. Manifest versions are immutable and always point to a consistent state.
+**Writes** go through SQLite's normal WAL, then flush to S3 at checkpoint:
+
+```
+SQLite: "commit + checkpoint"
+    |
+    v
+turbolite: collect dirty pages, group by page group and page type
+    |
+    v
+Encode: zstd compress each frame → (optional) GCM encrypt
+    |
+    v
+S3: PUT new page group versions → PUT new manifest (atomic commit)
+```
+
+The MsgPack **manifest** is the source of truth for where every page lives. It replaces SQLite's implicit `offset = page * size` with explicit pointers. Old page group versions are never overwritten; the manifest PUT is the atomic commit point. Old versions become garbage, cleaned up by `gc()`.
 
 SQLite defaults to 4KB pages to match filesystem disk page size. On S3, disk page size is irrelevant. What matters is minimizing request count and maximizing B-tree fan-out. The answer is **large pages**: turbolite defaults to 64KB pages. Fewer pages = fewer S3 round trips to reach a leaf.
 
-**Page groups** batch sequential pages into a larger S3 object, optimized to saturate bandwidth on prefetching with reasonable latency for point queries. Default is 256 pages per chunk, ~16MB at 64KB pages (uncompressed). On checkpoint, dirty groups are written as new immutable versions.
+**Page groups** batch many pages into a single S3 object. Big enough to saturate bandwidth on prefetch, small enough for point queries. Default: 256 pages per group, ~16MB at 64KB pages.
 
 But pages are not created equally. SQLite has different types of pages. turbolite **separates page groups by type**: interior B-Tree, index leaf, and data leaf pages. 
 
@@ -102,9 +135,9 @@ Interior pages are touched on every query to route lookups to leaf pages. turbol
 
 Index leaf pages get the same treatment: separate bundles, lazy background prefetch, pinned against eviction. Cold queries only fetch data pages from S3.
 
-To make point queries fast, turbolite uses **seekable compression**: each page group is encoded as multiple zstd frames (~4 pages per frame). The manifest stores byte offsets per frame, so a cache miss fetches just the ~256KB sub-chunk with the needed page via S3 range GET, not the entire group. 
+To make point queries fast, turbolite uses **seekable compression**: each page group is encoded as multiple **zstd frames** (~4 pages per frame). The manifest stores byte offsets per frame, so a cache miss fetches just the ~256KB sub-chunk with the needed page via S3 range GET, not the entire group.
 
-To make scans not-slow (they'll never be fast), turbolite uses adaptive prefetching, inspired by exponential backoff. On a cache miss, two things happen concurrently:
+To make scans not-slow (they'll never be fast), turbolite uses **speculative prefetching**, inspired by exponential backoff. On a cache miss, two things happen concurrently:
 1. **Inline range GET**: fetch the sub-chunk containing the needed page, return to SQLite immediately.
 2. **Background prefetch**: submit the full group + neighbors to a thread pool.
 
@@ -114,61 +147,40 @@ Consecutive misses escalate aggressively: by default, first miss fetches 33% of 
 
 ### Encryption & Compression
 
-turbolite encrypts and compresses at the page level.
-
 #### Compression
 
-All data is (optionally) zstd-compressed before storage. Page groups use seekable multi-frame encoding that independently compressed each frame (~4 pages, ~256KB), so a point lookup decompresses only the relevant frame rather than not the entire page group. Custom zstd dictionaries can be trained on your data and embedded in the database for better compression ratios.
+All data is zstd-compressed before storage. Page groups use seekable multi-frame encoding that independently compresses each frame (~4 pages, ~256KB), so a point lookup decompresses only the relevant frame rather than the entire page group. Custom zstd dictionaries can improve compression ratios further.
+
+Local (non-S3) mode also compresses at the page level with zstd. See the CLI for dictionary training tools.
 
 #### Encryption
 
-If encryption is enabled, turbolite encrypts everything including S3 objects, local data on disk, WAL/journal files, and manifest files.
-
-```rust
-let config = TieredConfig {
-    encryption_key: Some(my_32_byte_key),
-    ..Default::default()
-};
-```
-
-**Two encryption modes, chosen automatically by path:**
-
-| Path | Algorithm | Nonce | Overhead | Why |
-|------|-----------|-------|----------|-----|
-| S3 (page groups, bundles) | AES-256-GCM | `(group_id << 16) \| frame_index` | +16 bytes/frame | Authenticated encryption. Tamper detection. Unique nonce per frame preserves seekable range GETs. |
-| Local (cache, WAL, metadata) | AES-256-CTR | page number or byte offset | zero | Same-size ciphertext. Preserves OS page alignment. |
-
-**Encrypt after compress, decrypt before decompress.** Compression operates on plaintext (compressing ciphertext is useless). On the S3 path: `plaintext → zstd compress → GCM encrypt → S3 PUT`. On read: `S3 GET → GCM decrypt → zstd decompress → plaintext`.
-
-**Security model:** S3 data uses GCM with unique nonces per frame (authenticated, tamper-detecting). Local files use CTR with deterministic nonces (page number / byte offset), providing confidentiality against disk-at-rest attackers. CTR's deterministic nonces mean multi-snapshot attackers could recover XOR of plaintexts at reused offsets, matching SQLite's own SEE extension tradeoff. The local cache is ephemeral and recreatable from S3.
+If encryption is enabled, turbolite encrypts everything: S3 objects, local cache, WAL, metadata. S3 data uses AES-256-GCM with random nonces per frame (authenticated, tamper-detecting). Local data uses AES-256-CTR with zero size overhead. Encryption happens after compression: `plaintext → zstd → encrypt → S3`.
 
 **Key rotation:** `rotate_encryption_key(config, new_key)` re-encrypts, adds, or removes encryption on all S3 data without decompressing. `Some` to `Some` rotates keys, `Some` to `None` removes encryption, `None` to `Some` adds it. Crash-safe: old objects are never overwritten, the manifest upload is the atomic commit point, and a verification step confirms new data is readable before committing. Orphans from partial runs are cleaned by `gc()`.
 
 ## Strengths and Limitations
 
-### When turbolite is fast
+### Where turbolite is fast
 
-**Point lookups are the sweet spot.** A cold point lookup fetches 1-2 sub-chunks via S3 range GET (~100KB each). Interior and index pages are already cached. Arctic adds ~120ms for interior re-fetch + first data page. This works on any machine size.
+**Point lookups are the sweet spot.** At cache level `index`, a point lookup fetches 1-2 sub-chunks via S3 range GET (~100KB each). Interior and index pages are already cached. At cache level `none`, add ~120ms for interior re-fetch + first data page. This works on any machine size.
 
-**Scans with enough cores.** The prefetch pool saturates S3 bandwidth with adaptive hop scheduling (default: 33%/33%/remaining of all groups per consecutive miss). 8 threads cache the entire 1.46GB database in 2-3 hops.
+**Scans with enough cores.** The prefetch pool saturates S3 bandwidth with flexible hop scheduling (default: 33%/33%/remaining of all groups per consecutive miss). Sufficient threads can sync multi-GB databases in seconds with 2-3 prefetch batches.
 
-### When turbolite is slow
+### Where turbolite is slow
 
-**Scans on small machines.** With 1 prefetch thread, a cold scan over 1.46GB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect cold startup to be painful.
+**Scans on small machines.** With 1 prefetch thread, a scan over 1.46GB takes seconds, not milliseconds. The bottleneck is S3 round trips: each hop fetches groups serially. If your first query is a full scan on a 1-vCPU machine, expect startup to be painful.
 
 **Bad thread tuning.** Too few prefetch threads and scans stall waiting for S3. Too many and you waste memory on idle threads. The default (`num_cpus + 1`) is reasonable, but scan-heavy workloads on large databases need more CPUs.
 
-**First query penalty.** The first query on an arctic cache pays for interior page loading (~50-200ms depending on database size) plus at least one data fetch. Index pages are aggressively prefetched but slow. If the query needs an index page before the background fetch completes, it falls back to an inline range GET from the data page group.
+**First query penalty.** The first query at cache level `none` pays ~50-200ms for interior page loading plus at least one data fetch. If the query needs an index page before background prefetch finishes, it falls back to an inline range GET.
 
 ### Current limitations
 
-- **Single writer only.** Two machines writing to the same prefix will corrupt the manifest. Single-machine multi-process writes use fcntl locks (should work but not battle-tested). Multi-thread writes within one process have a known locking gap (fcntl is per-process, not per-thread).
+- **Single writer only.** Two machines writing to the same prefix will corrupt the manifest.
 - **No WAL shipping.** Writes between checkpoints live only in the local WAL. See [Durability](#durability).
-- **No mmap.** Cache hits use `pread`, not memory-mapped I/O.
-- **WAL shipping tools** (LiteStream, walrust) conflict with turbolite's checkpoint ownership. Built-in WAL shipping is on the roadmap.
-- **Shared cache mode** is meaningless across S3.
 
-SQLite features that **do** work transparently: FTS, R-tree, JSON, WAL mode, DELETE journal mode, VACUUM, autovacuum. All go through the page-level VFS interface.
+SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mode, VACUUM, autovacuum.
 
 ## Tuning
 
@@ -192,7 +204,7 @@ SQLite features that **do** work transparently: FTS, R-tree, JSON, WAL mode, DEL
 
 ## Durability
 
-turbolite is a storage layer, not a replication system, Some important notes on durability:
+turbolite is a storage layer, not a replication system.
 
 **After checkpoint**: page groups + manifest are in S3. S3 provides 11 nines of durability. This data survives machine loss.
 
@@ -201,6 +213,8 @@ turbolite is a storage layer, not a replication system, Some important notes on 
 Checkpoint frequency controls the tradeoff: more frequent checkpoints = smaller data-at-risk window but more S3 PUTs. The default is SQLite's auto-checkpoint (every 1000 WAL frames).
 
 **WAL shipping** (not yet implemented): the VFS already intercepts every WAL write, so it could ship WAL frames to S3 in the background, closing the durability gap without waiting for checkpoint. This is on the roadmap.
+
+**Consistency model:** single writer, snapshot readers. One process writes; readers see the last committed manifest when they opened. turbolite is not a distributed database and does not coordinate between multiple writers.
 
 ## Local Mode (no S3)
 
@@ -333,7 +347,7 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 
 ## Related Projects and Comparison
 
-There are many projects in the SQLite-over-network space. turbolite builds on ideas from all of them.
+There are many projects in the SQLite-over-network space. turbolite borrows ideas from all of them.
 
 ### Range requests on raw .db files (read-only)
 
@@ -377,16 +391,14 @@ These replicate local writes to S3 for backup or restore.
 | Encryption | AES-256-GCM per page | none | none | none | none | none |
 | Prefetch | fraction-based hop schedule | none or basic readahead | LRU cache | adaptive consolidation | client buffers | none |
 | Interior page optimization | detected, pinned, bundled separately | none | page index from LTX trailers | optional .dbi file | none | none |
-| Bytes per cold point lookup | ~100KB (one compressed frame) | 4-64KB (one raw page) | varies | varies | varies | 4KB (one page) |
+| Bytes per point lookup (cache: index) | ~100KB (one compressed frame) | 4-64KB (one raw page) | varies | varies | varies | 4KB (one page) |
 | Write cost per 4096 pages | ~$0.000005 (one PUT) | n/a | n/a | n/a | FoundationDB ops | ~$0.02 (4096 PUTs) |
-
-The projects above each solved pieces of what turbolite implements. Many thanks to all of these projects for the ideas and inspiration.
 
 ## Benchmarking
 
 All benchmarks live in [`benchmark/`](benchmark/). See [`benchmark/README.md`](benchmark/README.md) for deployment scenarios (local, Fly.io, EC2).
 
-The `tiered-bench` binary generates a social media dataset (users, posts, likes, friendships) and benchmarks warm/cold/arctic queries against S3.
+The `tiered-bench` binary generates a social media dataset (users, posts, likes, friendships) and benchmarks queries at each cache level against S3.
 
 ```bash
 # Basic benchmark: 100K posts, default settings
@@ -394,15 +406,15 @@ TIERED_TEST_BUCKET=my-bucket AWS_ENDPOINT_URL=https://t3.storage.dev \
   cargo run --features zstd,tiered --bin tiered-bench --release -- \
     --sizes 100000
 
-# 1M posts, 8 prefetch threads, only cold point queries
+# 1M posts, 8 prefetch threads, only interior-level point queries
 cargo run --features zstd,tiered --bin tiered-bench --release -- \
-    --sizes 1000000 --prefetch-threads 8 --queries post --modes cold
+    --sizes 1000000 --prefetch-threads 8 --queries post --modes interior
 
 # Quick local VFS comparison (no S3 needed)
 cargo run --example quick-bench --features encryption --release
 ```
 
-Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-hops`, `--queries` (post/profile/who-liked/mutual), `--modes` (warm/cold/arctic), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`.
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--prefetch-hops`, `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`.
 
 ## Testing
 
@@ -414,7 +426,11 @@ cargo test --features zstd,encryption         # + encryption tests
 
 ## Notes
 
-turbolite used to be named `sqlite-compress-encrypt-vfs`, aka `sqlces`.
+turbolite was previously named `sqlite-compress-encrypt-vfs`, aka `sqlces`.
+
+### Security model details
+
+S3 data uses AES-256-GCM with unique random nonces per frame (authenticated, tamper-detecting). Local files use AES-256-CTR with deterministic nonces (page number / byte offset), providing confidentiality against disk-at-rest attackers. CTR's deterministic nonces mean multi-snapshot attackers could recover XOR of plaintexts at reused offsets, matching SQLite's own SEE extension tradeoff. The local cache is ephemeral and recreatable from S3.
 
 ## License
 

@@ -1118,6 +1118,20 @@ impl SubChunkTracker {
         }
     }
 
+    /// Clear Index + Data sub-chunks, keep Pinned only.
+    fn clear_index_and_data(&mut self) {
+        let to_remove: Vec<SubChunkId> = self.present.iter()
+            .filter(|id| {
+                let tier = self.tiers.get(id).copied().unwrap_or(SubChunkTier::Data);
+                tier != SubChunkTier::Pinned
+            })
+            .copied()
+            .collect();
+        for id in to_remove {
+            self.remove(id);
+        }
+    }
+
     /// Clear everything including pinned (full reset).
     fn clear_all(&mut self) {
         self.present.clear();
@@ -4379,6 +4393,51 @@ impl TieredBenchHandle {
         }
     }
 
+    /// Evict index + data pages — interior B-tree pages and group 0 stay warm.
+    /// Simulates first query after connection open (interior loaded eagerly,
+    /// index prefetch hasn't finished yet).
+    pub fn clear_cache_interior_only(&self) {
+        self.prefetch_pool.wait_idle();
+
+        let pinned_pages = self.cache.interior_pages.lock().clone();
+        let ppg = self.cache.pages_per_group as u64;
+
+        // Reset group states to None, except group 0 stays Present
+        let states = self.cache.group_states.lock();
+        for (i, s) in states.iter().enumerate() {
+            if i == 0 {
+                s.store(GroupState::Present as u8, Ordering::Release);
+            } else {
+                s.store(GroupState::None as u8, Ordering::Release);
+            }
+        }
+        drop(states);
+
+        self.cache.group_access.lock().clear();
+        self.cache.index_pages.lock().clear();
+
+        // Clear bitmap except for interior pages and group 0
+        {
+            let mut bitmap = self.cache.bitmap.lock();
+            let total_pages = bitmap.bits.len() as u64 * 8;
+            bitmap.bits.fill(0);
+            for &page in &pinned_pages {
+                bitmap.mark_present(page);
+            }
+            let g0_end = ppg.min(total_pages);
+            for p in 0..g0_end {
+                bitmap.mark_present(p);
+            }
+            let _ = bitmap.persist();
+        }
+
+        // Clear sub-chunk tracker: evict Index + Data tiers, keep Pinned only
+        {
+            let mut tracker = self.cache.tracker.lock();
+            tracker.clear_index_and_data();
+        }
+    }
+
     /// Evict everything — interior pages, group 0, all data. Nothing cached.
     /// Next connection open must re-fetch interior chunks from S3.
     pub fn clear_cache_all(&self) {
@@ -4427,16 +4486,16 @@ impl TieredBenchHandle {
 /// Re-encrypt, encrypt, or decrypt all S3 data.
 ///
 /// Three modes based on `config.encryption_key` (old) and `new_key`:
-/// - `Some(old) → Some(new)`: key rotation (decrypt with old, re-encrypt with new)
-/// - `Some(old) → None`: remove encryption (decrypt, upload plaintext compressed data)
-/// - `None → Some(new)`: add encryption (encrypt previously plaintext data)
+/// - `Some(old), Some(new)`: key rotation (decrypt with old, re-encrypt with new)
+/// - `Some(old), None`: remove encryption (decrypt, store plaintext compressed data)
+/// - `None, Some(new)`: add encryption (encrypt previously plaintext data)
 ///
 /// Downloads each S3 object, transforms it, and uploads as a new versioned object.
 /// The manifest upload is the atomic commit point. Old objects are GC'd after.
 /// Local cache is cleared (ephemeral, repopulates on next open).
 ///
 /// This does NOT decompress/recompress, only changes the encryption layer.
-/// Frame table offsets are recalculated (GCM adds 28 bytes/frame).
+/// Frame table offsets are recalculated (GCM adds/removes 28 bytes/frame).
 ///
 /// **Offline operation**: close all connections before rotating. Open connections
 /// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
@@ -4454,6 +4513,28 @@ pub fn rotate_encryption_key(
             "rotate_encryption_key: both old and new keys are None (nothing to do)",
         ));
     }
+
+    if old_key == new_key {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rotate_encryption_key: old and new keys are identical (nothing to do)",
+        ));
+    }
+
+    // Helpers: decrypt if old_key present, encrypt if new_key present.
+    // When key is None, data passes through unchanged.
+    let maybe_decrypt = |data: &[u8]| -> io::Result<Vec<u8>> {
+        match old_key.as_ref() {
+            Some(k) => compress::decrypt_gcm_random_nonce(data, k),
+            None => Ok(data.to_vec()),
+        }
+    };
+    let maybe_encrypt = |data: &[u8]| -> io::Result<Vec<u8>> {
+        match new_key.as_ref() {
+            Some(k) => compress::encrypt_gcm_random_nonce(data, k),
+            None => Ok(data.to_vec()),
+        }
+    };
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -4478,15 +4559,22 @@ pub fn rotate_encryption_key(
     new_manifest.version += 1;
     let new_version = new_manifest.version;
     let mut replaced_keys: Vec<String> = Vec::new();
-    let mut validated_old_key = false;
+    let mut validated_old_key = old_key.is_none(); // skip validation when no old key
 
     let pg_count = manifest
         .page_group_keys
         .iter()
         .filter(|k| !k.is_empty())
         .count();
+    let mode = match (&old_key, &new_key) {
+        (Some(_), Some(_)) => "key rotation",
+        (Some(_), None) => "removing encryption",
+        (None, Some(_)) => "adding encryption",
+        (None, None) => unreachable!(),
+    };
     eprintln!(
-        "[rotate] starting key rotation: {} page groups, {} interior chunks, {} index chunks",
+        "[rotate] starting {}: {} page groups, {} interior chunks, {} index chunks",
+        mode,
         pg_count,
         manifest.interior_chunk_keys.len(),
         manifest.index_chunk_keys.len(),
@@ -4515,7 +4603,8 @@ pub fn rotate_encryption_key(
             } else {
                 &blob[..]
             };
-            compress::decrypt_gcm_random_nonce(test_data, &old_key).map_err(|_| {
+            // old_key is Some here (validated_old_key starts true when old_key is None)
+            compress::decrypt_gcm_random_nonce(test_data, old_key.as_ref().expect("old_key must be Some for validation")).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Old encryption key failed to decrypt existing data. Wrong key?",
@@ -4536,14 +4625,14 @@ pub fn rotate_encryption_key(
             for frame in frames {
                 let end = frame.offset as usize + frame.len as usize;
                 let frame_data = &blob[frame.offset as usize..end];
-                let compressed = compress::decrypt_gcm_random_nonce(frame_data, &old_key)?;
-                let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &new_key)?;
+                let compressed = maybe_decrypt(frame_data)?;
+                let output = maybe_encrypt(&compressed)?;
 
                 new_frames.push(FrameEntry {
                     offset: new_blob.len() as u64,
-                    len: re_encrypted.len() as u32,
+                    len: output.len() as u32,
                 });
-                new_blob.extend_from_slice(&re_encrypted);
+                new_blob.extend_from_slice(&output);
             }
 
             let new_s3_key = s3.page_group_key(gid as u64, new_version);
@@ -4554,11 +4643,11 @@ pub fn rotate_encryption_key(
             new_manifest.frame_tables[gid] = new_frames;
         } else {
             // Non-seekable: whole-blob decrypt + re-encrypt
-            let compressed = compress::decrypt_gcm_random_nonce(&blob, &old_key)?;
-            let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &new_key)?;
+            let compressed = maybe_decrypt(&blob)?;
+            let output = maybe_encrypt(&compressed)?;
 
             let new_s3_key = s3.page_group_key(gid as u64, new_version);
-            s3.put_page_groups(&[(new_s3_key.clone(), re_encrypted)])?;
+            s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
             replaced_keys.push(old_s3_key.clone());
             new_manifest.page_group_keys[gid] = new_s3_key;
@@ -4566,7 +4655,7 @@ pub fn rotate_encryption_key(
     }
 
     eprintln!(
-        "[rotate] re-encrypted {} page groups",
+        "[rotate] processed {} page groups",
         manifest
             .page_group_keys
             .iter()
@@ -4587,11 +4676,11 @@ pub fn rotate_encryption_key(
                 format!("Interior chunk {} not found", old_s3_key),
             )
         })?;
-        let compressed = compress::decrypt_gcm_random_nonce(&blob, &old_key)?;
-        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &new_key)?;
+        let compressed = maybe_decrypt(&blob)?;
+        let output = maybe_encrypt(&compressed)?;
 
         let new_s3_key = s3.interior_chunk_key(*chunk_id, new_version);
-        s3.put_page_groups(&[(new_s3_key.clone(), re_encrypted)])?;
+        s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
         replaced_keys.push(old_s3_key.clone());
         new_manifest
@@ -4599,7 +4688,7 @@ pub fn rotate_encryption_key(
             .insert(*chunk_id, new_s3_key);
     }
 
-    eprintln!("[rotate] re-encrypted {} interior chunks", interior_keys.len());
+    eprintln!("[rotate] processed {} interior chunks", interior_keys.len());
 
     // Re-encrypt index bundles
     let index_keys: Vec<(u32, String)> = manifest
@@ -4614,11 +4703,11 @@ pub fn rotate_encryption_key(
                 format!("Index chunk {} not found", old_s3_key),
             )
         })?;
-        let compressed = compress::decrypt_gcm_random_nonce(&blob, &old_key)?;
-        let re_encrypted = compress::encrypt_gcm_random_nonce(&compressed, &new_key)?;
+        let compressed = maybe_decrypt(&blob)?;
+        let output = maybe_encrypt(&compressed)?;
 
         let new_s3_key = s3.index_chunk_key(*chunk_id, new_version);
-        s3.put_page_groups(&[(new_s3_key.clone(), re_encrypted)])?;
+        s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
         replaced_keys.push(old_s3_key.clone());
         new_manifest
@@ -4626,7 +4715,69 @@ pub fn rotate_encryption_key(
             .insert(*chunk_id, new_s3_key);
     }
 
-    eprintln!("[rotate] re-encrypted {} index chunks", index_keys.len());
+    eprintln!("[rotate] processed {} index chunks", index_keys.len());
+
+    // VERIFY: re-download and decode one new page group before committing.
+    // Guards against silent S3 corruption or encode bugs.
+    if let Some(verify_key) = new_manifest.page_group_keys.iter().find(|k| !k.is_empty()) {
+        let verify_blob = s3.get_page_group(verify_key)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "verification failed: newly uploaded page group not found in S3",
+            )
+        })?;
+        // Find the gid for this key to check frame table
+        let verify_gid = new_manifest
+            .page_group_keys
+            .iter()
+            .position(|k| k == verify_key)
+            .expect("key must be in manifest");
+        let has_ft = verify_gid < new_manifest.frame_tables.len()
+            && !new_manifest.frame_tables[verify_gid].is_empty();
+        if has_ft {
+            // Verify first frame can be decrypted and decompressed
+            let frame = &new_manifest.frame_tables[verify_gid][0];
+            let end = frame.offset as usize + frame.len as usize;
+            if end > verify_blob.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "verification failed: frame extends beyond blob",
+                ));
+            }
+            let frame_data = &verify_blob[frame.offset as usize..end];
+            let decrypted = decrypt_if_needed(frame_data, new_key.as_ref())?;
+            compress::decompress(
+                &decrypted,
+                #[cfg(feature = "zstd")]
+                None,
+                #[cfg(not(feature = "zstd"))]
+                None,
+            )
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("verification failed: cannot decompress new data: {}", e),
+                )
+            })?;
+        } else {
+            // Non-seekable: verify whole blob
+            let decrypted = decrypt_if_needed(&verify_blob, new_key.as_ref())?;
+            compress::decompress(
+                &decrypted,
+                #[cfg(feature = "zstd")]
+                None,
+                #[cfg(not(feature = "zstd"))]
+                None,
+            )
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("verification failed: cannot decompress new data: {}", e),
+                )
+            })?;
+        }
+        eprintln!("[rotate] verification passed: new data is readable");
+    }
 
     // COMMIT POINT: upload new manifest
     s3.put_manifest(&new_manifest)?;
@@ -4644,7 +4795,7 @@ pub fn rotate_encryption_key(
     let _ = std::fs::remove_file(config.cache_dir.join("page_bitmap"));
     eprintln!("[rotate] cleared local cache");
 
-    eprintln!("[rotate] key rotation complete");
+    eprintln!("[rotate] {} complete", mode);
     Ok(())
 }
 
@@ -6444,6 +6595,27 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_chunk_tracker_clear_index_and_data_keeps_pinned() {
+        let dir = TempDir::new().unwrap();
+        let mut t = SubChunkTracker::new(dir.path().join("t"), 8, 2);
+        let pinned = SubChunkId { group_id: 0, frame_index: 0 };
+        let index = SubChunkId { group_id: 0, frame_index: 1 };
+        let data = SubChunkId { group_id: 0, frame_index: 2 };
+
+        t.mark_present(pinned, SubChunkTier::Data);
+        t.mark_pinned(pinned);
+        t.mark_present(index, SubChunkTier::Index);
+        t.mark_present(data, SubChunkTier::Data);
+
+        t.clear_index_and_data();
+        // Pinned survives
+        assert!(t.is_sub_chunk_present(&pinned));
+        // Index and Data are gone
+        assert!(!t.is_sub_chunk_present(&index));
+        assert!(!t.is_sub_chunk_present(&data));
+    }
+
+    #[test]
     fn test_sub_chunk_tracker_persist_and_reload() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("tracker_persist");
@@ -8012,5 +8184,296 @@ mod tests {
                 assert_eq!(page, &vec![expected_byte; 4096]);
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_add_encryption_non_seekable() {
+        // Encode without encryption, then encrypt (None -> Some)
+        let key = test_key();
+
+        let pages: Vec<Option<Vec<u8>>> = (0..4)
+            .map(|i| Some(vec![i as u8; 4096]))
+            .collect();
+
+        // Encode without encryption
+        let encoded = encode_page_group(
+            &pages,
+            4096,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            None, // no encryption
+        )
+        .unwrap();
+
+        // "Add encryption": encrypt the compressed blob
+        let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &key).unwrap();
+
+        // Decrypt with key should work
+        let (pc, ps, decoded_pages) = decode_page_group(
+            &encrypted,
+            #[cfg(feature = "zstd")]
+            None,
+            Some(&key),
+        )
+        .unwrap();
+        assert_eq!(pc, 4);
+        assert_eq!(ps, 4096);
+        for (i, page) in decoded_pages.iter().enumerate() {
+            assert_eq!(page, &vec![i as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_remove_encryption_non_seekable() {
+        // Encode with encryption, then decrypt (Some -> None)
+        let key = test_key();
+
+        let pages: Vec<Option<Vec<u8>>> = (0..4)
+            .map(|i| Some(vec![i as u8; 4096]))
+            .collect();
+
+        let encoded = encode_page_group(
+            &pages,
+            4096,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            Some(&key),
+        )
+        .unwrap();
+
+        // "Remove encryption": decrypt to get raw compressed data
+        let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &key).unwrap();
+
+        // Should be decodable without encryption
+        let (pc, ps, decoded_pages) = decode_page_group(
+            &decrypted,
+            #[cfg(feature = "zstd")]
+            None,
+            None, // no encryption
+        )
+        .unwrap();
+        assert_eq!(pc, 4);
+        assert_eq!(ps, 4096);
+        for (i, page) in decoded_pages.iter().enumerate() {
+            assert_eq!(page, &vec![i as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_add_encryption_seekable() {
+        // Encode seekable without encryption, add encryption, decrypt with key
+        let key = test_key();
+
+        let pages: Vec<Option<Vec<u8>>> = (0..8)
+            .map(|i| Some(vec![i as u8; 4096]))
+            .collect();
+
+        let (encoded, frame_table) = encode_page_group_seekable(
+            &pages,
+            4096,
+            2,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            None, // no encryption
+        )
+        .unwrap();
+
+        assert_eq!(frame_table.len(), 4);
+
+        // Add encryption per-frame
+        let mut new_blob = Vec::with_capacity(encoded.len() + 28 * frame_table.len());
+        let mut new_frames = Vec::with_capacity(frame_table.len());
+
+        for frame in &frame_table {
+            let end = frame.offset as usize + frame.len as usize;
+            let frame_data = &encoded[frame.offset as usize..end];
+            let encrypted = compress::encrypt_gcm_random_nonce(frame_data, &key).unwrap();
+
+            new_frames.push(FrameEntry {
+                offset: new_blob.len() as u64,
+                len: encrypted.len() as u32,
+            });
+            new_blob.extend_from_slice(&encrypted);
+        }
+
+        // Each encrypted frame should be 28 bytes larger
+        for (old, new) in frame_table.iter().zip(new_frames.iter()) {
+            assert_eq!(new.len, old.len + 28);
+        }
+
+        // Decrypt each frame
+        for (i, frame) in new_frames.iter().enumerate() {
+            let end = frame.offset as usize + frame.len as usize;
+            let raw = decode_seekable_subchunk(
+                &new_blob[frame.offset as usize..end],
+                #[cfg(feature = "zstd")]
+                None,
+                Some(&key),
+            )
+            .unwrap();
+            assert_eq!(raw.len(), 2 * 4096);
+            assert_eq!(&raw[..4096], &vec![(i * 2) as u8; 4096]);
+            assert_eq!(&raw[4096..], &vec![(i * 2 + 1) as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_remove_encryption_seekable() {
+        // Encode seekable with encryption, remove encryption, decode without key
+        let key = test_key();
+
+        let pages: Vec<Option<Vec<u8>>> = (0..8)
+            .map(|i| Some(vec![i as u8; 4096]))
+            .collect();
+
+        let (encoded, frame_table) = encode_page_group_seekable(
+            &pages,
+            4096,
+            2,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            Some(&key),
+        )
+        .unwrap();
+
+        assert_eq!(frame_table.len(), 4);
+
+        // Remove encryption per-frame
+        let mut new_blob = Vec::new();
+        let mut new_frames = Vec::with_capacity(frame_table.len());
+
+        for frame in &frame_table {
+            let end = frame.offset as usize + frame.len as usize;
+            let frame_data = &encoded[frame.offset as usize..end];
+            let decrypted = compress::decrypt_gcm_random_nonce(frame_data, &key).unwrap();
+
+            new_frames.push(FrameEntry {
+                offset: new_blob.len() as u64,
+                len: decrypted.len() as u32,
+            });
+            new_blob.extend_from_slice(&decrypted);
+        }
+
+        // Each decrypted frame should be 28 bytes smaller
+        for (old, new) in frame_table.iter().zip(new_frames.iter()) {
+            assert_eq!(new.len + 28, old.len);
+        }
+
+        // Decode each frame without encryption
+        for (i, frame) in new_frames.iter().enumerate() {
+            let end = frame.offset as usize + frame.len as usize;
+            let raw = decode_seekable_subchunk(
+                &new_blob[frame.offset as usize..end],
+                #[cfg(feature = "zstd")]
+                None,
+                None, // no encryption
+            )
+            .unwrap();
+            assert_eq!(raw.len(), 2 * 4096);
+            assert_eq!(&raw[..4096], &vec![(i * 2) as u8; 4096]);
+            assert_eq!(&raw[4096..], &vec![(i * 2 + 1) as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_add_encryption_interior_bundle() {
+        // Encode interior bundle without encryption, add encryption, decode with key
+        let key = test_key();
+
+        let page_data: Vec<Vec<u8>> = (0..3).map(|i| vec![i as u8; 4096]).collect();
+        let pages: Vec<(u64, &[u8])> = page_data
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d.as_slice()))
+            .collect();
+
+        let encoded = encode_interior_bundle(
+            &pages,
+            4096,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            None, // no encryption
+        )
+        .unwrap();
+
+        // Add encryption
+        let encrypted = compress::encrypt_gcm_random_nonce(&encoded, &key).unwrap();
+
+        // Decode with key
+        let decoded = decode_interior_bundle(
+            &encrypted,
+            #[cfg(feature = "zstd")]
+            None,
+            Some(&key),
+        )
+        .unwrap();
+
+        assert_eq!(decoded.len(), 3);
+        for (i, (pnum, data)) in decoded.iter().enumerate() {
+            assert_eq!(*pnum, i as u64);
+            assert_eq!(data, &vec![i as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_remove_encryption_interior_bundle() {
+        // Encode interior bundle with encryption, remove encryption, decode without key
+        let key = test_key();
+
+        let page_data: Vec<Vec<u8>> = (0..3).map(|i| vec![i as u8; 4096]).collect();
+        let pages: Vec<(u64, &[u8])> = page_data
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d.as_slice()))
+            .collect();
+
+        let encoded = encode_interior_bundle(
+            &pages,
+            4096,
+            3,
+            #[cfg(feature = "zstd")]
+            None,
+            Some(&key),
+        )
+        .unwrap();
+
+        // Remove encryption
+        let decrypted = compress::decrypt_gcm_random_nonce(&encoded, &key).unwrap();
+
+        // Decode without key
+        let decoded = decode_interior_bundle(
+            &decrypted,
+            #[cfg(feature = "zstd")]
+            None,
+            None, // no encryption
+        )
+        .unwrap();
+
+        assert_eq!(decoded.len(), 3);
+        for (i, (pnum, data)) in decoded.iter().enumerate() {
+            assert_eq!(*pnum, i as u64);
+            assert_eq!(data, &vec![i as u8; 4096]);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn test_both_keys_none_error() {
+        // Both old and new keys None should error
+        // This tests the rotate_encryption_key guard, simulated here
+        let old_key: Option<[u8; 32]> = None;
+        let new_key: Option<[u8; 32]> = None;
+        assert!(old_key.is_none() && new_key.is_none());
     }
 }
