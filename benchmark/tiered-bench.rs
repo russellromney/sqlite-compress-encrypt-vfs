@@ -1,12 +1,14 @@
-//! tiered-bench - Warm/cold benchmark for tiered S3-backed VFS
+//! tiered-bench - Benchmark for tiered S3-backed VFS
 //!
 //! Early-Facebook-style dataset:
 //!   - users, posts, friendships, likes (4 tables, indexed)
-//!   - Point lookups and small JOINs only
+//!   - Point lookups, JOINs, indexed filters, scans
 //!
-//! Two modes per query:
-//!   WARM: cache populated, reuse connection → measures cache-hit path (pread)
-//!   COLD: clear_cache() before each iteration → measures S3 fetch + decode
+//! Four cache levels:
+//!   none     = nothing cached (full cold start from S3)
+//!   interior = interior B-tree pages cached, index + data from S3
+//!   index    = interior + index pages cached, data from S3
+//!   data     = everything cached (warm, measures pread latency)
 //!
 //! ```bash
 //! TIERED_TEST_BUCKET=turbolite-test \
@@ -137,7 +139,11 @@ struct Cli {
     queries: Option<String>,
 
     /// Which modes to run (comma-separated). Default: all.
-    /// Options: warm, cold, arctic
+    /// Cache levels: none, interior, index, data
+    ///   none     = nothing cached (full cold start from S3)
+    ///   interior = interior B-tree pages cached, index + data from S3
+    ///   index    = interior + index pages cached, data from S3
+    ///   data     = everything cached (warm)
     #[arg(long, env = "BENCH_MODES")]
     modes: Option<String>,
 
@@ -602,7 +608,8 @@ fn run_query(
 
 /// WARM benchmark: cache populated, reuse connection.
 /// First call primes the cache, subsequent calls measure cache-hit latency.
-fn bench_warm(
+/// Cache level: data — everything cached, reuse connection. Measures pread latency.
+fn bench_data(
     conn: &Connection,
     handle: &TieredBenchHandle,
     label: &str,
@@ -630,15 +637,15 @@ fn bench_warm(
                 s3_fetches.push(fc);
                 s3_bytes.push(fb);
             }
-            Err(e) => eprintln!("    [warm] {} iter {} error: {}", label, i, e),
+            Err(e) => eprintln!("    [data] {} iter {} error: {}", label, i, e),
         }
     }
 
-    BenchResult { label: format!("[warm] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult { label: format!("[data] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
 }
 
-/// COLD benchmark: clear data pages before each iteration, interior pages stay cached.
-fn bench_cold(
+/// Cache level: index — interior + index pages cached, data pages from S3.
+fn bench_index(
     vfs_name: &str,
     db_name: &str,
     handle: &TieredBenchHandle,
@@ -654,9 +661,9 @@ fn bench_cold(
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("cold connection");
+        ).expect("index-level connection");
         if let Err(e) = run_query(&conn, sql, &params) {
-            eprintln!("    [cold] {} warmup {} error: {}", label, i, e);
+            eprintln!("    [index] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
     }
@@ -673,7 +680,7 @@ fn bench_cold(
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("cold connection");
+        ).expect("index-level connection");
         match run_query(&conn, sql, &params) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -681,17 +688,70 @@ fn bench_cold(
                 s3_fetches.push(fc);
                 s3_bytes.push(fb);
             }
-            Err(e) => eprintln!("    [cold] {} iter {} error: {}", label, i, e),
+            Err(e) => eprintln!("    [index] {} iter {} error: {}", label, i, e),
         }
         drop(conn);
     }
 
-    BenchResult { label: format!("[cold] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult { label: format!("[index] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
 }
 
-/// ARCTIC benchmark: clear EVERYTHING before each iteration, including interior pages.
+/// Cache level: interior — interior B-tree pages cached, index + data from S3.
+/// This is the realistic "first query after connection open" state.
+fn bench_interior(
+    vfs_name: &str,
+    db_name: &str,
+    handle: &TieredBenchHandle,
+    label: &str,
+    sql: &str,
+    param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
+    warmup: usize,
+    iterations: usize,
+) -> BenchResult {
+    for i in 0..warmup {
+        handle.clear_cache_interior_only();
+        handle.reset_s3_counters();
+        let params = param_fn(i);
+        let conn = Connection::open_with_flags_and_vfs(
+            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
+        ).expect("interior-level connection");
+        if let Err(e) = run_query(&conn, sql, &params) {
+            eprintln!("    [interior] {} warmup {} error: {}", label, i, e);
+        }
+        drop(conn);
+    }
+
+    let mut latencies = Vec::with_capacity(iterations);
+    let mut s3_fetches = Vec::with_capacity(iterations);
+    let mut s3_bytes = Vec::with_capacity(iterations);
+
+    for i in 0..iterations {
+        handle.clear_cache_interior_only();
+        handle.reset_s3_counters();
+
+        let params = param_fn(warmup + i);
+        let start = Instant::now();
+        let conn = Connection::open_with_flags_and_vfs(
+            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
+        ).expect("interior-level connection");
+        match run_query(&conn, sql, &params) {
+            Ok(_) => {
+                latencies.push(start.elapsed().as_micros() as f64);
+                let (fc, fb) = handle.s3_counters();
+                s3_fetches.push(fc);
+                s3_bytes.push(fb);
+            }
+            Err(e) => eprintln!("    [interior] {} iter {} error: {}", label, i, e),
+        }
+        drop(conn);
+    }
+
+    BenchResult { label: format!("[interior] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+}
+
+/// Cache level: none — everything evicted, including interior pages.
 /// Interior chunks must be re-fetched from S3 on each connection open.
-fn bench_arctic(
+fn bench_none(
     vfs_name: &str,
     db_name: &str,
     handle: &TieredBenchHandle,
@@ -707,9 +767,9 @@ fn bench_arctic(
         let params = param_fn(i);
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("arctic connection");
+        ).expect("none-level connection");
         if let Err(e) = run_query(&conn, sql, &params) {
-            eprintln!("    [arctic] {} warmup {} error: {}", label, i, e);
+            eprintln!("    [none] {} warmup {} error: {}", label, i, e);
         }
         drop(conn);
     }
@@ -726,7 +786,7 @@ fn bench_arctic(
         let start = Instant::now();
         let conn = Connection::open_with_flags_and_vfs(
             db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name,
-        ).expect("arctic connection");
+        ).expect("none-level connection");
         match run_query(&conn, sql, &params) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
@@ -734,12 +794,12 @@ fn bench_arctic(
                 s3_fetches.push(fc);
                 s3_bytes.push(fb);
             }
-            Err(e) => eprintln!("    [arctic] {} iter {} error: {}", label, i, e),
+            Err(e) => eprintln!("    [none] {} iter {} error: {}", label, i, e),
         }
         drop(conn);
     }
 
-    BenchResult { label: format!("[arctic] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
+    BenchResult { label: format!("[none] {}", label), latencies_us: latencies, s3_fetches, s3_bytes }
 }
 
 // =========================================================================
@@ -1000,32 +1060,41 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     ];
     let queries: Vec<QueryDef> = all_queries.into_iter().filter(|q| should_run_query(q.label)).collect();
 
-    if should_run_mode("warm") {
+    if should_run_mode("data") {
         println!();
-        println!("=== WARM (cache populated, reuse connection) ===");
+        println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_warm(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations));
+            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations));
         }
     }
 
-    drop(warm_conn); // close warm connection before cold benchmarks
+    drop(warm_conn); // close warm connection before S3-fetching benchmarks
 
-    if should_run_mode("cold") {
+    if should_run_mode("index") {
         println!();
-        println!("=== COLD (data evicted, interior pages + group 0 cached) ===");
+        println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_cold(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
         }
     }
 
-    if should_run_mode("arctic") {
+    if should_run_mode("interior") {
         println!();
-        println!("=== ARCTIC (everything evicted, interior chunks re-fetched from S3) ===");
+        println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_arctic(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
+        }
+    }
+
+    if should_run_mode("none") {
+        println!();
+        println!("=== CACHE LEVEL: NONE (everything from S3) ===");
+        print_header();
+        for q in &queries {
+            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations));
         }
     }
 

@@ -2,26 +2,28 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
-## Ypres: Encryption Key Rotation
+## Ypres: Encryption Key Rotation + Add/Remove Encryption
 
-Re-encrypt all S3 data with a new key without decompressing/recompressing.
+Rotate, add, or remove encryption on all S3 data without decompressing/recompressing.
 
 ### Design
-- `rotate_encryption_key(config, new_key)` standalone function
-- Decrypt with old key, re-encrypt with new key. GCM overhead is constant (28 bytes/frame), so frame table offsets are preserved.
-- Seekable page groups: per-frame decrypt/re-encrypt
+- `rotate_encryption_key(config, new_key: Option<[u8; 32]>)` standalone function
+- Three modes: `Some(old), Some(new)` = key rotation; `Some(old), None` = remove encryption; `None, Some(new)` = add encryption
+- Seekable page groups: per-frame decrypt/re-encrypt with recalculated frame table offsets
 - Non-seekable page groups, interior bundles, index bundles: whole-blob decrypt/re-encrypt
 - Manifest upload is the atomic commit point. Old S3 objects GC'd after.
 - Local cache cleared (ephemeral, repopulates on next open)
 
 ### Safety
 - Fail-fast: validates old key by decrypting first page group before any uploads
+- Post-upload verification: re-downloads and decompresses one new page group before committing manifest
 - Crash-safe: old objects never overwritten, only new versioned objects created
 - Atomic: manifest swap is the commit point; partial rotation leaves orphans cleaned by gc()
+- Same-key guard: errors if old and new keys are identical
 
 ### Tests
-- 9 rotation unit tests: seekable/non-seekable/bundle roundtrips, frame table preservation, nonce uniqueness, wrong key rejection, same-key idempotent, empty DB, large page group (256 pages)
-- 4 S3 integration tests: cold read after rotation, old key rejection, GC cleanup verification, row-level data integrity (500 rows)
+- 16 unit tests: seekable/non-seekable/bundle roundtrips for rotation, add encryption, and remove encryption; frame table preservation, nonce uniqueness, wrong key rejection, same-key idempotent, empty DB, large page group (256 pages)
+- 6 S3 integration tests: cold read after rotation, old key rejection, GC cleanup, 500-row data integrity, add encryption cold read, remove encryption cold read
 
 ---
 
@@ -47,13 +49,13 @@ One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache
 
 ### Tests
 - 21 encryption unit tests: roundtrip, on-disk not plaintext, wrong key rejection, nonce uniqueness, bulk ops
-- 3 S3 integration tests: encrypted write + cold read, wrong key cold read fails, arctic start with all page types
+- 3 S3 integration tests: encrypted write + read at cache `none`, wrong key rejection, full cold start with all page types
 
 ---
 
 ## Agincourt: Index Bundles + Lazy Prefetch + Page-Size-Aware Chunking
 
-3-7x arctic improvement through three compounding changes:
+3-7x improvement at cache level `none` through three compounding changes:
 
 ### Index bundles
 - Manifest field `index_chunk_keys: HashMap<u32, String>` — page-size-aware chunking via `bundle_chunk_range()` (~32MB target per chunk)
@@ -66,12 +68,12 @@ One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache
 ### Lazy background prefetch
 - VFS open spawns background thread for index bundle fetch instead of blocking
 - First query serves index pages from data groups via inline range GET while background populates full cache
-- Eliminates synchronous 107-144MB fetch that dominated cold latency
+- Eliminates synchronous 107-144MB fetch that dominated latency at low cache levels
 
 ### Index page cache survival
 - `index_pages: HashSet<u64>` tracks index pages in DiskCache
 - Bitmap re-marks index pages in `clear_cache`/`clear_cache_data_only`
-- `clear_cache_all` (arctic) properly clears them for true cold testing
+- `clear_cache_all` (cache level `none`) properly clears them for full cold testing
 
 ### Page-size-aware bundle chunking
 - `bundle_chunk_range()` targets ~32MB uncompressed per chunk instead of fixed 32768 page range
@@ -79,11 +81,11 @@ One key, VFS encrypts everything — S3 objects, local cache, WAL/journal, cache
 - 1M rows now produces 46 index chunks that interleave with data fetches
 
 ### Results (1M rows, 1.46GB, Fly iad → Tigris, 8 vCPU, 16GB RAM)
-- Arctic point lookup: 468ms → 143ms (3.3x)
-- Arctic profile join: 822ms → 419ms (2.0x)
-- Cold point lookup: 54ms → 23ms
-- Cold mutual friends: 27ms → 11ms
-- Warm point lookup: 98μs
+- Cache: none — point lookup: 468ms → 143ms (3.3x)
+- Cache: none — profile join: 822ms → 419ms (2.0x)
+- Cache: index — point lookup: 54ms → 23ms
+- Cache: index — mutual friends: 27ms → 11ms
+- Cache: data — point lookup: 98us
 
 ---
 
