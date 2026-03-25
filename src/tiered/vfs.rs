@@ -27,6 +27,21 @@ pub struct TieredVfs {
     config: TieredConfig,
     /// Owned runtime (if we created one ourselves)
     _runtime: Option<tokio::runtime::Runtime>,
+    /// Phase Verdun: shared prediction table (None when prediction_enabled=false).
+    prediction: Option<prediction::SharedPrediction>,
+    /// Phase Verdun: shared access history (None when prediction_enabled=false).
+    access_history: Option<prediction::SharedAccessHistory>,
+    /// Shared manifest state. Written by TieredHandle during sync/checkpoint,
+    /// read by flush_to_s3() for non-blocking S3 upload.
+    shared_manifest: Arc<RwLock<Manifest>>,
+    /// Shared pending S3 groups. Accumulated by TieredHandle during local-only
+    /// checkpoints, drained by flush_to_s3().
+    shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    /// Serializes flush_to_s3() calls. Prevents two concurrent flushes from
+    /// racing on version numbers and S3 keys. Also prevents a durable-mode
+    /// checkpoint (which drains s3_dirty_groups in sync()) from interleaving
+    /// with a flush in progress.
+    flush_lock: Arc<Mutex<()>>,
 }
 
 impl TieredVfs {
@@ -53,8 +68,9 @@ impl TieredVfs {
         eprintln!("[tiered] S3 client created, fetching manifest...");
 
         // Fetch manifest to get page_size for cache initialization
-        let manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
-        eprintln!("[tiered] manifest fetched (page_size={}, ppg={})", manifest.page_size, manifest.pages_per_group);
+        let mut manifest = s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        manifest.detect_and_normalize_strategy();
+        eprintln!("[tiered] manifest fetched (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
         let page_size = if manifest.page_size > 0 {
             manifest.page_size
         } else {
@@ -97,6 +113,24 @@ impl TieredVfs {
             config.encryption_key,
         ));
 
+        // Phase Verdun: initialize prediction table + access history from manifest (if enabled)
+        let (prediction, access_history) = if config.prediction_enabled {
+            let table = prediction::PredictionTable::from_persisted(&manifest.prediction_patterns);
+            let mut history = prediction::AccessHistory::new();
+            history.freq = manifest.btree_access_freq.clone();
+            (
+                Some(Arc::new(RwLock::new(table))),
+                Some(Arc::new(RwLock::new(history))),
+            )
+        } else {
+            (None, None)
+        };
+
+        // Shared state for two-phase checkpoint (flush_to_s3)
+        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let shared_dirty_groups = Arc::new(Mutex::new(HashSet::new()));
+        let flush_lock = Arc::new(Mutex::new(()));
+
         Ok(Self {
             s3,
             cache,
@@ -104,31 +138,50 @@ impl TieredVfs {
             page_count,
             config,
             _runtime: owned_runtime,
+            prediction,
+            access_history,
+            shared_manifest,
+            shared_dirty_groups,
+            flush_lock,
         })
     }
 
-    /// Get a lightweight handle for benchmarking (clear_cache, S3 counters).
-    /// The handle shares the same cache and S3 client as the VFS.
+    /// Get a lightweight handle for benchmarking (clear_cache, S3 counters, flush_to_s3).
+    /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
     pub fn bench_handle(&self) -> TieredBenchHandle {
         TieredBenchHandle {
             s3: Arc::clone(&self.s3),
             cache: Arc::clone(&self.cache),
             prefetch_pool: Arc::clone(&self.prefetch_pool),
+            shared_manifest: Arc::clone(&self.shared_manifest),
+            shared_dirty_groups: Arc::clone(&self.shared_dirty_groups),
+            flush_lock: Arc::clone(&self.flush_lock),
+            compression_level: self.config.compression_level,
+            #[cfg(feature = "zstd")]
+            dictionary: self.config.dictionary.clone(),
+            encryption_key: self.config.encryption_key,
+            gc_enabled: self.config.gc_enabled,
+            prediction: self.prediction.clone(),
+            access_history: self.access_history.clone(),
         }
     }
 
     /// Evict non-interior pages from disk cache. Interior pages and group 0
-    /// (schema + root page) stay warm — simulates production where structural
+    /// (schema + root page) stay warm -- simulates production where structural
     /// pages are always hot after first access.
+    ///
+    /// Safe to call with pending flush: groups awaiting S3 upload are protected
+    /// (their pages remain in the disk cache bitmap).
     pub fn clear_cache(&self) {
         self.prefetch_pool.wait_idle();
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
+        let pending_groups = self.pending_group_pages();
 
-        // Reset group states to None, except group 0 stays Present
+        // Reset group states to None, except group 0 and pending groups stay Present
         let states = self.cache.group_states.lock();
         for (i, s) in states.iter().enumerate() {
-            if i == 0 {
+            if i == 0 || pending_groups.contains_key(&(i as u64)) {
                 s.store(GroupState::Present as u8, Ordering::Release);
             } else {
                 s.store(GroupState::None as u8, Ordering::Release);
@@ -138,7 +191,7 @@ impl TieredVfs {
 
         self.cache.group_access.lock().clear();
 
-        // Clear bitmap except for interior pages, index pages, and group 0
+        // Clear bitmap except for interior pages, index pages, group 0, and pending groups
         // Uses B-tree-aware group_pages[0] for group 0 (not positional 0..ppg)
         {
             let index_pages = self.cache.index_pages.lock().clone();
@@ -151,8 +204,21 @@ impl TieredVfs {
             for &page in &index_pages {
                 bitmap.mark_present(page);
             }
+            // Protect pending flush pages
+            for pages in pending_groups.values() {
+                for &p in pages {
+                    bitmap.mark_present(p);
+                }
+            }
             if let Some(g0_pages) = gp.first() {
+                // BTreeAware: explicit page list
                 for &p in g0_pages {
+                    bitmap.mark_present(p);
+                }
+            } else {
+                // Positional: group 0 = pages 0..ppg
+                let ppg = self.cache.pages_per_group as u64;
+                for p in 0..ppg {
                     bitmap.mark_present(p);
                 }
             }
@@ -164,6 +230,66 @@ impl TieredVfs {
             let mut tracker = self.cache.tracker.lock();
             tracker.clear_data_only();
         }
+    }
+
+    /// Upload locally-checkpointed dirty pages to S3 without holding any SQLite lock.
+    ///
+    /// # Two-phase checkpoint pattern
+    ///
+    /// ```ignore
+    /// // Phase 1: fast (~1ms), holds SQLite EXCLUSIVE lock briefly
+    /// turbolite::tiered::set_local_checkpoint_only(true);
+    /// conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    /// turbolite::tiered::set_local_checkpoint_only(false);
+    ///
+    /// // Phase 2: slow (S3 uploads), NO SQLite lock held
+    /// vfs.flush_to_s3().unwrap();
+    /// ```
+    ///
+    /// # Durability model
+    ///
+    /// Between phase 1 and phase 2, data exists ONLY in the local disk cache.
+    /// - Process crash: data survives (on local disk)
+    /// - Machine loss: data lost (not yet on S3)
+    /// - `clear_cache*` methods protect pending groups from eviction
+    ///
+    /// After flush_to_s3() completes, data is durable on S3.
+    pub fn flush_to_s3(&self) -> io::Result<()> {
+        let _guard = self.flush_lock.lock().unwrap();
+        flush::flush_dirty_groups_to_s3(
+            &self.s3,
+            &self.cache,
+            &self.shared_manifest,
+            &self.shared_dirty_groups,
+            self.config.compression_level,
+            #[cfg(feature = "zstd")]
+            self.config.dictionary.as_deref(),
+            self.config.encryption_key,
+            self.config.gc_enabled,
+            self.access_history.as_ref(),
+            self.prediction.as_ref(),
+        )
+    }
+
+    /// Returns true if there are dirty groups pending S3 upload.
+    pub fn has_pending_flush(&self) -> bool {
+        !self.shared_dirty_groups.lock().unwrap().is_empty()
+    }
+
+    /// Get page numbers for all groups pending S3 upload.
+    /// Used by clear_cache to protect unflushed pages from eviction.
+    fn pending_group_pages(&self) -> HashMap<u64, Vec<u64>> {
+        let pending = self.shared_dirty_groups.lock().unwrap();
+        if pending.is_empty() {
+            return HashMap::new();
+        }
+        let manifest = self.shared_manifest.read();
+        let mut result = HashMap::new();
+        for &gid in pending.iter() {
+            let pages = manifest.group_page_nums(gid).into_owned();
+            result.insert(gid, pages);
+        }
+        result
     }
 
     /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
@@ -300,7 +426,8 @@ impl Vfs for TieredVfs {
         let path = self.config.cache_dir.join(db);
 
         if matches!(opts.kind, OpenKind::MainDb) {
-            let manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+            let mut manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+            manifest.detect_and_normalize_strategy();
 
             let ppg = if manifest.pages_per_group > 0 {
                 manifest.pages_per_group
@@ -308,11 +435,14 @@ impl Vfs for TieredVfs {
                 self.config.pages_per_group
             };
 
-            // Update cache's group_pages from latest manifest
+            // Update cache's group_pages from latest manifest (BTreeAware only)
             if !manifest.group_pages.is_empty() {
                 self.cache.set_group_pages(manifest.group_pages.clone());
                 self.cache.ensure_group_capacity(manifest.group_pages.len());
             }
+
+            // Update shared manifest with latest from S3
+            *self.shared_manifest.write() = manifest;
 
             let lock_dir = self.config.cache_dir.join("locks");
             fs::create_dir_all(&lock_dir)?;
@@ -322,21 +452,39 @@ impl Vfs for TieredVfs {
                 .write(true)
                 .open(&lock_path)?;
 
+            // Create WAL stub file so SQLite can enter WAL mode.
+            // Without this, SQLite checks xAccess("db-wal") on open, finds no
+            // WAL file, and silently falls back to rollback journal mode even
+            // if the header says WAL. The stub is empty (0 bytes); SQLite
+            // treats an empty WAL as "cleanly shut down, start fresh".
+            if !self.config.read_only {
+                let wal_path = self.config.cache_dir.join(format!("{}-wal", db));
+                let _ = FsOpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&wal_path);
+            }
+
             Ok(TieredHandle::new_tiered(
                 Arc::clone(&self.s3),
                 Arc::clone(&self.cache),
-                manifest,
+                Arc::clone(&self.shared_manifest),
+                Arc::clone(&self.shared_dirty_groups),
                 lock_path,
                 ppg,
                 self.config.compression_level,
                 self.config.read_only,
+                self.config.sync_mode,
                 self.config.prefetch_hops.clone(),
+                self.config.btree_prefetch_hops.clone(),
                 Some(Arc::clone(&self.prefetch_pool)),
                 self.config.gc_enabled,
                 self.config.eager_index_load,
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
                 self.config.encryption_key,
+                self.prediction.clone(),
+                self.access_history.clone(),
             ))
         } else {
             if let Some(parent) = path.parent() {
@@ -395,4 +543,3 @@ impl Vfs for TieredVfs {
         duration
     }
 }
-

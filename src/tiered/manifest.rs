@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 
 /// S3 manifest — updated atomically after all page group uploads.
@@ -32,10 +34,15 @@ pub struct Manifest {
     #[serde(default)]
     pub sub_pages_per_frame: u32,
 
+    /// Grouping strategy used to build this manifest.
+    /// Positional (legacy): gid = page_num / ppg. BTreeAware: explicit mapping.
+    #[serde(default = "default_strategy")]
+    pub strategy: GroupingStrategy,
+
     // --- Phase Midway: B-tree-aware page groups ---
 
     /// Explicit page-to-group mapping. group_pages[gid] = ordered list of page numbers
-    /// in that group. Empty = legacy positional mapping (gid = page_num / ppg).
+    /// in that group. Empty for Positional strategy (computed on the fly).
     #[serde(default)]
     pub group_pages: Vec<Vec<u64>>,
 
@@ -51,6 +58,30 @@ pub struct Manifest {
     /// Built on load from `btrees`, not serialized.
     #[serde(skip)]
     pub btree_groups: HashMap<u64, Vec<u64>>,
+
+    /// Phase Verdun-i: reverse index page_num -> B-tree name (table/index name).
+    /// Built on load from `btrees`, not serialized. Survives VACUUM (names stable).
+    #[serde(skip)]
+    pub page_to_tree_name: HashMap<u64, String>,
+
+    /// Phase Verdun-i: reverse index tree_name -> group IDs.
+    /// Built on load from `btrees`, not serialized.
+    #[serde(skip)]
+    pub tree_name_to_groups: HashMap<String, Vec<u64>>,
+
+    /// Phase Verdun: B-tree access frequency for prediction confidence and decay.
+    /// Keyed by tree name (survives VACUUM).
+    #[serde(default)]
+    pub btree_access_freq: HashMap<String, f32>,
+
+    /// Phase Verdun-i: persisted prediction patterns (name set, confidence).
+    #[serde(default)]
+    pub prediction_patterns: Vec<(std::collections::BTreeSet<String>, f32)>,
+}
+
+fn default_strategy() -> GroupingStrategy {
+    // Default to Positional for backward compat with manifests that lack this field.
+    GroupingStrategy::Positional
 }
 
 /// A single frame entry in a seekable page group. Points to a byte range within the S3 object
@@ -79,10 +110,15 @@ impl Manifest {
             index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
             sub_pages_per_frame: 0,
+            strategy: GroupingStrategy::Positional,
             group_pages: Vec::new(),
             btrees: HashMap::new(),
             page_index: HashMap::new(),
             btree_groups: HashMap::new(),
+            page_to_tree_name: HashMap::new(),
+            tree_name_to_groups: HashMap::new(),
+            btree_access_freq: HashMap::new(),
+            prediction_patterns: Vec::new(),
         }
     }
 
@@ -97,8 +133,23 @@ impl Manifest {
     }
 
     /// Build the reverse index (page_num -> PageLocation) from group_pages.
+    /// No-op for Positional strategy (page_location computed arithmetically).
+    /// Auto-detects BTreeAware if group_pages is populated (backward compat).
     pub fn build_page_index(&mut self) {
         self.page_index.clear();
+        self.btree_groups.clear();
+        self.page_to_tree_name.clear();
+        self.tree_name_to_groups.clear();
+
+        // Auto-detect: if group_pages is populated, this is BTreeAware
+        if !self.group_pages.is_empty() && self.strategy == GroupingStrategy::Positional {
+            self.strategy = GroupingStrategy::BTreeAware;
+        }
+
+        if self.strategy == GroupingStrategy::Positional {
+            return;
+        }
+
         for (gid, pages) in self.group_pages.iter().enumerate() {
             for (idx, &page_num) in pages.iter().enumerate() {
                 self.page_index.insert(page_num, PageLocation {
@@ -107,18 +158,101 @@ impl Manifest {
                 });
             }
         }
-        // Build btree_groups: for each group, store all sibling groups from the same B-tree
-        self.btree_groups.clear();
-        for (_root, entry) in &self.btrees {
+        // Build btree_groups + page_to_tree_name + tree_name_to_groups from B-tree manifest entries
+        for (_, entry) in &self.btrees {
             for &gid in &entry.group_ids {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
+            }
+            // Phase Verdun-i: reverse index from pages -> tree name
+            for &gid in &entry.group_ids {
+                if let Some(pages) = self.group_pages.get(gid as usize) {
+                    for &page_num in pages {
+                        self.page_to_tree_name.insert(page_num, entry.name.clone());
+                    }
+                }
+            }
+            // Phase Verdun-i: tree name -> group IDs
+            self.tree_name_to_groups.insert(entry.name.clone(), entry.group_ids.clone());
+        }
+    }
+
+    /// Look up where a page lives. Dispatches by strategy:
+    /// Positional: arithmetic (gid = page_num / ppg, idx = page_num % ppg).
+    /// BTreeAware: HashMap lookup in page_index.
+    pub fn page_location(&self, page_num: u64) -> Option<PageLocation> {
+        match self.strategy {
+            GroupingStrategy::Positional => {
+                if self.pages_per_group == 0 || page_num >= self.page_count {
+                    return None;
+                }
+                let ppg = self.pages_per_group as u64;
+                Some(PageLocation {
+                    group_id: page_num / ppg,
+                    index: (page_num % ppg) as u32,
+                })
+            }
+            GroupingStrategy::BTreeAware => {
+                self.page_index.get(&page_num).copied()
             }
         }
     }
 
-    /// Look up where a page lives. Returns None only if page_num is beyond manifest.
-    pub fn page_location(&self, page_num: u64) -> Option<PageLocation> {
-        self.page_index.get(&page_num).copied()
+    /// Get the list of page numbers in a group. Dispatches by strategy:
+    /// Positional: returns [gid*ppg .. min((gid+1)*ppg, page_count)].
+    /// BTreeAware: borrows from group_pages[gid] (zero-allocation).
+    pub fn group_page_nums(&self, gid: u64) -> Cow<'_, [u64]> {
+        match self.strategy {
+            GroupingStrategy::Positional => {
+                let ppg = self.pages_per_group as u64;
+                let start = gid * ppg;
+                let end = std::cmp::min(start + ppg, self.page_count);
+                Cow::Owned((start..end).collect())
+            }
+            GroupingStrategy::BTreeAware => {
+                Cow::Borrowed(self.group_pages.get(gid as usize)
+                    .expect("BTreeAware group must exist in group_pages")
+                    .as_slice())
+            }
+        }
+    }
+
+    /// Number of pages in a group (without allocating a Vec).
+    pub fn group_size(&self, gid: u64) -> usize {
+        match self.strategy {
+            GroupingStrategy::Positional => {
+                let ppg = self.pages_per_group as u64;
+                let start = gid * ppg;
+                std::cmp::min(ppg, self.page_count.saturating_sub(start)) as usize
+            }
+            GroupingStrategy::BTreeAware => {
+                self.group_pages.get(gid as usize).map(|v| v.len()).unwrap_or(0)
+            }
+        }
+    }
+
+    /// Select prefetch neighbors based on strategy.
+    /// Positional: radial fan-out from current gid.
+    /// BTreeAware: sibling groups from the same B-tree.
+    pub fn prefetch_neighbors(&self, gid: u64) -> PrefetchNeighbors {
+        match self.strategy {
+            GroupingStrategy::Positional => {
+                PrefetchNeighbors::RadialFanout { total_groups: self.total_groups() }
+            }
+            GroupingStrategy::BTreeAware => {
+                PrefetchNeighbors::BTreeSiblings(
+                    self.btree_groups.get(&gid).cloned().unwrap_or_default()
+                )
+            }
+        }
+    }
+
+    /// Detect strategy from manifest contents (for backward compat with manifests
+    /// that lack the strategy field). Call after deserialization.
+    pub fn detect_and_normalize_strategy(&mut self) {
+        if !self.group_pages.is_empty() && self.strategy == GroupingStrategy::Positional {
+            self.strategy = GroupingStrategy::BTreeAware;
+        }
+        self.build_page_index();
     }
 }
 

@@ -12,6 +12,10 @@ pub(crate) struct S3Client {
     pub(crate) fetch_count: AtomicU64,
     /// S3 bytes fetched (for benchmarking / diagnostics)
     pub(crate) fetch_bytes: AtomicU64,
+    /// S3 PUT count (for benchmarking / diagnostics)
+    pub(crate) put_count: AtomicU64,
+    /// S3 bytes uploaded (for benchmarking / diagnostics)
+    pub(crate) put_bytes: AtomicU64,
 }
 
 impl S3Client {
@@ -59,6 +63,8 @@ impl S3Client {
             runtime,
             fetch_count: AtomicU64::new(0),
             fetch_bytes: AtomicU64::new(0),
+            put_count: AtomicU64::new(0),
+            put_bytes: AtomicU64::new(0),
         })
     }
 
@@ -213,8 +219,13 @@ impl S3Client {
             if let Some(ct) = content_type {
                 req = req.content_type(ct);
             }
+            let data_len = data.len() as u64;
             match req.send().await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.put_count.fetch_add(1, Ordering::Relaxed);
+                    self.put_bytes.fetch_add(data_len, Ordering::Relaxed);
+                    return Ok(());
+                }
                 Err(e) => {
                     retries += 1;
                     if retries >= 3 {
@@ -313,6 +324,8 @@ impl S3Client {
     }
 
     pub(crate) async fn put_page_groups_async(&self, groups: &[(String, Vec<u8>)]) -> io::Result<()> {
+        let total_bytes: u64 = groups.iter().map(|(_, d)| d.len() as u64).sum();
+        let total_puts = groups.len() as u64;
         let mut handles = Vec::with_capacity(groups.len());
         for (key, data) in groups {
             let client = self.client.clone();
@@ -356,6 +369,9 @@ impl S3Client {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
         }
+        // All PUTs succeeded; update counters
+        self.put_count.fetch_add(total_puts, Ordering::Relaxed);
+        self.put_bytes.fetch_add(total_bytes, Ordering::Relaxed);
         Ok(())
     }
 

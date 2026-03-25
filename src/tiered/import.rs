@@ -58,103 +58,115 @@ pub fn import_sqlite_file(
         total_groups,
     );
 
-    // Phase Midway: walk B-trees to build page-to-btree map, then pack by B-tree
     let compression_level = config.compression_level;
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
     let version = 1u64;
+    let strategy = config.grouping_strategy;
 
     eprintln!(
-        "[import] encoding: {} (sub_ppf={})",
+        "[import] encoding: {} (sub_ppf={}) strategy={:?}",
         if use_seekable { "seekable multi-frame" } else { "legacy single-frame" },
         sub_ppf,
+        strategy,
     );
 
-    // Walk B-trees to discover page ownership
-    eprintln!("[import] walking B-trees...");
-    let walk_result = crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
-        let mut buf = vec![0u8; page_size as usize];
-        file.read_exact_at(&mut buf, page_num * page_size as u64).ok()?;
-        Some(buf)
-    });
-    eprintln!(
-        "[import] found {} B-trees, {} unowned pages",
-        walk_result.btrees.len(),
-        walk_result.unowned_pages.len(),
-    );
+    // Build group page lists and btree manifest based on strategy
+    let (group_pages_list, btrees_manifest) = match strategy {
+        GroupingStrategy::Positional => {
+            // Sequential chunking: group g = pages [g*ppg .. (g+1)*ppg)
+            let mut groups: Vec<Vec<u64>> = Vec::new();
+            for gid in 0..total_groups {
+                let start = gid * ppg as u64;
+                let end = std::cmp::min(start + ppg as u64, page_count);
+                groups.push((start..end).collect());
+            }
+            eprintln!("[import] positional: {} groups", groups.len());
+            (groups, HashMap::new())
+        }
+        GroupingStrategy::BTreeAware => {
+            // Walk B-trees to discover page ownership
+            eprintln!("[import] walking B-trees...");
+            let walk_result = crate::btree_walker::walk_all_btrees(page_count, page_size, &|page_num| {
+                let mut buf = vec![0u8; page_size as usize];
+                file.read_exact_at(&mut buf, page_num * page_size as u64).ok()?;
+                Some(buf)
+            });
+            eprintln!(
+                "[import] found {} B-trees, {} unowned pages",
+                walk_result.btrees.len(),
+                walk_result.unowned_pages.len(),
+            );
 
-    // Pack pages by B-tree into groups.
-    // Large B-trees (>= ppg/4 pages) get their own groups.
-    // Small B-trees + unowned pages are bin-packed into shared groups.
-    let mut group_pages_list: Vec<Vec<u64>> = Vec::new();
+            // Pack pages by B-tree into groups.
+            // Large B-trees (>= ppg/4 pages) get their own groups.
+            // Small B-trees + unowned pages are bin-packed into shared groups.
+            let mut group_pages_list: Vec<Vec<u64>> = Vec::new();
 
-    // Sort B-trees by size descending (large first)
-    let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
-        walk_result.btrees.iter().collect();
-    btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+            // Sort B-trees by size descending (large first)
+            let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
+                walk_result.btrees.iter().collect();
+            btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
 
-    let threshold = std::cmp::max(ppg as usize / 4, 1);
-    let mut small_pages: Vec<u64> = Vec::new();
+            let threshold = std::cmp::max(ppg as usize / 4, 1);
+            let mut small_pages: Vec<u64> = Vec::new();
 
-    for (_root, entry) in &btree_list {
-        // Sort pages by page number so frames align with SQLite's sequential access.
-        // BFS traversal order scatters pages across frames; page-number order keeps
-        // consecutive leaves in the same frame, enabling sub-chunk range GETs to serve
-        // sequential scans with fewer fetches.
-        let mut sorted_pages = entry.pages.clone();
-        sorted_pages.sort_unstable();
+            for (_root, entry) in &btree_list {
+                let mut sorted_pages = entry.pages.clone();
+                sorted_pages.sort_unstable();
 
-        if sorted_pages.len() >= threshold {
-            // Large B-tree: own groups, chunked to ppg
-            for chunk in sorted_pages.chunks(ppg as usize) {
+                if sorted_pages.len() >= threshold {
+                    for chunk in sorted_pages.chunks(ppg as usize) {
+                        group_pages_list.push(chunk.to_vec());
+                    }
+                } else {
+                    small_pages.extend_from_slice(&sorted_pages);
+                }
+            }
+
+            let mut sorted_unowned = walk_result.unowned_pages.clone();
+            sorted_unowned.sort_unstable();
+            small_pages.extend_from_slice(&sorted_unowned);
+
+            for chunk in small_pages.chunks(ppg as usize) {
                 group_pages_list.push(chunk.to_vec());
             }
-        } else {
-            // Small B-tree: collect for bin-packing
-            small_pages.extend_from_slice(&sorted_pages);
+
+            eprintln!(
+                "[import] packed into {} groups (was {} positional)",
+                group_pages_list.len(), total_groups,
+            );
+
+            // Build btrees manifest map
+            let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
+            for (gid, pages) in group_pages_list.iter().enumerate() {
+                for &p in pages {
+                    page_to_gid.insert(p, gid as u64);
+                }
+            }
+
+            let mut btrees_manifest: HashMap<u64, BTreeManifestEntry> = HashMap::new();
+            for (&root_page, entry) in &walk_result.btrees {
+                let mut gid_set: HashSet<u64> = HashSet::new();
+                for &p in &entry.pages {
+                    if let Some(&gid) = page_to_gid.get(&p) {
+                        gid_set.insert(gid);
+                    }
+                }
+                let mut gids: Vec<u64> = gid_set.into_iter().collect();
+                gids.sort_unstable();
+                btrees_manifest.insert(root_page, BTreeManifestEntry {
+                    name: entry.name.clone(),
+                    obj_type: entry.obj_type.clone(),
+                    group_ids: gids,
+                });
+            }
+
+            (group_pages_list, btrees_manifest)
         }
-    }
-
-    // Add unowned pages to the small-pages bin (sorted for same reason)
-    let mut sorted_unowned = walk_result.unowned_pages.clone();
-    sorted_unowned.sort_unstable();
-    small_pages.extend_from_slice(&sorted_unowned);
-
-    // Bin-pack small pages into groups
-    for chunk in small_pages.chunks(ppg as usize) {
-        group_pages_list.push(chunk.to_vec());
-    }
+    };
 
     let actual_groups = group_pages_list.len();
-    eprintln!(
-        "[import] packed into {} groups (was {} positional)",
-        actual_groups, total_groups,
-    );
-
-    // Build btrees manifest map by scanning which groups contain which B-tree's pages
-    let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
-    for (gid, pages) in group_pages_list.iter().enumerate() {
-        for &p in pages {
-            page_to_gid.insert(p, gid as u64);
-        }
-    }
-
-    let mut btrees_manifest: HashMap<u64, BTreeManifestEntry> = HashMap::new();
-    for (&root_page, entry) in &walk_result.btrees {
-        let mut gid_set: HashSet<u64> = HashSet::new();
-        for &p in &entry.pages {
-            if let Some(&gid) = page_to_gid.get(&p) {
-                gid_set.insert(gid);
-            }
-        }
-        let mut gids: Vec<u64> = gid_set.into_iter().collect();
-        gids.sort_unstable();
-        btrees_manifest.insert(root_page, BTreeManifestEntry {
-            name: entry.name.clone(),
-            obj_type: entry.obj_type.clone(),
-            group_ids: gids,
-        });
-    }
 
     // Encode and collect uploads for each group
     let mut page_group_keys: Vec<String> = Vec::with_capacity(actual_groups);
@@ -343,10 +355,15 @@ pub fn import_sqlite_file(
         index_chunk_keys,
         frame_tables,
         sub_pages_per_frame: if use_seekable { sub_ppf } else { 0 },
-        group_pages: group_pages_list,
+        strategy,
+        group_pages: if strategy == GroupingStrategy::Positional { Vec::new() } else { group_pages_list },
         btrees: btrees_manifest,
         page_index: HashMap::new(),
         btree_groups: HashMap::new(),
+        page_to_tree_name: HashMap::new(),
+        tree_name_to_groups: HashMap::new(),
+        btree_access_freq: HashMap::new(),
+        prediction_patterns: Vec::new(),
     };
     manifest.build_page_index();
     s3.put_manifest(&manifest)?;

@@ -95,19 +95,26 @@ impl DiskCache {
         };
 
         // Initialize group states — mark as Present for groups where bitmap shows all pages cached.
-        // Uses B-tree-aware group_pages mapping (not positional).
         let group_states: Vec<std::sync::atomic::AtomicU8> = (0..total_groups)
             .map(|gid| {
                 let state = if page_count > 0 {
                     if let Some(gp) = group_pages.get(gid) {
-                        // B-tree-aware: check if all pages in this group are in the bitmap
+                        // BTreeAware: check if all pages in this group are in the bitmap
                         if !gp.is_empty() && gp.iter().all(|&p| bitmap.is_present(p)) {
                             GroupState::Present as u8
                         } else {
                             GroupState::None as u8
                         }
                     } else {
-                        GroupState::None as u8
+                        // Positional: check [gid*ppg .. (gid+1)*ppg)
+                        let ppg = pages_per_group as u64;
+                        let start = gid as u64 * ppg;
+                        let end = std::cmp::min(start + ppg, page_count);
+                        if start < end && (start..end).all(|p| bitmap.is_present(p)) {
+                            GroupState::Present as u8
+                        } else {
+                            GroupState::None as u8
+                        }
                     }
                 } else {
                     GroupState::None as u8
@@ -516,34 +523,42 @@ impl DiskCache {
     }
 
     /// Evict a single page group from the local cache.
-    /// Uses B-tree-aware group_pages mapping to clear the correct bitmap bits.
     pub(crate) fn evict_group(&self, gid: u64) {
         let gp = self.group_pages.read();
-        if let Some(page_nums) = gp.get(gid as usize) {
-            // Clear bitmap for actual pages in this group (not positional)
+        let page_nums: Vec<u64> = if let Some(explicit) = gp.get(gid as usize) {
+            // BTreeAware: explicit page list
+            explicit.clone()
+        } else {
+            // Positional fallback: [gid*ppg .. (gid+1)*ppg)
+            let ppg = self.pages_per_group as u64;
+            let start = gid * ppg;
+            (start..start + ppg).collect()
+        };
+        drop(gp);
+
+        {
             let mut bitmap = self.bitmap.lock();
-            for &pnum in page_nums {
+            for &pnum in &page_nums {
                 bitmap.clear(pnum);
             }
-            drop(bitmap);
+        }
 
-            // On Linux: hole punch each page to reclaim NVMe blocks
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::io::AsRawFd;
-                let file = self.cache_file.write();
-                let ps = self.page_size.load(Ordering::Acquire) as u64;
-                for &pnum in page_nums {
-                    let offset = (pnum * ps) as libc::off_t;
-                    let len = ps as libc::off_t;
-                    unsafe {
-                        libc::fallocate(
-                            file.as_raw_fd(),
-                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                            offset,
-                            len,
-                        );
-                    }
+        // On Linux: hole punch each page to reclaim NVMe blocks
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let file = self.cache_file.write();
+            let ps = self.page_size.load(Ordering::Acquire) as u64;
+            for &pnum in &page_nums {
+                let offset = (pnum * ps) as libc::off_t;
+                let len = ps as libc::off_t;
+                unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        offset,
+                        len,
+                    );
                 }
             }
         }

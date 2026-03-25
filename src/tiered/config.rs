@@ -1,5 +1,60 @@
 use super::*;
 
+// ===== Sync mode =====
+
+/// Controls whether checkpoint uploads to S3 synchronously (blocking) or defers to flush_to_s3().
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// Default. `sync()` uploads dirty pages to S3 during checkpoint.
+    /// The SQLite EXCLUSIVE lock is held for the entire S3 upload duration.
+    /// Full S3 durability on every checkpoint.
+    Durable,
+    /// `sync()` writes to local disk cache only; dirty groups are recorded for
+    /// later upload via `flush_to_s3()`. The EXCLUSIVE lock is held for ~1ms.
+    ///
+    /// Between checkpoint and flush, data exists only in local disk cache:
+    /// - Process crash: data survives (on local disk)
+    /// - Machine loss: data lost (not yet on S3)
+    ///
+    /// Call `flush_to_s3()` (on TieredVfs or TieredBenchHandle) to upload.
+    LocalThenFlush,
+}
+
+impl Default for SyncMode {
+    fn default() -> Self {
+        SyncMode::Durable
+    }
+}
+
+// ===== Grouping strategy =====
+
+/// How pages are assigned to groups and how prefetch neighbors are selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupingStrategy {
+    /// Legacy positional mapping: gid = page_num / ppg, idx = page_num % ppg.
+    /// Group g contains pages [g*ppg .. min((g+1)*ppg, page_count)].
+    /// Prefetch uses radial fan-out from current group.
+    Positional,
+    /// B-tree-aware: explicit page-to-group mapping from btree walking.
+    /// group_pages[gid] = ordered list of page numbers.
+    /// Prefetch uses sibling groups from the same B-tree.
+    BTreeAware,
+}
+
+impl Default for GroupingStrategy {
+    fn default() -> Self {
+        GroupingStrategy::BTreeAware
+    }
+}
+
+/// Prefetch neighbor selection returned by `Manifest::prefetch_neighbors()`.
+pub enum PrefetchNeighbors {
+    /// Radial fan-out from current gid (positional strategy).
+    RadialFanout { total_groups: u64 },
+    /// Sibling groups from the same B-tree (btree-aware strategy).
+    BTreeSiblings(Vec<u64>),
+}
+
 // ===== Group state for prefetch coordination =====
 
 #[repr(u8)]
@@ -38,10 +93,16 @@ pub struct TieredConfig {
     /// Page groups not accessed within this window are evicted from local NVMe.
     /// Interior page groups (B-tree internal nodes) are pinned permanently.
     pub cache_ttl_secs: u64,
-    /// Fraction-based prefetch schedule. Each element is the fraction of
+    /// Radial prefetch schedule (Positional strategy). Each element is the fraction of
     /// total page groups to prefetch on consecutive cache misses.
     /// Default [0.33, 0.33] = 3-hop: miss 1 fetches 33%, miss 2 fetches 33%, miss 3+ fetches all.
     pub prefetch_hops: Vec<f32>,
+    /// B-tree sibling prefetch schedule (BTreeAware strategy). Each element is the fraction of
+    /// eligible sibling groups to prefetch on consecutive cache misses.
+    /// Default [0.0, 0.5, 0.5] = skip first miss (point queries get zero overhead),
+    /// then 50% on miss 2, remaining 50% on miss 3, everything on miss 4+.
+    /// Higher floor, lower volatility: scans pay one extra miss but point queries are clean.
+    pub btree_prefetch_hops: Vec<f32>,
     /// Number of prefetch worker threads (default: num_cpus + 1).
     /// N+1 keeps the pipeline full: when a thread blocks on S3 I/O,
     /// the extra thread uses that core for decompression/cache writes.
@@ -69,6 +130,19 @@ pub struct TieredConfig {
     /// The manifest is NOT encrypted (it contains only S3 keys and byte offsets, no user data).
     /// Requires the `encryption` feature for actual encryption; without it, the key is ignored.
     pub encryption_key: Option<[u8; 32]>,
+    /// Page grouping strategy for import. Default: BTreeAware.
+    /// Positional: sequential chunking (page N -> group N/ppg).
+    /// BTreeAware: B-tree walking + bin-packing by B-tree.
+    pub grouping_strategy: GroupingStrategy,
+    /// Phase Verdun: enable predictive cross-tree prefetch + access history.
+    /// When true, the VFS learns which B-trees appear together in transactions
+    /// and prefetches them in parallel on subsequent queries.
+    /// Default: false (enable after testing).
+    pub prediction_enabled: bool,
+    /// Checkpoint sync mode. Controls whether S3 upload happens during checkpoint
+    /// (Durable, blocking) or is deferred to flush_to_s3() (LocalThenFlush, non-blocking).
+    /// Default: Durable.
+    pub sync_mode: SyncMode,
 }
 
 impl Default for TieredConfig {
@@ -85,6 +159,7 @@ impl Default for TieredConfig {
             region: None,
             cache_ttl_secs: 3600,
             prefetch_hops: vec![0.33, 0.33],
+            btree_prefetch_hops: vec![0.0, 0.5, 0.5],
             prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -100,6 +175,9 @@ impl Default for TieredConfig {
             gc_enabled: false,
             eager_index_load: true,
             encryption_key: None,
+            grouping_strategy: GroupingStrategy::default(),
+            prediction_enabled: false,
+            sync_mode: SyncMode::default(),
         }
     }
 }

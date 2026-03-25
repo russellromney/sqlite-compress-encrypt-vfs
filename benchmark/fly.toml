@@ -1,4 +1,4 @@
-app = "cinch-tiered-bench"
+app = "turbolite-tiered-bench"
 primary_region = "iad"
 
 [build]
@@ -13,7 +13,7 @@ primary_region = "iad"
   destination = "/data"
 
 [processes]
-  app = "--sizes 1000000 --page-size 65536 --ppg 128 --import auto --force --iterations 5 --warmup 1 --modes none,interior,index,data"
+  app = "--sizes 1000000 --page-size 65536 --ppg 256 --import auto --iterations 5 --warmup 1 --modes none,interior,index,data --grouping btree --btree-hops 0.33,0.33,0.34"
 
 [[vm]]
   size = "performance-8x"
