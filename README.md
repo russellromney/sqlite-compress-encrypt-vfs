@@ -106,13 +106,21 @@ To make scans not-slow (they'll never be fast), turbolite uses **adaptive prefet
 1. **Inline range GET**: fetch the specific page group frame containing the needed page, return to SQLite immediately.
 2. **Background prefetch**: submit the full group *for that tree (index or table)* to a thread pool for fetch according to the hop schedule.
 
-Consecutive misses escalate: each miss advances through a **"prefetch aggression" schedule** that controls what fraction of groups to prefetch. 
+Consecutive misses escalate: each miss advances through a **"prefetch aggression" schedule** that controls what fraction of groups to prefetch.
 
 The default aggression schedule is `[0.0, 0.5, 0.5]` which skips the first miss entirely (so point queries pay zero overhead), then fetches 50% of *same-tree page groups* on the second miss and the remaining 50% on the third.
 
-This schedule takes advantage of B-tree introspection, but it does make a key tradeoff: a slower latency floor (extra GET on cache miss) for extremely efficient scans: every prefetched group in a scan is guaranteed to contain pages from the right tree. In the 1.5GB benchmark, this brings down a full table scan from ~650ms to ~250ms, while adding ~50ms to point fetches. 
+This schedule takes advantage of B-tree introspection, but it does make a key tradeoff: a slower latency floor (extra GET on cache miss) for extremely efficient scans: every prefetched group in a scan is guaranteed to contain pages from the right tree. In the 1.5GB benchmark, this brings down a full table scan from ~650ms to ~250ms, while adding ~50ms to point fetches.
 
 An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and immediately fetches the rest of the `users` table in the background - *and nothing else*. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
+
+### Experimental^2 Features
+
+Adapting prefetching is reactive: it discovers tables through misses. But SQLite already knows what it's going to read. turbolite exploits this with **frontrun prefetch**: it intercepts the SQLite query plan before a query executes, extracts the exact tables/indexes the query will touch, and submits the relevant page groups to the prefetch pool in the order that they will be requested by SQlite - before the first page is even read. 
+
+This is pretty neat: a five-table join that would trigger five sequential miss-then-fetch cycles instead fires all five fetches in parallel at query start. Benchmarking shows this speeds up cold multi-table queries by 1.5x and scans by up to 5x (depending on prefetch agression). The hop schedule remains as fallback. 
+
+> One caveat: SQLite supports one trace callback per connection. If another extension claims the slot first, frontrun prefetch silently fails.
 
 turbolite also has an experimental **semantic predictive prefetching** feature that tracks **cross-table access patterns** using a lightweight prediction engine held as a [trie](https://ds.cs.rutgers.edu/assignment-trie/) in the manifest. When queries consistently touch the same set of tables together (e.g. `users` then `posts` then `likes`), future queries that touch any subset trigger background prefetch of the rest. See [Predictive Prefetching](#predictive-prefetching-experimental) for details.
 
@@ -401,7 +409,7 @@ These replicate local writes to S3 for backup or restore.
 | Writes to S3 | checkpoint (one PUT per group) | no | no | no | yes (MVCC) | one PUT per page |
 | Compression | seekable multi-frame zstd | none | none | zstd (nested DB) | zstd delta encoding | none |
 | Encryption | AES-256-GCM per page | none | none | none | none | none |
-| Prefetch | fraction-based hop schedule | none or basic readahead | LRU cache | adaptive consolidation | client buffers | none |
+| Prefetch | look-ahead + hop schedule | none or basic readahead | LRU cache | adaptive consolidation | client buffers | none |
 | Interior page optimization | detected, pinned, bundled separately | none | page index from LTX trailers | optional .dbi file | none | none |
 | Bytes per point lookup (cache: index) | ~100KB (one compressed frame) | 4-64KB (one raw page) | varies | varies | varies | 4KB (one page) |
 | Write cost per 4096 pages | ~$0.000005 (one PUT) | n/a | n/a | n/a | FoundationDB ops | ~$0.02 (4096 PUTs) |
@@ -426,7 +434,7 @@ cargo run --features zstd,tiered --bin tiered-bench --release -- \
 cargo run --example quick-bench --features encryption --release
 ```
 
-Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--btree-hops` (B-tree prefetch schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`.
+Key flags: `--sizes` (row counts), `--ppg` (pages per group), `--prefetch-threads`, `--btree-hops` (B-tree prefetch schedule), `--grouping` (positional or btree), `--queries` (post/profile/who-liked/mutual), `--modes` (none/interior/index/data), `--skip-verify` (skip COUNT(*) on small machines), `--iterations`, `--plan-aware` (enable look-ahead prefetch).
 
 ## Testing
 

@@ -118,6 +118,20 @@ static void turbolite_s3_bytes_func(
  * Calls Rust to run EQP on the SQL string and push planned accesses
  * to the global queue. The VFS drains the queue on first cache miss.
  *
+ * IMPORTANT: sqlite3_trace_v2 supports exactly ONE callback per
+ * connection. Installing this callback overwrites any previously
+ * registered trace callback. Conversely, if another extension or
+ * user code calls sqlite3_trace_v2 after turbolite loads, our
+ * callback is silently replaced and plan-aware prefetch stops
+ * working (the VFS falls back to hop-schedule prefetch with no
+ * error). If you need both turbolite's plan-aware prefetch and
+ * your own trace callback, a future turbolite_chain_trace_v2()
+ * API will support chaining.
+ *
+ * Overhead: EQP adds ~10us per sqlite3_step() call. This is
+ * negligible for cold/warm queries where prefetch saves 100ms+,
+ * but is non-zero overhead for fully-cached hot queries.
+ *
  * Reentrant guard: running EQP inside the callback triggers another
  * sqlite3_step() which fires the trace again. The Rust side filters
  * out EXPLAIN statements, but the C guard prevents the FFI roundtrip
@@ -175,7 +189,10 @@ int sqlite3_turbolite_init(
     /* Phase Marne: install trace callback for query-plan-aware prefetch.
      * SQLITE_TRACE_STMT fires at start of sqlite3_step() with the SQL string.
      * The callback runs EQP and pushes planned B-tree accesses to the global
-     * queue, which the VFS drains on first cache miss. */
+     * queue, which the VFS drains on first cache miss.
+     *
+     * WARNING: this overwrites any existing trace callback on this connection.
+     * See the comment on turbolite_trace_callback above for details. */
     rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT, turbolite_trace_callback, 0);
     if (rc != SQLITE_OK) {
         /* Non-fatal: VFS falls back to hop schedule without query plan */

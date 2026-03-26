@@ -144,15 +144,9 @@ pub fn parse_eqp_output(eqp_text: &str) -> Vec<PlannedAccess> {
                     });
                 }
             }
-        } else if access_type == AccessType::Search {
-            // SEARCH without explicit index (e.g., rowid lookup): emit table as Search
-            if seen.insert((table_name.to_string(), AccessType::Search)) {
-                accesses.push(PlannedAccess {
-                    tree_name: table_name.to_string(),
-                    access_type: AccessType::Search,
-                });
-            }
         }
+        // SEARCH without USING INDEX (e.g., rowid lookup) emits nothing.
+        // Rowid lookups are point queries; the hop schedule handles them.
     }
 
     accesses

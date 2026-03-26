@@ -139,12 +139,6 @@ struct Cli {
     #[arg(long, default_value = "0.0,0.5,0.5", env = "BENCH_BTREE_HOPS")]
     btree_hops: String,
 
-    /// Max inline range GETs per B-tree before switching to prefetch-wait.
-    /// Default 2: point queries (1 GET/tree) stay fast, scans switch to bulk prefetch.
-    /// Set to 255 to disable (unlimited range GETs).
-    #[arg(long, default_value = "2", env = "BENCH_MAX_RANGE_GETS")]
-    max_range_gets: u8,
-
     /// Which queries to run (comma-separated). Default: all.
     /// Options: post, profile, who-liked, mutual
     #[arg(long, env = "BENCH_QUERIES")]
@@ -583,35 +577,35 @@ fn generate_local_db(path: &std::path::Path, n_posts: usize, batch_size: usize, 
 // =========================================================================
 
 const Q_POST_DETAIL: &str = "\
-SELECT p.id, p.content, p.created_at, p.like_count,
-       u.first_name, u.last_name, u.school, u.city
-FROM posts p
-JOIN users u ON u.id = p.user_id
-WHERE p.id = ?1";
+SELECT posts.id, posts.content, posts.created_at, posts.like_count,
+       users.first_name, users.last_name, users.school, users.city
+FROM posts
+JOIN users ON users.id = posts.user_id
+WHERE posts.id = ?1";
 
 const Q_PROFILE: &str = "\
-SELECT u.first_name, u.last_name, u.school, u.city, u.bio,
-       p.id, p.content, p.created_at, p.like_count
-FROM users u
-JOIN posts p ON p.user_id = u.id
-WHERE u.id = ?1
-ORDER BY p.created_at DESC
+SELECT users.first_name, users.last_name, users.school, users.city, users.bio,
+       posts.id, posts.content, posts.created_at, posts.like_count
+FROM users
+JOIN posts ON posts.user_id = users.id
+WHERE users.id = ?1
+ORDER BY posts.created_at DESC
 LIMIT 10";
 
 const Q_WHO_LIKED: &str = "\
-SELECT u.first_name, u.last_name, u.school, l.created_at
-FROM likes l
-JOIN users u ON u.id = l.user_id
-WHERE l.post_id = ?1
-ORDER BY l.created_at DESC
+SELECT users.first_name, users.last_name, users.school, likes.created_at
+FROM likes
+JOIN users ON users.id = likes.user_id
+WHERE likes.post_id = ?1
+ORDER BY likes.created_at DESC
 LIMIT 50";
 
 const Q_MUTUAL: &str = "\
-SELECT u.id, u.first_name, u.last_name, u.school
-FROM friendships f1
-JOIN friendships f2 ON f1.user_b = f2.user_b
-JOIN users u ON u.id = f1.user_b
-WHERE f1.user_a = ?1 AND f2.user_a = ?2
+SELECT users.id, users.first_name, users.last_name, users.school
+FROM friendships
+JOIN friendships AS friendships_b ON friendships.user_b = friendships_b.user_b
+JOIN users ON users.id = friendships.user_b
+WHERE friendships.user_a = ?1 AND friendships_b.user_a = ?2
 LIMIT 20";
 
 /// Indexed filter: uses idx_posts_user. On cold, only the matching index leaf
@@ -630,16 +624,26 @@ SELECT COUNT(*) FROM posts WHERE like_count > ?1";
 
 /// Phase Marne: run EXPLAIN QUERY PLAN via rusqlite and push planned
 /// accesses to the global queue. The VFS drains the queue on first read.
-fn push_query_plan(conn: &Connection, sql: &str) {
+fn push_query_plan(conn: &Connection, sql: &str, params: &[rusqlite::types::Value]) {
     let eqp_sql = format!("EXPLAIN QUERY PLAN {}", sql);
     let mut stmt = match conn.prepare(&eqp_sql) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            if std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!("  [push-plan] prepare FAILED: {}", e);
+            }
+            return;
+        }
     };
     let mut output = String::new();
-    let mut rows = match stmt.query([]) {
+    let mut rows = match stmt.query(rusqlite::params_from_iter(params)) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) => {
+            if std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!("  [push-plan] query FAILED: {}", e);
+            }
+            return;
+        }
     };
     while let Ok(Some(row)) = rows.next() {
         if let Ok(detail) = row.get::<_, String>(3) {
@@ -647,7 +651,14 @@ fn push_query_plan(conn: &Connection, sql: &str) {
             output.push('\n');
         }
     }
+    if std::env::var("BENCH_VERBOSE").is_ok() {
+        eprintln!("  [push-plan] sql={} eqp_output={:?}", &sql[..sql.len().min(60)], &output);
+    }
     let accesses = parse_eqp_output(&output);
+    if std::env::var("BENCH_VERBOSE").is_ok() {
+        let names: Vec<&str> = accesses.iter().map(|a| a.tree_name.as_str()).collect();
+        eprintln!("  [push-plan] parsed={:?}", names);
+    }
     push_planned_accesses(accesses);
 }
 
@@ -658,7 +669,9 @@ fn run_query(
     plan_aware: bool,
 ) -> Result<usize, rusqlite::Error> {
     if plan_aware {
-        push_query_plan(conn, sql);
+        push_query_plan(conn, sql, params);
+    } else if std::env::var("BENCH_VERBOSE").is_ok() {
+        eprintln!("  [run-query] plan_aware=false, skipping push");
     }
     let mut stmt = conn.prepare_cached(sql)?;
     let rows: Vec<Vec<rusqlite::types::Value>> = stmt
@@ -943,45 +956,65 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     };
     let s3_prefix = format!("social_{}_{}", n_posts, strategy_suffix);
     if cli.import.is_some() {
-        // Fast path: generate plain SQLite DB locally, then import to S3
-        let _gen_tmp = TempDir::new().expect("temp dir for local gen");
-        let local_path = if let Some(ref path) = cli.import {
-            if path == "auto" {
-                let local_db = _gen_tmp.path().join(&db_name);
-                eprintln!("[bench] generating local DB: {}", local_db.display());
-                let gen_start = Instant::now();
-                generate_local_db(&local_db, n_posts, cli.batch_size, cli.page_size);
-                println!("  Local gen:   {:.2}s", gen_start.elapsed().as_secs_f64());
-                local_db.to_string_lossy().to_string()
-            } else {
-                path.clone()
-            }
-        } else {
-            unreachable!()
-        };
-
-        let import_start = Instant::now();
-        let grouping = parse_grouping(&cli.grouping);
-        let config = turbolite::tiered::TieredConfig {
+        // Fast path: generate plain SQLite DB locally, then import to S3.
+        // When --import auto and data already exists on S3, skip generation and import.
+        let check_config = turbolite::tiered::TieredConfig {
             bucket: test_bucket(),
             prefix: s3_prefix.clone(),
             endpoint_url: endpoint_url(),
             region: std::env::var("AWS_REGION").ok(),
-            pages_per_group: cli.ppg,
-            compression_level: 1,
-            grouping_strategy: grouping,
             ..Default::default()
         };
-        let manifest = turbolite::tiered::import_sqlite_file(
-            &config,
-            std::path::Path::new(&local_path),
-        ).expect("import failed");
-        println!("  S3 import:   {:.2}s ({} pages, {} groups, {} interior chunks)",
-            import_start.elapsed().as_secs_f64(),
-            manifest.page_count,
-            manifest.page_group_keys.len(),
-            manifest.interior_chunk_keys.len(),
-        );
+        let existing_manifest = turbolite::tiered::get_manifest(&check_config)
+            .expect("failed to check S3 manifest");
+
+        let is_auto = cli.import.as_deref() == Some("auto");
+        if is_auto && existing_manifest.is_some() {
+            let m = existing_manifest.unwrap();
+            eprintln!(
+                "[bench] S3 data already exists at prefix '{}' ({} pages, {} groups), skipping generation",
+                s3_prefix, m.page_count, m.page_group_keys.len(),
+            );
+        } else {
+            let _gen_tmp = TempDir::new().expect("temp dir for local gen");
+            let local_path = if let Some(ref path) = cli.import {
+                if path == "auto" {
+                    let local_db = _gen_tmp.path().join(&db_name);
+                    eprintln!("[bench] generating local DB: {}", local_db.display());
+                    let gen_start = Instant::now();
+                    generate_local_db(&local_db, n_posts, cli.batch_size, cli.page_size);
+                    println!("  Local gen:   {:.2}s", gen_start.elapsed().as_secs_f64());
+                    local_db.to_string_lossy().to_string()
+                } else {
+                    path.clone()
+                }
+            } else {
+                unreachable!()
+            };
+
+            let import_start = Instant::now();
+            let grouping = parse_grouping(&cli.grouping);
+            let config = turbolite::tiered::TieredConfig {
+                bucket: test_bucket(),
+                prefix: s3_prefix.clone(),
+                endpoint_url: endpoint_url(),
+                region: std::env::var("AWS_REGION").ok(),
+                pages_per_group: cli.ppg,
+                compression_level: 1,
+                grouping_strategy: grouping,
+                ..Default::default()
+            };
+            let manifest = turbolite::tiered::import_sqlite_file(
+                &config,
+                std::path::Path::new(&local_path),
+            ).expect("import failed");
+            println!("  S3 import:   {:.2}s ({} pages, {} groups, {} interior chunks)",
+                import_start.elapsed().as_secs_f64(),
+                manifest.page_count,
+                manifest.page_group_keys.len(),
+                manifest.interior_chunk_keys.len(),
+            );
+        }
     } else if cli.force {
         // Legacy VFS generation path
         let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, parse_prefetch_hops(&cli.prefetch_hops), parse_prefetch_hops(&cli.btree_hops), parse_grouping(&cli.grouping));

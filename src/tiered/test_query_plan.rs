@@ -33,10 +33,8 @@ fn test_parse_scan_with_index() {
 fn test_parse_search_rowid() {
     let eqp = "SEARCH users USING INTEGER PRIMARY KEY (rowid=?)";
     let result = parse_eqp_output(eqp);
-    // No "USING INDEX", falls back to table name as Search
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].tree_name, "users");
-    assert_eq!(result[0].access_type, AccessType::Search);
+    // Rowid lookup: no prefetch needed, hop schedule handles it
+    assert_eq!(result.len(), 0);
 }
 
 #[test]
