@@ -1457,6 +1457,17 @@ impl DatabaseHandle for TieredHandle {
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
             eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending.len());
+
+            // Phase Gallipoli: persist manifest + dirty groups locally for crash recovery
+            {
+                let m = self.manifest.read().clone();
+                let dirty_groups: Vec<u64> = pending.iter().copied().collect();
+                let local = manifest::LocalManifest { manifest: m, dirty_groups };
+                if let Err(e) = local.persist(&cache.cache_dir) {
+                    eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
+                }
+            }
+
             return Ok(());
         }
 
@@ -1997,6 +2008,15 @@ impl DatabaseHandle for TieredHandle {
                 cache.stat_evictions.fetch_add(count as u64, Ordering::Relaxed);
                 cache.stat_bytes_evicted.fetch_add(count as u64 * scbs, Ordering::Relaxed);
                 eprintln!("[sync] evict_on_checkpoint: evicted {} data sub-chunks", count);
+            }
+        }
+
+        // Phase Gallipoli: persist local manifest (no dirty groups in Durable mode)
+        if let Some(cache) = &self.cache {
+            let m = self.manifest.read().clone();
+            let local = manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
+            if let Err(e) = local.persist(&cache.cache_dir) {
+                eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
             }
         }
 

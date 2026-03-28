@@ -74,7 +74,7 @@ mod vfs;
 
 // Public API (visible outside the crate)
 pub use bench::TieredSharedState;
-pub use config::{GroupState, GroupingStrategy, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
+pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};

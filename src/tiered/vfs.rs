@@ -146,6 +146,47 @@ impl TieredVfs {
         })
     }
 
+    /// Load manifest based on ManifestSource config.
+    /// Returns (manifest, recovered_dirty_groups).
+    fn load_manifest(&self) -> io::Result<(Manifest, Vec<u64>)> {
+        let existing = self.shared_manifest.read();
+        let has_loaded = existing.page_count > 0 || existing.version > 0;
+        drop(existing);
+
+        match self.config.manifest_source {
+            ManifestSource::Auto => {
+                // If VFS already has a manifest (warm reconnect), use it
+                if has_loaded {
+                    let m = self.shared_manifest.read().clone();
+                    eprintln!("[tiered] using in-memory manifest (warm reconnect, v{})", m.version);
+                    return Ok((m, Vec::new()));
+                }
+                // Try local manifest first
+                if let Some(local) = manifest::LocalManifest::load(&self.config.cache_dir)? {
+                    let dirty = local.dirty_groups.clone();
+                    eprintln!(
+                        "[tiered] loaded local manifest (v{}, {} pages, {} dirty groups)",
+                        local.manifest.version, local.manifest.page_count, dirty.len(),
+                    );
+                    let mut m = local.manifest;
+                    m.build_page_index();
+                    return Ok((m, dirty));
+                }
+                // Fall back to S3
+                eprintln!("[tiered] no local manifest, fetching from S3...");
+                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] manifest fetched from S3 (v{}, {} pages)", m.version, m.page_count);
+                Ok((m, Vec::new()))
+            }
+            ManifestSource::S3 => {
+                eprintln!("[tiered] fetching manifest from S3 (manifest_source=S3)...");
+                let m = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+                eprintln!("[tiered] manifest fetched (v{}, {} pages)", m.version, m.page_count);
+                Ok((m, Vec::new()))
+            }
+        }
+    }
+
     /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
     pub fn shared_state(&self) -> TieredSharedState {
@@ -428,7 +469,8 @@ impl Vfs for TieredVfs {
         let path = self.config.cache_dir.join(db);
 
         if matches!(opts.kind, OpenKind::MainDb) {
-            let mut manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+            // Phase Gallipoli: load manifest from local disk or S3 based on config.
+            let (mut manifest, recovered_dirty_groups) = self.load_manifest()?;
             manifest.detect_and_normalize_strategy();
 
             let ppg = if manifest.pages_per_group > 0 {
@@ -443,8 +485,16 @@ impl Vfs for TieredVfs {
                 self.cache.ensure_group_capacity(manifest.group_pages.len());
             }
 
-            // Update shared manifest with latest from S3
+            // Update shared manifest
             *self.shared_manifest.write() = manifest;
+
+            // Recover dirty groups from local manifest (LocalThenFlush crash recovery)
+            if !recovered_dirty_groups.is_empty() {
+                let mut pending = self.shared_dirty_groups.lock().unwrap();
+                let count = recovered_dirty_groups.len();
+                pending.extend(recovered_dirty_groups);
+                eprintln!("[tiered] recovered {} dirty groups from local manifest (pending S3 flush)", count);
+            }
 
             let lock_dir = self.config.cache_dir.join("locks");
             fs::create_dir_all(&lock_dir)?;
