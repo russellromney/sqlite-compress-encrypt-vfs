@@ -99,7 +99,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
     };
     let cold_vfs_name = unique_vfs_name("ixb_cold");
     let cold_vfs = TieredVfs::new(cold_config).unwrap();
-    let _bench = cold_vfs.bench_handle();
+    let _bench = cold_vfs.shared_state();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = rusqlite::Connection::open_with_flags_and_vfs(

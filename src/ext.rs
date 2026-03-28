@@ -34,7 +34,7 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
 #[cfg(feature = "tiered")]
-static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredBenchHandle> = std::sync::OnceLock::new();
+static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredSharedState> = std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -122,7 +122,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
     }
 
     let vfs = TieredVfs::new(config)?;
-    let _ = BENCH_HANDLE.set(vfs.bench_handle());
+    let _ = BENCH_HANDLE.set(vfs.shared_state());
     crate::tiered::register("turbolite-s3", vfs)
 }
 
@@ -272,6 +272,39 @@ pub unsafe extern "C" fn turbolite_warm(
     std::ptr::null()
 }
 
+/// Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
+/// tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_query(
+    db: *mut std::ffi::c_void,
+    sql: *const std::os::raw::c_char,
+) -> i32 {
+    if sql.is_null() {
+        return -1;
+    }
+    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let accesses = crate::tiered::query_plan::run_eqp_and_parse(db, sql_str);
+            h.evict_query(&accesses) as i32
+        }
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_query(
+    _db: *mut std::ffi::c_void,
+    _sql: *const std::os::raw::c_char,
+) -> i32 {
+    -1
+}
+
 /// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
 /// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
 #[cfg(feature = "tiered")]
@@ -300,6 +333,29 @@ pub unsafe extern "C" fn turbolite_evict(_tier: *const std::os::raw::c_char) -> 
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     std::ptr::null()
+}
+
+/// Full GC: list all S3 objects under prefix, delete orphans not in manifest.
+/// Returns number of objects deleted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_gc() -> i32 {
+    match BENCH_HANDLE.get() {
+        Some(h) => match h.gc() {
+            Ok(count) => count as i32,
+            Err(e) => {
+                eprintln!("[gc] ERROR: {}", e);
+                -1
+            }
+        },
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub extern "C" fn turbolite_gc() -> i32 {
+    -1
 }
 
 #[cfg(not(feature = "tiered"))]

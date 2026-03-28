@@ -146,10 +146,10 @@ impl TieredVfs {
         })
     }
 
-    /// Get a lightweight handle for benchmarking (clear_cache, S3 counters, flush_to_s3).
+    /// Get a shared state handle for cache control, S3 counters, flush_to_s3, and SQL functions.
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
-    pub fn bench_handle(&self) -> TieredBenchHandle {
-        TieredBenchHandle {
+    pub fn shared_state(&self) -> TieredSharedState {
+        TieredSharedState {
             s3: Arc::clone(&self.s3),
             cache: Arc::clone(&self.cache),
             prefetch_pool: Arc::clone(&self.prefetch_pool),

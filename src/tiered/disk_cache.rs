@@ -54,6 +54,11 @@ pub(crate) struct DiskCache {
     pub(crate) stat_evictions: AtomicU64,
     /// Bytes evicted from cache.
     pub(crate) stat_bytes_evicted: AtomicU64,
+    /// Peak cache size observed (bytes). Updated on every mark_present.
+    pub(crate) stat_peak_cache_bytes: AtomicU64,
+    /// Sub-chunks evicted in the last between-query eviction pass.
+    /// Used for churn detection (>50% of cache evicted = high churn).
+    pub(crate) stat_last_eviction_count: AtomicU64,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -160,6 +165,8 @@ impl DiskCache {
             stat_misses: AtomicU64::new(0),
             stat_evictions: AtomicU64::new(0),
             stat_bytes_evicted: AtomicU64::new(0),
+            stat_peak_cache_bytes: AtomicU64::new(0),
+            stat_last_eviction_count: AtomicU64::new(0),
         })
     }
 
@@ -413,6 +420,9 @@ impl DiskCache {
         if let Some(s) = states.get(gid as usize) {
             s.store(GroupState::Present as u8, Ordering::Release);
         }
+        // Track peak cache size
+        let current = self.tracker.lock().current_cache_bytes;
+        self.stat_peak_cache_bytes.fetch_max(current, Ordering::Relaxed);
         // Wake any threads waiting on this group
         self.group_condvar.notify_all();
         // Lazy eviction check
@@ -683,6 +693,20 @@ impl DiskCache {
             self.stat_evictions.fetch_add(1, Ordering::Relaxed);
             self.stat_bytes_evicted.fetch_add(scbs, Ordering::Relaxed);
             evicted += 1;
+        }
+        self.stat_last_eviction_count.store(evicted as u64, Ordering::Relaxed);
+
+        // Churn detection: if >50% of cache was evicted, warn
+        if evicted > 0 {
+            let total_present = self.tracker.lock().present.len() as u64;
+            let total_before = total_present + evicted as u64;
+            if total_before > 0 && (evicted as u64 * 100 / total_before) > 50 {
+                eprintln!(
+                    "[cache] WARNING: high churn detected. Evicted {} of {} sub-chunks ({}%). \
+                     Consider increasing cache_limit.",
+                    evicted, total_before, evicted as u64 * 100 / total_before,
+                );
+            }
         }
         evicted
     }
