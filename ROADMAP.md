@@ -1,38 +1,7 @@
 # turbolite Roadmap
 
-## Tannenberg: lib.rs Split
-> After: Kursk · Before: Marne (Memory)
-
-Split `lib.rs` (2,595 lines) into focused modules. Tiered split is done (see CHANGELOG). lib.rs remains.
-
-- [ ] `lib.rs` -- module declarations, public re-exports only
-- [ ] `locks.rs` -- `InProcessLocks`, `SlotState`, `SHARED_FILE_CACHE`, lock/unlock functions, debug tracing
-- [ ] `file_format.rs` -- `FileHeader`, `PageIndex`, magic bytes, constants
-- [ ] `compressed_handle.rs` -- `CompressedHandle` struct, page ops, `DatabaseHandle` trait impl, `FileWalIndex`
-- [ ] `compressed_vfs.rs` -- `CompressedVfs`, `Vfs` trait impl
-- [ ] `maintenance.rs` -- `inspect_database()`, `compact()`, `compact_with_recompression()`, `CompactionConfig`
-- [ ] `cargo test` passes with no changes to public API
-- [ ] `make ext` builds successfully
-- [ ] All `use turbolite::` paths in bin/, tests/, examples/ still compile
-
----
-
-## Marne (Memory): Dirty Page Memory Optimization
-> After: Tannenberg · Before: Thermopylae
-
-`write_all_at()` stores a full page copy in `dirty_pages: HashMap<u64, Vec<u8>>` AND writes it to the cache file. The HashMap copy is only needed at checkpoint to know which groups to re-encode, but the data is already in the cache. Holding it twice wastes memory: 1000 dirty 64KB pages = 64MB in the HashMap alone.
-
-- [ ] Replace `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>` (8 bytes per page instead of 64KB)
-- [ ] At checkpoint, read dirty pages back from cache file via `cache.read_page()` (microsecond pread, trivial vs S3 PUT)
-- [ ] Remove the `dirty_snapshot.clone()` in `sync()` -- just clone the HashSet
-- [ ] Update `read_exact_at()` to check cache instead of HashMap for dirty page reads (cache is already up-to-date from `write_all_at`)
-- [ ] Test: write 1000 pages, verify memory usage doesn't scale with page count
-- [ ] Test: checkpoint after dirty page optimization still produces correct S3 data
-
----
-
 ## Thermopylae: Tunable GC + Autovacuum Integration
-> After: Marne (Memory) · Before: Marathon
+> After: Kursk · Before: Marathon
 
 ### a. Tunable GC policy
 - [ ] `gc_keep_versions: u32` -- number of old page group versions to retain (default 0 = delete all). Enables point-in-time restore window.
@@ -383,17 +352,8 @@ Application-level cache control via SQL functions. Most important for multi-tena
   - Reuses frontrun EQP parsing infrastructure
   - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
   - Default: evict data tier only (keep index for potential re-query)
-- [ ] Per-tree always-evict rules: data fetched during query but never kept between queries
-  - `turbolite_config_set('evict_always', 'audit_log, idx_audit_date')` -- set rule
-  - `turbolite_config_set('evict_always_remove', 'audit_log')` -- remove rule
-  - `TURBOLITE_EVICT_ALWAYS=audit_log,idx_audit_date` env var for startup config
-  - Between-query eviction (trace profile callback) checks always-evict set, sheds those trees first
-  - Stored as `HashSet<String>` on VFS, checked during `evict_to_budget()` and between-query cleanup
 - [ ] FFI + ext_entry.c registration for all functions
-- [ ] `turbolite_config()` -- returns current config as JSON (cache_limit, TTL, evict_on_checkpoint, evict_always trees, prefetch schedules, all runtime-tunable settings)
-- [ ] `turbolite_config_reset()` -- resets all runtime config to env var / startup defaults
-- [ ] FFI + ext_entry.c registration for all functions
-- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages, always-evict rule sheds tree after every query, rule removal stops eviction, env var parsed at startup, config() reflects current state, config_reset() restores defaults
+- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages
 
 ### e. Checkpoint eviction
 

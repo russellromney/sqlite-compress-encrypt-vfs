@@ -2,6 +2,17 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Marne (Memory): Dirty Page Memory Optimization
+
+Replaced `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>`. Dirty page data lives only in the disk cache file, not duplicated in memory. Saves 64KB per dirty page (1000 dirty 64KB pages = 64MB saved).
+
+- `write_all_at()` writes to cache file and inserts page number into HashSet (was: clone page data into HashMap + write to cache)
+- `read_exact_at()` checks HashSet membership, reads from cache (was: read from HashMap)
+- `sync()` snapshots HashSet (was: clone entire HashMap with page data). Interior/index page classification reads from cache at checkpoint time.
+- 282 unit tests passing, no regressions
+
+---
+
 ## Marne: Query-Plan-Aware Prefetch
 
 The VFS knows which B-trees a query will access BEFORE the first page read. A trace callback runs EXPLAIN QUERY PLAN at the start of sqlite3_step(), parses SCAN/SEARCH + table/index names, and pushes them to a global queue. The VFS drains the queue on first cache miss and submits all planned groups to the prefetch pool in one batch. Falls back to hop schedule when queue is empty.

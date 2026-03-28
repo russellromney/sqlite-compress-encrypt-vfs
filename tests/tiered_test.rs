@@ -11,7 +11,7 @@
 
 #[cfg(feature = "tiered")]
 mod tiered_tests {
-    use turbolite::tiered::{TieredConfig, TieredVfs};
+    use turbolite::tiered::{GroupingStrategy, TieredConfig, TieredVfs};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tempfile::TempDir;
 
@@ -4913,5 +4913,230 @@ mod tiered_tests {
             let cleanup_vfs = TieredVfs::new(cleanup_config).unwrap();
             cleanup_vfs.destroy_s3().unwrap();
         }
+    }
+
+    // ── Phase Stalingrad: evict_tree + cache_info tests ──
+
+    #[test]
+    fn test_evict_tree_by_name() {
+        let cache_dir = TempDir::new().unwrap();
+        let local_db = cache_dir.path().join("local_evict.db");
+
+        // Step 1: Create a local SQLite file with enough data to span multiple groups.
+        // Using 4096 page size + ppg=8 means each group covers 8 pages (32KB).
+        // We need enough rows to spread across multiple pages per table.
+        {
+            let conn = rusqlite::Connection::open(&local_db).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size=4096;
+                 PRAGMA journal_mode=DELETE;
+                 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, bio TEXT);
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT);
+                 CREATE INDEX idx_posts_user ON posts(user_id);",
+            ).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..500 {
+                tx.execute("INSERT INTO users VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, format!("user_{}", i), format!("Bio for user {} with some padding text to fill pages", i)]).unwrap();
+            }
+            for i in 0..2000 {
+                tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, i % 500, format!("Post body {} with enough text to fill up multiple pages in the database", i)]).unwrap();
+            }
+            tx.commit().unwrap();
+            conn.execute_batch("VACUUM;").unwrap();
+        }
+
+        // Step 2: Import via import_sqlite_file (builds BTreeAware manifest)
+        let mut config = test_config("evict_tree", cache_dir.path());
+        config.pages_per_group = 8;
+        config.grouping_strategy = turbolite::tiered::GroupingStrategy::BTreeAware;
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let manifest = turbolite::tiered::import_sqlite_file(&config, &local_db)
+            .expect("import failed");
+        assert!(!manifest.tree_name_to_groups.is_empty(),
+            "import must populate tree_name_to_groups");
+
+        // Step 3: Open via tiered VFS (cold read from S3)
+        let vfs_name = unique_vfs_name("tiered_evict_tree");
+        let vfs = TieredVfs::new(config).expect("TieredVfs");
+        let bench = vfs.bench_handle();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "evict_tree_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        ).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+        // Warm cache by reading
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2000);
+
+        // Evict posts tree
+        let evicted = bench.evict_tree("posts");
+        assert!(evicted > 0, "expected at least one group evicted for 'posts'");
+
+        // Nonexistent tree returns 0
+        assert_eq!(bench.evict_tree("nonexistent_table"), 0);
+
+        // CSV works (users may have been evicted or in group 0)
+        let _evicted_csv = bench.evict_tree("users, idx_posts_user");
+
+        // Empty/whitespace is a no-op
+        assert_eq!(bench.evict_tree(""), 0);
+        assert_eq!(bench.evict_tree("  ,  , "), 0);
+
+        // Data still readable after eviction (re-fetched from S3)
+        let count2: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count2, 2000);
+
+        drop(conn);
+        let cleanup_config = TieredConfig {
+            bucket, prefix, endpoint_url: endpoint,
+            region: Some("auto".to_string()),
+            cache_dir: cache_dir.path().to_path_buf(),
+            pages_per_group: 8,
+            ..Default::default()
+        };
+        TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    }
+
+    #[test]
+    fn test_cache_info_returns_valid_json() {
+        let cache_dir = TempDir::new().unwrap();
+        let config = test_config("cache_info", cache_dir.path());
+        let vfs_name = unique_vfs_name("tiered_cache_info");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let vfs = TieredVfs::new(config).expect("TieredVfs");
+        let bench = vfs.bench_handle();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "cache_info_test.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        ).unwrap();
+
+        conn.execute_batch(
+            "PRAGMA page_size=65536;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
+        ).unwrap();
+
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..100 {
+                tx.execute("INSERT INTO data VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("val_{}", i)]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+        // Warm cache
+        let _: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
+
+        // Get cache info
+        let info = bench.cache_info();
+        assert!(info.contains("\"size_bytes\":"), "JSON should contain size_bytes: {}", info);
+        assert!(info.contains("\"groups_cached\":"), "JSON should contain groups_cached: {}", info);
+        assert!(info.contains("\"groups_total\":"), "JSON should contain groups_total: {}", info);
+        assert!(info.contains("\"tiers\":"), "JSON should contain tiers: {}", info);
+        assert!(info.contains("\"pinned\":"), "JSON should contain pinned tier: {}", info);
+        assert!(info.contains("\"s3_gets_total\":"), "JSON should contain s3_gets_total: {}", info);
+
+        // After clearing cache, size should drop
+        bench.clear_cache_data_only();
+        let info_after = bench.cache_info();
+        // Parse size_bytes from both
+        let size_before: u64 = info.split("\"size_bytes\":").nth(1).unwrap()
+            .split(',').next().unwrap().parse().unwrap();
+        let size_after: u64 = info_after.split("\"size_bytes\":").nth(1).unwrap()
+            .split(',').next().unwrap().parse().unwrap();
+        assert!(size_after <= size_before, "cache should shrink after clear: before={}, after={}", size_before, size_after);
+
+        drop(conn);
+        let cleanup_config = TieredConfig {
+            bucket, prefix, endpoint_url: endpoint,
+            region: Some("auto".to_string()),
+            cache_dir: cache_dir.path().to_path_buf(),
+            pages_per_group: 8,
+            ..Default::default()
+        };
+        TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
+    }
+
+    #[test]
+    fn test_evict_tree_skips_pending_flush_groups() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut config = test_config("evict_tree_pending", cache_dir.path());
+        config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+        let vfs_name = unique_vfs_name("tiered_evict_pending");
+        let bucket = config.bucket.clone();
+        let prefix = config.prefix.clone();
+        let endpoint = config.endpoint_url.clone();
+
+        let vfs = TieredVfs::new(config).expect("TieredVfs");
+        let bench = vfs.bench_handle();
+        turbolite::tiered::register(&vfs_name, vfs).unwrap();
+
+        let conn = rusqlite::Connection::open_with_flags_and_vfs(
+            "evict_tree_pending.db",
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            &vfs_name,
+        ).unwrap();
+
+        conn.execute_batch(
+            "PRAGMA page_size=65536;
+             PRAGMA journal_mode=WAL;
+             CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
+        ).unwrap();
+
+        turbolite::tiered::set_local_checkpoint_only(true);
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..100 {
+                tx.execute("INSERT INTO data VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("v{}", i)]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+
+        // Groups are pending flush, evict_tree should skip them
+        assert!(bench.has_pending_flush());
+        let evicted = bench.evict_tree("data");
+        assert_eq!(evicted, 0, "pending groups must not be evicted");
+
+        // Flush, then evict should work
+        turbolite::tiered::set_local_checkpoint_only(false);
+        bench.flush_to_s3().unwrap();
+        assert!(!bench.has_pending_flush());
+
+        // Data still readable
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 100);
+
+        drop(conn);
+        let cleanup_config = TieredConfig {
+            bucket, prefix, endpoint_url: endpoint,
+            region: Some("auto".to_string()),
+            cache_dir: cache_dir.path().to_path_buf(),
+            pages_per_group: 8,
+            ..Default::default()
+        };
+        TieredVfs::new(cleanup_config).unwrap().destroy_s3().unwrap();
     }
 }

@@ -906,7 +906,22 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // 3d. Drain per-connection settings (turbolite_config_set SQL function).
+        // 3d. Phase Stalingrad: between-query eviction trigger.
+        //
+        // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
+        // fires on statement completion and sets the end-query signal). If so,
+        // this is the boundary between two queries: the right time to evict
+        // cached data down to the budget.
+        //
+        // Order matters: evict BEFORE draining settings and plan queue, so the
+        // new query starts with a trimmed cache. The eviction itself is a no-op
+        // until size-based eviction is wired up (Phase Stalingrad a).
+        if query_plan::check_and_clear_end_query() {
+            // TODO(Stalingrad-a): call self.evict_to_budget() here once
+            // size-based eviction is implemented.
+        }
+
+        // 3e. Drain per-connection settings (turbolite_config_set SQL function).
         // Same global-queue pattern as plan drain. Users can tune prefetch schedules
         // before each query without reopening the connection.
         //

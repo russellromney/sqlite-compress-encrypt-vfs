@@ -237,6 +237,86 @@ impl TieredBenchHandle {
         )
     }
 
+    /// Evict all cached data for the named trees. Accepts comma-separated tree
+    /// names (e.g., "audit_log, idx_audit_date"). Looks up each name in the
+    /// manifest's tree_name_to_groups, evicts those groups from DiskCache.
+    /// Skips groups that are pending S3 upload (dirty page safety) or pinned.
+    /// Returns the number of groups evicted.
+    pub fn evict_tree(&self, tree_names_csv: &str) -> u32 {
+        let pending = self.shared_dirty_groups.lock().unwrap().clone();
+        let manifest = self.shared_manifest.read();
+        let interior_groups = self.cache.interior_groups.lock().clone();
+
+        let mut evicted = 0u32;
+        for name in tree_names_csv.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(group_ids) = manifest.tree_name_to_groups.get(name) {
+                for &gid in group_ids {
+                    if pending.contains(&gid) {
+                        continue;
+                    }
+                    if interior_groups.contains(&gid) {
+                        continue;
+                    }
+                    self.cache.evict_group(gid);
+                    evicted += 1;
+                }
+            }
+        }
+        evicted
+    }
+
+    /// Return cache info as a JSON string. Includes size, tier breakdown,
+    /// cached/total group counts, and S3 stats.
+    pub fn cache_info(&self) -> String {
+        let manifest = self.shared_manifest.read();
+        let page_size = manifest.page_size as u64;
+        let sub_pages = self.cache.sub_pages_per_frame as u64;
+        let sub_chunk_bytes = sub_pages * page_size;
+        let total_groups = manifest.page_group_keys.len() as u64;
+
+        let tracker = self.cache.tracker.lock();
+        let mut pinned_chunks = 0u64;
+        let mut index_chunks = 0u64;
+        let mut data_chunks = 0u64;
+
+        let mut groups_with_data: HashSet<u32> = HashSet::new();
+
+        for id in &tracker.present {
+            groups_with_data.insert(id.group_id);
+            match tracker.tiers.get(id) {
+                Some(&cache_tracking::SubChunkTier::Pinned) => pinned_chunks += 1,
+                Some(&cache_tracking::SubChunkTier::Index) => index_chunks += 1,
+                Some(&cache_tracking::SubChunkTier::Data) | None => data_chunks += 1,
+            }
+        }
+
+        let pinned_bytes = pinned_chunks * sub_chunk_bytes;
+        let index_bytes = index_chunks * sub_chunk_bytes;
+        let data_bytes = data_chunks * sub_chunk_bytes;
+        let total_bytes = pinned_bytes + index_bytes + data_bytes;
+
+        let s3_gets = self.s3.fetch_count.load(Ordering::Relaxed);
+
+        format!(
+            "{{\"size_bytes\":{},\"groups_cached\":{},\"groups_total\":{},\
+            \"tiers\":{{\"pinned\":{{\"chunks\":{},\"bytes\":{}}},\
+            \"index\":{{\"chunks\":{},\"bytes\":{}}},\
+            \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
+            \"s3_gets_total\":{}}}",
+            total_bytes,
+            groups_with_data.len(),
+            total_groups,
+            pinned_chunks, pinned_bytes,
+            index_chunks, index_bytes,
+            data_chunks, data_bytes,
+            s3_gets,
+        )
+    }
+
     /// Get page numbers for all groups pending S3 upload.
     /// Used by clear_cache methods to protect unflushed pages from eviction.
     fn pending_group_pages(&self) -> HashMap<u64, Vec<u64>> {
