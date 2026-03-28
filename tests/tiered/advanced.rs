@@ -524,7 +524,7 @@ fn test_evict_tree_by_name() {
     // Step 3: Open via tiered VFS (cold read from S3)
     let vfs_name = unique_vfs_name("tiered_evict_tree");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -578,7 +578,7 @@ fn test_cache_info_returns_valid_json() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -682,7 +682,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
     // Step 3: Open via tiered VFS, write new data, local-checkpoint to create pending groups
     let vfs_name = unique_vfs_name("tiered_evict_pending");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(

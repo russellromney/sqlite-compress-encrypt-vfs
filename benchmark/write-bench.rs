@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
-use turbolite::tiered::{TieredBenchHandle, TieredConfig, TieredVfs};
+use turbolite::tiered::{TieredSharedState, TieredConfig, TieredVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -199,18 +199,18 @@ struct S3Snapshot {
     get_bytes: u64,
 }
 
-fn s3_snapshot(bench: &TieredBenchHandle) -> S3Snapshot {
+fn s3_snapshot(bench: &TieredSharedState) -> S3Snapshot {
     let (puts, put_bytes) = bench.s3_put_counters();
     let (gets, get_bytes) = bench.s3_counters();
     S3Snapshot { puts, put_bytes, gets, get_bytes }
 }
 
-fn s3_put_delta(bench: &TieredBenchHandle, before: &S3Snapshot) -> (u64, u64) {
+fn s3_put_delta(bench: &TieredSharedState, before: &S3Snapshot) -> (u64, u64) {
     let (puts, bytes) = bench.s3_put_counters();
     (puts - before.puts, bytes - before.put_bytes)
 }
 
-fn s3_get_delta(bench: &TieredBenchHandle, before: &S3Snapshot) -> (u64, u64) {
+fn s3_get_delta(bench: &TieredSharedState, before: &S3Snapshot) -> (u64, u64) {
     let (gets, bytes) = bench.s3_counters();
     (gets - before.gets, bytes - before.get_bytes)
 }
@@ -235,7 +235,7 @@ struct CheckpointStats {
     s3_bytes: u64,
 }
 
-fn timed_checkpoint(conn: &Connection, bench: &TieredBenchHandle) -> CheckpointStats {
+fn timed_checkpoint(conn: &Connection, bench: &TieredSharedState) -> CheckpointStats {
     let before = s3_snapshot(bench);
     let start = Instant::now();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -259,7 +259,7 @@ struct TwoPhaseCheckpointStats {
 
 /// Two-phase checkpoint: fast local phase (holds lock briefly) + async S3 upload (no lock).
 /// Reads and writes can continue during the S3 upload phase.
-fn timed_checkpoint_two_phase(conn: &Connection, bench: &TieredBenchHandle) -> TwoPhaseCheckpointStats {
+fn timed_checkpoint_two_phase(conn: &Connection, bench: &TieredSharedState) -> TwoPhaseCheckpointStats {
     let before = s3_snapshot(bench);
     let total_start = Instant::now();
 
@@ -349,7 +349,7 @@ fn groups_for(page_count: i64, ppg: u32) -> i64 {
 
 struct VfsSetup {
     conn: Connection,
-    bench: TieredBenchHandle,
+    bench: TieredSharedState,
     prefix: String,
     db_name: String,
     _cache_dir: TempDir,
@@ -363,7 +363,7 @@ fn setup_writer_vfs(name_prefix: &str, cli: &Cli) -> VfsSetup {
 
     let vfs_name = unique_vfs_name(name_prefix);
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -835,7 +835,7 @@ fn scenario_cold_write(cli: &Cli) {
 
     let vfs_name = unique_vfs_name("cold_seed");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench_seed = vfs.bench_handle();
+    let bench_seed = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -861,7 +861,7 @@ fn scenario_cold_write(cli: &Cli) {
     let cold_config = make_config(&prefix, cold_cache.path(), cli);
     let cold_vfs_name = unique_vfs_name("cold_write");
     let cold_vfs = TieredVfs::new(cold_config).expect("cold TieredVfs");
-    let cold_bench = cold_vfs.bench_handle();
+    let cold_bench = cold_vfs.shared_state();
     turbolite::tiered::register(&cold_vfs_name, cold_vfs).unwrap();
 
     let cold_conn = Connection::open_with_flags_and_vfs(
@@ -933,7 +933,7 @@ fn scenario_merge_write(cli: &Cli) {
     };
     let vfs_name = unique_vfs_name("merge_write");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(
@@ -1062,7 +1062,7 @@ fn scenario_arctic_write(cli: &Cli) {
     };
     let vfs_name = unique_vfs_name("arctic_write");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     // Open connection (this eagerly fetches interior bundles)
@@ -1172,7 +1172,7 @@ fn scenario_two_phase(cli: &Cli) {
     };
     let vfs_name = unique_vfs_name("two_phase");
     let vfs = TieredVfs::new(config).expect("TieredVfs");
-    let bench = vfs.bench_handle();
+    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let conn = Connection::open_with_flags_and_vfs(

@@ -225,7 +225,7 @@ Two-phase checkpoint: fast local WAL compaction (~1ms lock) + async S3 upload (n
 
 ### Two-phase checkpoint (flush_to_s3)
 - Shared `Arc<RwLock<Manifest>>` and `Arc<Mutex<HashSet<u64>>>` between handle and VFS for lock-free flush
-- `flush_to_s3()` on both `TieredVfs` and `TieredBenchHandle`
+- `flush_to_s3()` on both `TieredVfs` and `TieredSharedState`
 - Uploads page groups, interior chunks, and index leaf bundles outside any SQLite lock
 - `flush_lock` mutex prevents concurrent flush races on version numbers and S3 keys
 - Cache eviction protects pending-upload groups from eviction (all `clear_cache*` methods)

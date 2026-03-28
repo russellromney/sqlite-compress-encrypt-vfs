@@ -40,6 +40,9 @@ extern int turbolite_bench_reset_s3(void);
 extern long long turbolite_bench_s3_gets(void);
 extern long long turbolite_bench_s3_bytes(void);
 
+/* Rust function -- full GC scan. Defined in src/ext.rs. */
+extern int turbolite_gc(void);
+
 /* Rust function -- runtime config (prefetch tuning).
  * Defined in src/tiered/settings.rs. */
 extern int turbolite_config_set(const char *key, const char *value);
@@ -50,6 +53,7 @@ extern int turbolite_evict_tree(const char *tree_names);
 extern int turbolite_evict(const char *tier);
 extern const char *turbolite_cache_info(void);
 extern const char *turbolite_warm(sqlite3 *db, const char *sql);
+extern int turbolite_evict_query(sqlite3 *db, const char *sql);
 
 /* ── SQL functions ──────────────────────────────────────────────── */
 
@@ -220,6 +224,32 @@ static void turbolite_evict_func(
 }
 
 /*
+ * turbolite_evict_query(sql TEXT)
+ * Evict cached data for trees referenced by a SQL query. Runs EQP,
+ * extracts tree names, evicts their groups.
+ * Returns number of groups evicted.
+ */
+static void turbolite_evict_query_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *sql = (const char *)sqlite3_value_text(argv[0]);
+    if (!sql) {
+        sqlite3_result_error(ctx, "turbolite_evict_query: SQL argument required", -1);
+        return;
+    }
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    int evicted = turbolite_evict_query(db, sql);
+    if (evicted < 0) {
+        sqlite3_result_error(ctx, "turbolite_evict_query: no tiered VFS registered", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, evicted);
+}
+
+/*
  * turbolite_warm(sql TEXT)
  * Pre-warm cache for a planned query. Runs EQP, extracts tree names,
  * submits their page groups to the prefetch pool. Non-blocking.
@@ -243,6 +273,26 @@ static void turbolite_warm_func(
         return;
     }
     sqlite3_result_text(ctx, json, -1, SQLITE_TRANSIENT);
+}
+
+/*
+ * turbolite_gc()
+ * Full orphan scan: list all S3 objects under prefix, delete those not in manifest.
+ * Returns number of deleted objects.
+ */
+static void turbolite_gc_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    (void)argv;
+    int deleted = turbolite_gc();
+    if (deleted < 0) {
+        sqlite3_result_error(ctx, "turbolite_gc: no tiered VFS registered or S3 error", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, deleted);
 }
 
 /* ── Trace callback: frontrun prefetch + between-query eviction ─── */
@@ -397,6 +447,14 @@ int sqlite3_turbolite_init(
     sqlite3_create_function_v2(
         db, "turbolite_warm", 1,
         SQLITE_UTF8, 0, turbolite_warm_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_evict_query", 1,
+        SQLITE_UTF8, 0, turbolite_evict_query_func, 0, 0, 0
+    );
+    sqlite3_create_function_v2(
+        db, "turbolite_gc", 0,
+        SQLITE_UTF8, 0, turbolite_gc_func, 0, 0, 0
     );
 
     return SQLITE_OK;

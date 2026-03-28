@@ -73,7 +73,7 @@ mod settings;
 mod vfs;
 
 // Public API (visible outside the crate)
-pub use bench::TieredBenchHandle;
+pub use bench::TieredSharedState;
 pub use config::{GroupState, GroupingStrategy, PrefetchNeighbors, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TieredHandle;
 pub use import::import_sqlite_file;

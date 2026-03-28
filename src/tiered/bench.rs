@@ -7,8 +7,8 @@ use super::*;
 
 /// Lightweight handle for benchmarking -- shares the same S3 client, cache,
 /// manifest, and dirty groups as the VFS.
-/// Obtained via [`TieredVfs::bench_handle`] before registering the VFS.
-pub struct TieredBenchHandle {
+/// Obtained via [`TieredVfs::shared_state`] before registering the VFS.
+pub struct TieredSharedState {
     pub(super) s3: Arc<S3Client>,
     pub(super) cache: Arc<DiskCache>,
     pub(super) prefetch_pool: Arc<PrefetchPool>,
@@ -25,7 +25,7 @@ pub struct TieredBenchHandle {
     pub(super) access_history: Option<prediction::SharedAccessHistory>,
 }
 
-impl TieredBenchHandle {
+impl TieredSharedState {
     /// Evict data pages only -- interior B-tree pages and group 0 stay warm.
     /// Simulates production where structural pages are always hot.
     ///
@@ -304,6 +304,14 @@ impl TieredBenchHandle {
         evicted
     }
 
+    /// Evict cached data for trees referenced by a query. Runs EQP to extract
+    /// tree names, then evicts those trees' groups. Returns number of groups evicted.
+    pub fn evict_query(&self, accesses: &[query_plan::PlannedAccess]) -> u32 {
+        let tree_names: Vec<&str> = accesses.iter().map(|a| a.tree_name.as_str()).collect();
+        let csv = tree_names.join(",");
+        self.evict_tree(&csv)
+    }
+
     /// Return cache info as a JSON string. Includes size, tier breakdown,
     /// cached/total group counts, and S3 stats.
     pub fn cache_info(&self) -> String {
@@ -340,6 +348,8 @@ impl TieredBenchHandle {
         let misses = self.cache.stat_misses.load(Ordering::Relaxed);
         let evictions = self.cache.stat_evictions.load(Ordering::Relaxed);
         let bytes_evicted = self.cache.stat_bytes_evicted.load(Ordering::Relaxed);
+        let peak_bytes = self.cache.stat_peak_cache_bytes.load(Ordering::Relaxed);
+        let last_eviction = self.cache.stat_last_eviction_count.load(Ordering::Relaxed);
         let hit_rate = if hits + misses > 0 {
             hits as f64 / (hits + misses) as f64
         } else {
@@ -347,21 +357,21 @@ impl TieredBenchHandle {
         };
 
         format!(
-            "{{\"size_bytes\":{},\"groups_cached\":{},\"groups_total\":{},\
+            "{{\"size_bytes\":{},\"peak_bytes\":{},\"groups_cached\":{},\"groups_total\":{},\
             \"tiers\":{{\"pinned\":{{\"chunks\":{},\"bytes\":{}}},\
             \"index\":{{\"chunks\":{},\"bytes\":{}}},\
             \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
             \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
-            \"evictions\":{},\"bytes_evicted\":{},\
+            \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{},\
             \"s3_gets_total\":{}}}",
-            total_bytes,
+            total_bytes, peak_bytes,
             groups_with_data.len(),
             total_groups,
             pinned_chunks, pinned_bytes,
             index_chunks, index_bytes,
             data_chunks, data_bytes,
             hits, misses, hit_rate,
-            evictions, bytes_evicted,
+            evictions, bytes_evicted, last_eviction,
             s3_gets,
         )
     }
@@ -421,5 +431,39 @@ impl TieredBenchHandle {
             result.insert(gid, pages);
         }
         result
+    }
+
+    /// Full GC: list all S3 objects, diff against manifest, delete orphans.
+    /// Returns count of objects deleted.
+    pub fn gc(&self) -> io::Result<usize> {
+        let manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
+        let all_keys = self.s3.list_all_keys()?;
+
+        let mut live_keys: HashSet<String> = HashSet::new();
+        live_keys.insert(self.s3.manifest_key_msgpack());
+        for key in &manifest.page_group_keys {
+            if !key.is_empty() {
+                live_keys.insert(key.clone());
+            }
+        }
+        for key in manifest.interior_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+        for key in manifest.index_chunk_keys.values() {
+            live_keys.insert(key.clone());
+        }
+
+        let orphans: Vec<String> = all_keys
+            .into_iter()
+            .filter(|k| !live_keys.contains(k))
+            .collect();
+
+        let count = orphans.len();
+        if count > 0 {
+            eprintln!("[gc] deleting {} orphaned S3 objects...", count);
+            self.s3.delete_objects(&orphans)?;
+            eprintln!("[gc] deleted {} orphaned objects", count);
+        }
+        Ok(count)
     }
 }

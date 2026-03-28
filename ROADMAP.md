@@ -290,7 +290,7 @@ Before running an expensive query, users can check how much cache it would need.
 
 ### g. Naming cleanup
 
-- [ ] Rename `TieredBenchHandle` to `TieredSharedState` (it's used by both benchmarks and SQL functions, not just benchmarks)
+- [ ] Rename `TieredSharedState` to `TieredSharedState` (it's used by both benchmarks and SQL functions, not just benchmarks)
 
 ---
 

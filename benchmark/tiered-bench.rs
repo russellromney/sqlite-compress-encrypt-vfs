@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{GroupingStrategy, TieredBenchHandle, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
+use turbolite::tiered::{GroupingStrategy, TieredSharedState, TieredConfig, TieredVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tempfile::TempDir;
@@ -831,7 +831,7 @@ fn run_query_pair(
 /// Cache level: data — everything cached, reuse connection. Measures pread latency.
 fn bench_data(
     conn: &Connection,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -870,7 +870,7 @@ fn bench_data(
 fn bench_index(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -925,7 +925,7 @@ fn bench_index(
 fn bench_interior(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -980,7 +980,7 @@ fn bench_interior(
 fn bench_none(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1034,7 +1034,7 @@ fn bench_none(
 fn bench_none_pair(
     vfs_name: &str,
     db_name: &str,
-    handle: &TieredBenchHandle,
+    handle: &TieredSharedState,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1275,7 +1275,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     eprintln!("[bench] calling TieredVfs::new()...");
     let reader_vfs = TieredVfs::new(reader_config).expect("reader VFS");
     eprintln!("[bench] TieredVfs::new() returned OK");
-    let bench_handle = reader_vfs.bench_handle();
+    let shared_state = reader_vfs.shared_state();
     let reader_vfs_name = unique_vfs_name("reader");
     eprintln!("[bench] registering VFS '{}'", reader_vfs_name);
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
@@ -1434,7 +1434,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &bench_handle, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_data(&warm_conn, &shared_state, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1445,7 +1445,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1454,7 +1454,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1463,7 +1463,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &bench_handle, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_none(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1512,7 +1512,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let r = bench_none_pair(
                     &reader_vfs_name,
                     &db_name,
-                    &bench_handle,
+                    &shared_state,
                     q.label,
                     q.sql,
                     &q.param_fn,

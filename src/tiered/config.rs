@@ -16,7 +16,7 @@ pub enum SyncMode {
     /// - Process crash: data survives (on local disk)
     /// - Machine loss: data lost (not yet on S3)
     ///
-    /// Call `flush_to_s3()` (on TieredVfs or TieredBenchHandle) to upload.
+    /// Call `flush_to_s3()` (on TieredVfs or TieredSharedState) to upload.
     LocalThenFlush,
 }
 
@@ -28,16 +28,14 @@ impl Default for SyncMode {
 
 // ===== Grouping strategy =====
 
-/// How pages are assigned to groups and how prefetch neighbors are selected.
+/// Grouping strategy marker. Only BTreeAware is supported.
+/// Kept as an enum for serde backward compatibility with existing manifests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupingStrategy {
-    /// Legacy positional mapping: gid = page_num / ppg, idx = page_num % ppg.
-    /// Group g contains pages [g*ppg .. min((g+1)*ppg, page_count)].
-    /// Prefetch uses radial fan-out from current group.
+    /// Legacy positional mapping. No longer used for new databases.
+    /// Existing Positional manifests are read-only compatible.
     Positional,
     /// B-tree-aware: explicit page-to-group mapping from btree walking.
-    /// group_pages[gid] = ordered list of page numbers.
-    /// Prefetch uses sibling groups from the same B-tree.
     BTreeAware,
 }
 
@@ -45,14 +43,6 @@ impl Default for GroupingStrategy {
     fn default() -> Self {
         GroupingStrategy::BTreeAware
     }
-}
-
-/// Prefetch neighbor selection returned by `Manifest::prefetch_neighbors()`.
-pub enum PrefetchNeighbors {
-    /// Radial fan-out from current gid (positional strategy).
-    RadialFanout { total_groups: u64 },
-    /// Sibling groups from the same B-tree (btree-aware strategy).
-    BTreeSiblings(Vec<u64>),
 }
 
 // ===== Group state for prefetch coordination =====
@@ -93,10 +83,6 @@ pub struct TieredConfig {
     /// Page groups not accessed within this window are evicted from local NVMe.
     /// Interior page groups (B-tree internal nodes) are pinned permanently.
     pub cache_ttl_secs: u64,
-    /// Radial prefetch schedule (Positional strategy). Each element is the fraction of
-    /// total page groups to prefetch on consecutive cache misses.
-    /// Default [0.33, 0.33] = 3-hop: miss 1 fetches 33%, miss 2 fetches 33%, miss 3+ fetches all.
-    pub prefetch_hops: Vec<f32>,
     /// Prefetch schedule for SEARCH queries (BTreeAware strategy).
     /// SEARCH queries scan unknown portions of indexes/tables, need aggressive warmup.
     /// Default [0.3, 0.3, 0.4] = prefetch 30% of siblings on first miss, ramp up.
@@ -136,10 +122,6 @@ pub struct TieredConfig {
     /// The manifest is NOT encrypted (it contains only S3 keys and byte offsets, no user data).
     /// Requires the `encryption` feature for actual encryption; without it, the key is ignored.
     pub encryption_key: Option<[u8; 32]>,
-    /// Page grouping strategy for import. Default: BTreeAware.
-    /// Positional: sequential chunking (page N -> group N/ppg).
-    /// BTreeAware: B-tree walking + bin-packing by B-tree.
-    pub grouping_strategy: GroupingStrategy,
     /// Phase Verdun: enable predictive cross-tree prefetch + access history.
     /// When true, the VFS learns which B-trees appear together in transactions
     /// and prefetches them in parallel on subsequent queries.
@@ -199,7 +181,6 @@ impl Default for TieredConfig {
             gc_enabled: true,
             eager_index_load: true,
             encryption_key: None,
-            grouping_strategy: GroupingStrategy::default(),
             prediction_enabled: false,
             sync_mode: SyncMode::default(),
             query_plan_prefetch: true,
