@@ -171,6 +171,66 @@ pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
     BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().1 as i64)
 }
 
+// ── Phase Stalingrad: cache eviction + observability ──────────────────
+
+/// Evict cached data for named trees. tree_names is a comma-separated C string.
+/// Returns number of groups evicted, or -1 if no tiered VFS.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
+    if tree_names.is_null() {
+        return -1;
+    }
+    let names = match std::ffi::CStr::from_ptr(tree_names).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match BENCH_HANDLE.get() {
+        Some(h) => h.evict_tree(names) as i32,
+        None => -1,
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::c_char) -> i32 {
+    -1
+}
+
+/// Return cache info as a JSON C string. Caller must treat as SQLITE_TRANSIENT.
+/// Returns null if no tiered VFS.
+///
+/// Uses a thread-local buffer to avoid allocation lifetime issues across FFI.
+#[cfg(feature = "tiered")]
+#[no_mangle]
+pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
+    thread_local! {
+        static CACHE_INFO_BUF: std::cell::RefCell<std::ffi::CString> =
+            std::cell::RefCell::new(std::ffi::CString::new("").unwrap());
+    }
+    match BENCH_HANDLE.get() {
+        Some(h) => {
+            let json = h.cache_info();
+            match std::ffi::CString::new(json) {
+                Ok(c) => {
+                    CACHE_INFO_BUF.with(|buf| {
+                        *buf.borrow_mut() = c;
+                        buf.borrow().as_ptr()
+                    })
+                }
+                Err(_) => std::ptr::null(),
+            }
+        }
+        None => std::ptr::null(),
+    }
+}
+
+#[cfg(not(feature = "tiered"))]
+#[no_mangle]
+pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
+    std::ptr::null()
+}
+
 #[cfg(not(feature = "tiered"))]
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
