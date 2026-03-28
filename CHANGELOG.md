@@ -2,6 +2,33 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Stalingrad (items 1-3): Cache Eviction Foundations
+
+Between-query eviction boundary, manual tree eviction, and cache observability. The building blocks for production cache management.
+
+### 1. SQLITE_TRACE_PROFILE + end-query signal
+- `turbolite_trace_end_query()` FFI entry point, called from C trace profile callback
+- AtomicBool end-query signal: set on statement completion, checked+cleared by VFS on next read
+- Multiple signals collapse to one check (idempotent). Trace callback handles both SQLITE_TRACE_STMT (plan-aware prefetch) and SQLITE_TRACE_PROFILE (end-query signal)
+- Reentrant guard prevents false PROFILE events from inner EQP statements
+- Between-query eviction hook wired in VFS read path (step 3d), no-op until size-based eviction (item 4)
+- 5 unit tests
+
+### 2. `turbolite_evict_tree(names)` SQL function
+- Evicts cached groups for named B-trees via `tree_name_to_groups` manifest lookup
+- Accepts comma-separated names: `SELECT turbolite_evict_tree('audit_log, idx_audit_date')`
+- Skips groups pending S3 upload (dirty page safety) and interior/pinned groups
+- Works with BTreeAware grouping strategy (Positional has no tree-to-group mapping)
+- FFI: `turbolite_evict_tree()` in ext.rs, C wrapper in ext_entry.c
+- Integration test with BTreeAware import, pending-flush safety test
+
+### 3. `turbolite_cache_info()` SQL function
+- Returns JSON: `size_bytes`, `groups_cached`, `groups_total`, tier breakdown (pinned/index/data chunks and bytes), `s3_gets_total`
+- Thread-local CString buffer for FFI safety (SQLITE_TRANSIENT copies immediately)
+- Integration test: JSON structure validation, size decrease after cache clear
+
+---
+
 ## Marne (Memory): Dirty Page Memory Optimization
 
 Replaced `dirty_pages: HashMap<u64, Vec<u8>>` with `dirty_page_nums: HashSet<u64>`. Dirty page data lives only in the disk cache file, not duplicated in memory. Saves 64KB per dirty page (1000 dirty 64KB pages = 64MB saved).

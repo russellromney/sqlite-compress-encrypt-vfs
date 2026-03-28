@@ -230,13 +230,15 @@ Cache grows unbounded today. Add a global byte budget enforced between queries. 
 - Never evict sub-chunks containing dirty pages (any journal mode) or pending flush pages (LocalThenFlush)
 - Minimum floor: `max(all_interior_groups_size, prefetch_threads * sub_frame_size)`. Reject config below this.
 
+Between-query eviction hook is wired (step 3d in VFS read path, end-query signal via SQLITE_TRACE_PROFILE). Remaining work is the eviction logic itself:
+
 - [ ] `max_cache_bytes: Option<u64>` in TieredConfig
 - [ ] `TURBOLITE_CACHE_LIMIT` env var (e.g., `512MB`, `2GB`), parsed at VFS registration
 - [ ] `turbolite_config_set('cache_limit', '512MB')` for runtime adjustment
 - [ ] `current_cache_bytes: AtomicU64` on DiskCache, updated on write/evict
 - [ ] `is_evictable(sub_chunk)`: false if dirty, pending flush, or Pinned
 - [ ] `evict_to_budget()`: loop `evict_one()` over evictable sub-chunks until under limit
-- [ ] Between-query trigger: trace callback calls `evict_to_budget()` if over limit before processing next query's EQP
+- [ ] Wire `evict_to_budget()` into the existing between-query hook (handle.rs step 3d TODO)
 - [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
 - [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
 
@@ -256,22 +258,9 @@ Replace pure LRU with weighted scoring that considers both recency and frequency
 
 No other SQLite VFS lets you introspect the cache. This is a devex differentiator.
 
-- [ ] `turbolite_cache_info()` SQL function returning JSON:
-  ```json
-  {
-    "size_bytes": 52428800,
-    "limit_bytes": 536870912,
-    "groups_cached": 24,
-    "groups_total": 48,
-    "tiers": {
-      "pinned": {"groups": 1, "bytes": 262144},
-      "index": {"groups": 5, "bytes": 5242880},
-      "data": {"groups": 18, "bytes": 46923776}
-    },
-    "hit_rate": 0.94,
-    "evictions_since_open": 12
-  }
-  ```
+`turbolite_cache_info()` is implemented (size_bytes, groups_cached/total, tier breakdown, s3_gets_total). Remaining work adds richer stats and churn detection:
+
+- [ ] Add `limit_bytes`, `hit_rate`, `evictions_since_open` fields to cache_info JSON (after size-based eviction lands)
 - [ ] `turbolite_cache_stats()` SQL function: `{hits, misses, evictions, bytes_evicted, bytes_fetched}`
 - [ ] Post-query churn detection: if between-query eviction sheds >50% of cache, include warning in stats:
   `{"last_query_evictions": 847, "cache_churn": "high", "recommendation": "cache_limit >= 512MB would eliminate churn"}`
@@ -279,7 +268,6 @@ No other SQLite VFS lets you introspect the cache. This is a devex differentiato
 - [ ] Track hit/miss counters on `read_exact_at` (cache hit vs S3 fetch)
 - [ ] Track eviction counters in `evict_one()` / `evict_to_budget()`
 - [ ] Log at WARN level when between-query eviction sheds >50% of cache (visible in app logs without checking SQL functions)
-- [ ] FFI: Rust functions exposed via ext_entry.c, same pattern as bench functions
 - [ ] Tests: stats increment correctly, info reflects actual cache state, churn warning triggers at threshold, peak working set tracked
 
 ### c2. Query cost estimation
@@ -344,16 +332,15 @@ Before running an expensive query, users can check how much cache it would need.
 
 Application-level cache control via SQL functions. Most important for multi-tenant: the application knows when a tenant is cold.
 
+`turbolite_evict_tree(names)` is implemented (comma-separated tree names, skips pending/interior groups, BTreeAware only). Remaining:
+
 - [ ] `turbolite_evict('data')` / `turbolite_evict('index')` / `turbolite_evict('all')` -- evict by tier
-- [ ] `turbolite_evict_tree('table_name')` -- evict specific tree's cached data
-  - Looks up `tree_name_to_groups` in manifest, evicts those groups' sub-chunks
-  - Accepts comma-separated names: `turbolite_evict_tree('audit_log, idx_audit_date')`
 - [ ] `turbolite_evict_query('SELECT ...')` -- run EQP, extract trees, evict their data
   - Reuses frontrun EQP parsing infrastructure
   - Optional second arg for tier: `turbolite_evict_query('SELECT ...', 'data')`
   - Default: evict data tier only (keep index for potential re-query)
-- [ ] FFI + ext_entry.c registration for all functions
-- [ ] Tests: tree eviction only affects named tree's groups, query eviction matches EQP output, evict('all') resets everything except pending flush pages
+- [ ] FFI + ext_entry.c registration for remaining functions
+- [ ] Tests: query eviction matches EQP output, evict('all') resets everything except pending flush pages
 
 ### e. Checkpoint eviction
 
