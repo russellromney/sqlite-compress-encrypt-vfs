@@ -476,6 +476,15 @@ pub(crate) fn flush_dirty_groups_to_s3(
         }
     }
 
+    // Phase Gallipoli: persist local manifest with empty dirty_groups (flush complete)
+    {
+        let m = shared_manifest.read().clone();
+        let local = super::manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
+        if let Err(e) = local.persist(&cache.cache_dir) {
+            eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
+        }
+    }
+
     eprintln!("[flush] complete");
     Ok(())
 }
