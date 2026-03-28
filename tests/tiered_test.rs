@@ -5079,14 +5079,47 @@ mod tiered_tests {
 
     #[test]
     fn test_evict_tree_skips_pending_flush_groups() {
+        // This test must use BTreeAware import so tree_name_to_groups is populated.
+        // Without it, evict_tree("posts") always returns 0 because the name lookup
+        // yields no groups, making the test a false positive.
         let cache_dir = TempDir::new().unwrap();
+        let local_db = cache_dir.path().join("local_pending.db");
+
+        // Step 1: Create a local SQLite file with enough data to span multiple groups.
+        {
+            let conn = rusqlite::Connection::open(&local_db).unwrap();
+            conn.execute_batch(
+                "PRAGMA page_size=4096;
+                 PRAGMA journal_mode=DELETE;
+                 CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT);
+                 CREATE INDEX idx_posts_user ON posts(user_id);",
+            ).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..2000 {
+                tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, i % 100, format!("Post body {} with padding text to fill pages", i)]).unwrap();
+            }
+            tx.commit().unwrap();
+            conn.execute_batch("VACUUM;").unwrap();
+        }
+
+        // Step 2: Import via import_sqlite_file (builds BTreeAware manifest with tree_name_to_groups)
         let mut config = test_config("evict_tree_pending", cache_dir.path());
+        config.pages_per_group = 8;
+        config.grouping_strategy = GroupingStrategy::BTreeAware;
         config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
-        let vfs_name = unique_vfs_name("tiered_evict_pending");
         let bucket = config.bucket.clone();
         let prefix = config.prefix.clone();
         let endpoint = config.endpoint_url.clone();
 
+        let manifest = turbolite::tiered::import_sqlite_file(&config, &local_db)
+            .expect("import failed");
+        let posts_groups = manifest.tree_name_to_groups.get("posts")
+            .expect("import must map 'posts' to groups");
+        assert!(!posts_groups.is_empty(), "posts must have at least one group");
+
+        // Step 3: Open via tiered VFS, write new data, local-checkpoint to create pending groups
+        let vfs_name = unique_vfs_name("tiered_evict_pending");
         let vfs = TieredVfs::new(config).expect("TieredVfs");
         let bench = vfs.bench_handle();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -5097,37 +5130,50 @@ mod tiered_tests {
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         ).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
-        conn.execute_batch(
-            "PRAGMA page_size=65536;
-             PRAGMA journal_mode=WAL;
-             CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
-        ).unwrap();
+        // Warm cache by reading (so groups are cached)
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2000);
 
+        // Verify evict_tree works when nothing is pending
+        assert!(!bench.has_pending_flush());
+        let evicted_before = bench.evict_tree("posts");
+        assert!(evicted_before > 0, "should evict posts groups when no pending flush");
+
+        // Re-warm cache
+        let _: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+
+        // Write new data and local-checkpoint to create pending groups
         turbolite::tiered::set_local_checkpoint_only(true);
         {
             let tx = conn.unchecked_transaction().unwrap();
-            for i in 0..100 {
-                tx.execute("INSERT INTO data VALUES (?1, ?2)",
-                    rusqlite::params![i, format!("v{}", i)]).unwrap();
+            for i in 2000..2500 {
+                tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![i, i % 100, format!("new post {}", i)]).unwrap();
             }
             tx.commit().unwrap();
         }
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
 
-        // Groups are pending flush, evict_tree should skip them
+        // Now groups are pending: evict_tree should skip pending ones
         assert!(bench.has_pending_flush());
-        let evicted = bench.evict_tree("data");
-        assert_eq!(evicted, 0, "pending groups must not be evicted");
+        let evicted_pending = bench.evict_tree("posts");
+        // Some groups may still be evictable (not all posts groups are dirty),
+        // but pending ones must be skipped. The key assertion is that we evict
+        // fewer groups than when nothing was pending.
+        assert!(evicted_pending < evicted_before,
+            "pending flush must reduce evictable groups: before={}, during_pending={}",
+            evicted_before, evicted_pending);
 
-        // Flush, then evict should work
+        // Flush, then evict should work fully again
         turbolite::tiered::set_local_checkpoint_only(false);
         bench.flush_to_s3().unwrap();
         assert!(!bench.has_pending_flush());
 
-        // Data still readable
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 100);
+        // Data still readable after flush
+        let count2: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+        assert_eq!(count2, 2500);
 
         drop(conn);
         let cleanup_config = TieredConfig {

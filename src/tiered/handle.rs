@@ -1432,20 +1432,25 @@ impl DatabaseHandle for TieredHandle {
                 Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
             }
             let page_size = *self.page_size.read() as usize;
+            let mut type_buf = vec![0u8; page_size];
             for &page_num in &dirty_snapshot {
                 let loc = manifest.page_location(page_num)
                     .expect("page must have group assignment after new-page assignment");
                 pending.insert(loc.group_id);
                 // Track interior pages so final sync builds correct interior chunks.
                 // Phase Marne: read page type byte from cache instead of in-memory buffer.
-                let mut type_buf = vec![0u8; page_size];
-                if cache.read_page(page_num, &mut type_buf).is_ok() {
-                    let type_byte = if page_num == 0 { type_buf.get(100) } else { type_buf.get(0) };
-                    if let Some(&b) = type_byte {
-                        if b == 0x05 || b == 0x02 {
-                            cache.mark_interior_group(loc.group_id, page_num, loc.index);
-                            interior_found += 1;
+                match cache.read_page(page_num, &mut type_buf) {
+                    Ok(()) => {
+                        let type_byte = if page_num == 0 { type_buf.get(100) } else { type_buf.get(0) };
+                        if let Some(&b) = type_byte {
+                            if b == 0x05 || b == 0x02 {
+                                cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                                interior_found += 1;
+                            }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during local checkpoint interior scan: {}", page_num, e);
                     }
                 }
             }
@@ -1648,18 +1653,23 @@ impl DatabaseHandle for TieredHandle {
         {
             // Phase Marne: collect interior pages from cache (dirty_snapshot is just page numbers)
             let mut dirty_interior_count = 0usize;
+            let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
-                let mut buf = vec![0u8; page_size as usize];
-                if cache.read_page(pnum, &mut buf).is_ok() {
-                    let type_byte = if pnum == 0 { buf.get(100) } else { buf.get(0) };
-                    if let Some(&b) = type_byte {
-                        if b == 0x05 || b == 0x02 {
-                            if let Some(loc) = manifest_snap.page_location(pnum) {
-                                cache.mark_interior_group(loc.group_id, pnum, loc.index);
+                match cache.read_page(pnum, &mut read_buf) {
+                    Ok(()) => {
+                        let type_byte = if pnum == 0 { read_buf.get(100) } else { read_buf.get(0) };
+                        if let Some(&b) = type_byte {
+                            if b == 0x05 || b == 0x02 {
+                                if let Some(loc) = manifest_snap.page_location(pnum) {
+                                    cache.mark_interior_group(loc.group_id, pnum, loc.index);
+                                }
+                                all_interior.insert(pnum, read_buf.clone());
+                                dirty_interior_count += 1;
                             }
-                            all_interior.insert(pnum, buf);
-                            dirty_interior_count += 1;
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during interior collection: {}", pnum, e);
                     }
                 }
             }
@@ -1764,16 +1774,21 @@ impl DatabaseHandle for TieredHandle {
         {
             // Phase Marne: read dirty pages from cache for index leaf classification
             let mut dirty_index_count = 0usize;
+            let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
-                let mut buf = vec![0u8; page_size as usize];
-                if cache.read_page(pnum, &mut buf).is_ok() {
-                    let hdr_off = if pnum == 0 { 100 } else { 0 };
-                    let type_byte = buf.get(hdr_off);
-                    if let Some(&b) = type_byte {
-                        if b == 0x0A && is_valid_btree_page(&buf, hdr_off) {
-                            all_index_leaves.insert(pnum, buf);
-                            dirty_index_count += 1;
+                match cache.read_page(pnum, &mut read_buf) {
+                    Ok(()) => {
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let type_byte = read_buf.get(hdr_off);
+                        if let Some(&b) = type_byte {
+                            if b == 0x0A && is_valid_btree_page(&read_buf, hdr_off) {
+                                all_index_leaves.insert(pnum, read_buf.clone());
+                                dirty_index_count += 1;
+                            }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("[sync] ERROR: cache.read_page({}) failed during index leaf collection: {}", pnum, e);
                     }
                 }
             }
