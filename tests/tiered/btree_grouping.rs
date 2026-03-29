@@ -157,13 +157,7 @@ fn test_write_amplification_btree_grouping() {
 }
 
 /// VACUUM + checkpoint: all pages have valid assignments, cold reader works.
-/// NOTE: Currently fails due to group encoding mismatch after VACUUM reorganizes pages.
-/// VACUUM changes page numbers but the VFS checkpoint doesn't re-walk B-trees,
-/// so the manifest's group_pages contains stale page assignments. This is a known
-/// limitation - VACUUM through the VFS with B-tree-aware grouping needs a re-walk
-/// at checkpoint time to handle page number changes.
 #[test]
-#[ignore = "VACUUM through VFS with B-tree-aware grouping needs checkpoint re-walk (known issue)"]
 fn test_vacuum_produces_correct_mapping() {
     let cache_dir = tempfile::tempdir().unwrap();
     let config = test_config("btree_vac", cache_dir.path());
