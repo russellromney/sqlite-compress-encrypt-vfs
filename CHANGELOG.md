@@ -2,6 +2,39 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
+## Midway-g: B-tree Page Group Compaction
+
+- `analyze_dead_space()`: re-walk B-trees, compare against manifest, report dead-page ratio per tree
+- `compact_btree()`: collect live pages, dense-pack into new groups of ppg size
+- `turbolite_compact()` SQL function: compact all B-trees exceeding 30% dead space threshold
+- Reuses old group IDs where possible (avoids manifest growth), async GC of replaced S3 objects
+- Cold reader verification: data readable after compaction
+- 3 integration tests: dead space reclaimed, no-op when clean, threshold respected
+
+---
+
+## Gallipoli: Local Manifest Persistence
+
+### a. Local manifest persistence
+- `LocalManifest` struct wraps `Manifest` + `dirty_groups: Vec<u64>` for unflushed page tracking
+- Atomic write via tmp + rename to `cache_dir/manifest.msgpack` on every checkpoint
+- `flush_to_s3()` clears dirty_groups after successful upload
+
+### b. Manifest source config
+- `manifest_source: Auto | S3` on TieredConfig. Auto (default): load local manifest if present, fall back to S3. S3: always fetch from S3.
+- `TURBOLITE_MANIFEST_SOURCE` env var, `turbolite_config_set('manifest_source', 'auto')` runtime toggle
+
+### c. Dirty group recovery
+- On open with Auto mode: if local manifest has dirty_groups, log warning and populate s3_dirty_groups
+- `flush_to_s3()` picks up recovered dirty groups and uploads them
+- Crash simulation test: kill after local checkpoint, restart, verify flush recovers all data
+
+### d. Packaging cleanup
+- Python package: clear `FileNotFoundError` with install instructions when .so is missing
+- `turbolite.pc.in` template for pkg-config system install discovery
+
+---
+
 ## Midway: Remove Positional Strategy + turbolite_gc() + Marathon
 
 ### Remove Positional strategy

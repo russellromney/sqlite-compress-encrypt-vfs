@@ -1,47 +1,15 @@
 # turbolite Roadmap
 
-## Thermopylae: GC + Msgpack Manifest + Autovacuum
-> After: Kursk · Before: Marathon
+## Midway (remaining): Tests
+> After: Thermopylae · Before: Somme
 
-### b. `turbolite_gc()` SQL function
-- [ ] `turbolite_gc()`: full orphan scan (list all S3 keys, diff against manifest, delete orphans), returns deleted count
-- [ ] FFI + ext_entry.c registration, same pattern as turbolite_cache_info
-- [ ] Tests: orphans cleaned up, live keys preserved, returns correct count, no-op when no orphans
+Remaining integration tests for B-Tree-Aware Page Groups (completed work in CHANGELOG).
 
----
-
-## Midway (remaining): Remove Positional + Compaction + Tests
-> After: Thermopylae · Before: Gallipoli
-
-Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
-
-### Compaction (g) -- DONE
-- [x] `analyze_dead_space()`: re-walk B-trees, compare against manifest, report dead ratio per tree
-- [x] `compact_btree()`: read live pages, dense-pack into new groups
-- [x] `turbolite_compact()` SQL function: compact all B-trees exceeding 30% dead space threshold
-- [x] GC old groups after manifest swap (async)
-- [x] Cold reader verification: data readable after compaction
-- [x] Tests: dead space reclaimed, no-op when clean, threshold respected
-
-### Remaining tests (h)
 - [ ] Re-walk B-trees at checkpoint to update mapping for new/moved pages
 - [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
 - [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
 - [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
 - [ ] VACUUM: full repack produces correct mapping
-
----
-
-## Gallipoli: Local Manifest Persistence
-> After: Midway (remaining) · Before: Somme
-
-### a-c. Completed (see CHANGELOG)
-
-Local manifest persistence, manifest source config (Auto/S3), dirty group recovery.
-
-### d. Packaging cleanup
-- [x] Python package: clear `FileNotFoundError` when .so missing
-- [x] `turbolite.pc.in` template for pkg-config system install discovery
 
 ---
 
@@ -169,51 +137,8 @@ Extend tree-level prediction with frame granularity. Instead of "fetch all of tr
 
 ---
 
-## Marne (Query Plan remaining): Benchmark
-> After: Verdun (remaining) · Before: Stalingrad
-
-- [x] `--plan-aware` flag in tiered-bench
-- [x] Before each measured query, call `run_eqp_and_parse(db, sql)` + `push_planned_accesses()` to simulate trace callback
-- [x] Compare plan-aware vs hop-schedule on all query types, cache levels none/interior/index
-- [x] `--matrix` mode: sweep 10 schedule pairs x 6 queries at cold level
-- [x] `tiered-tune` binary: connect to existing database, sweep schedules against user queries
-- [x] Storage backend comparison: S3 Express vs Tigris results documented
-
----
-
-## Stalingrad: Cache Eviction Policies
-> After: Marne (Query Plan remaining) · Before: Austerlitz
-
-Production cache management: size limits, observability, manual control, and smart eviction. Without this, a machine serving many tenant databases will grow the cache unbounded.
-
-### a. Size-based eviction
-
-Cache grows unbounded today. Add a global byte budget enforced between queries. The cache limit is "what you keep between queries," not "what you're allowed to use." Active queries and writes get whatever they need; eviction runs after.
-
-**Semantics:**
-- Eviction NEVER fires during `read_exact_at()` or active query execution
-- Eviction fires between queries (on next trace callback), on checkpoint, and on explicit `turbolite_evict()` calls
-- Cache can temporarily exceed the limit during a query; trimmed back after
-- Never evict sub-chunks containing dirty pages (any journal mode) or pending flush pages (LocalThenFlush)
-- Minimum floor: `max(all_interior_groups_size, prefetch_threads * sub_frame_size)`. Reject config below this.
-
-Between-query eviction hook is wired (step 3d in VFS read path, end-query signal via SQLITE_TRACE_PROFILE). Remaining work is the eviction logic itself:
-
-- [ ] `max_cache_bytes: Option<u64>` in TieredConfig
-- [ ] `TURBOLITE_CACHE_LIMIT` env var (e.g., `512MB`, `2GB`), parsed at VFS registration
-- [ ] `turbolite_config_set('cache_limit', '512MB')` for runtime adjustment
-- [ ] `current_cache_bytes: AtomicU64` on DiskCache, updated on write/evict
-- [ ] `is_evictable(sub_chunk)`: false if dirty, pending flush, or Pinned
-- [ ] `evict_to_budget()`: loop `evict_one()` over evictable sub-chunks until under limit
-- [ ] Wire `evict_to_budget()` into the existing between-query hook (handle.rs step 3d TODO)
-- [ ] Minimum cache floor validation at config time; warn + clamp if `cache_limit` is below floor
-- [ ] Tests: cache stays within budget between queries, temporary overshoot during scan allowed, dirty pages never evicted, pending flush pages never evicted, Pinned never evicted, budget=0 means unlimited (default), config below floor rejected
-
-### b-g. Completed (see CHANGELOG)
-
-All Stalingrad items implemented: weighted eviction (b), observability with churn detection and peak tracking (c), tier eviction + evict_query (d), checkpoint eviction (e), speculative warm (f), TieredSharedState rename (g).
-
-### Future: query cost estimation (c2) + query analysis (c3)
+## Stalingrad (remaining): Query Cost Estimation
+> After: Marne · Before: Austerlitz
 
 Diagnostic tools, not blocking production use. Build when needed.
 
