@@ -57,6 +57,7 @@ use crate::FileWalIndex;
 // --- Extracted submodules (Phase Tannenberg) ---
 mod bench;
 mod cache_tracking;
+mod compact;
 mod config;
 mod disk_cache;
 mod encoding;

@@ -13,6 +13,7 @@
 mod tiered {
     pub mod helpers;
     mod basic;
+    mod compact;
     mod data_ops;
     mod indexes;
     mod gc;
