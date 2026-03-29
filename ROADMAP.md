@@ -1,15 +1,27 @@
 # turbolite Roadmap
 
-## Midway (remaining): Tests
+## Midway (remaining): VACUUM Checkpoint Re-walk + Tests
 > After: Thermopylae · Before: Somme
 
-Remaining integration tests for B-Tree-Aware Page Groups (completed work in CHANGELOG).
+### Bug: VACUUM corrupts B-tree-aware page groups
 
-- [ ] Re-walk B-trees at checkpoint to update mapping for new/moved pages
+**Problem:** VACUUM reorganizes all page numbers, but the VFS checkpoint path doesn't re-walk B-trees. The manifest's `group_pages` contains stale page assignments from before VACUUM. When a cold reader fetches groups using the post-VACUUM manifest, the encoded group has fewer pages than `group_pages` claims, producing "short data" warnings and "file is not a database" errors.
+
+**Root cause:** `sync()` in handle.rs assigns new pages to groups using `manifest.page_location()`, which returns stale locations for pages that VACUUM renumbered. The encoded group only contains the pages that were actually dirty (the new page numbers), but `group_pages` still lists the old page numbers.
+
+**Fix: Re-walk B-trees at checkpoint when VACUUM detected.**
+
+VACUUM is detectable: it changes the database cookie (offset 24 in page 0) and typically reduces `page_count`. When detected, re-walk B-trees from page 0 and rebuild `group_pages`, `btrees`, and `page_index` before grouping dirty pages.
+
+### a-d. DONE (see CHANGELOG)
+
+VACUUM detection via schema cookie + dirty ratio. Re-walk B-trees from cache, rebuild group_pages,
+upload all repacked groups, GC old keys. Cold reader verified with index scans.
+
+### Remaining tests
 - [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
-- [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
-- [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
-- [ ] VACUUM: full repack produces correct mapping
+- [ ] VACUUM + additional writes: inserts after VACUUM land in correct groups
+- [ ] Schema cookie tracking: re-walk only triggers on VACUUM, not on normal writes
 
 ---
 

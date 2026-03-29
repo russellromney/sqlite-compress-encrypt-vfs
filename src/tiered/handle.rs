@@ -64,6 +64,14 @@ pub struct TieredHandle {
     /// B-tree names that had dirty pages this session (for write decay, applied once per flush).
     dirty_btrees: HashSet<String>,
 
+    // --- Phase Midway: VACUUM detection ---
+    /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
+    /// and VACUUM. Used to detect VACUUM and trigger B-tree re-walk at checkpoint.
+    last_schema_cookie: Option<u32>,
+    /// Old S3 keys to GC after VACUUM re-walk. Populated during VACUUM detection,
+    /// consumed during the upload phase.
+    vacuum_replaced_keys: Option<Vec<String>>,
+
     // --- Phase Stalingrad: cache eviction ---
     /// Maximum cache size in bytes. None = unlimited.
     cache_limit: Option<u64>,
@@ -287,6 +295,8 @@ impl TieredHandle {
             prediction,
             access_history,
             dirty_btrees: HashSet::new(),
+            last_schema_cookie: None,
+            vacuum_replaced_keys: None,
             cache_limit: max_cache_bytes.and_then(|n| if n == 0 { None } else { Some(n) }),
             evict_on_checkpoint,
             passthrough_file: None,
@@ -326,6 +336,8 @@ impl TieredHandle {
             prediction: None,
             access_history: None,
             dirty_btrees: HashSet::new(),
+            last_schema_cookie: None,
+            vacuum_replaced_keys: None,
             cache_limit: None,
             evict_on_checkpoint: false,
             passthrough_file: Some(RwLock::new(file)),
@@ -1349,6 +1361,27 @@ impl DatabaseHandle for TieredHandle {
         let page_size = *self.page_size.read() as u64;
         let page_num = offset / page_size;
 
+        // Phase Midway: capture schema cookie from page 0 for VACUUM detection.
+        // Read the EXISTING cookie before this write overwrites it.
+        if page_num == 0 && self.last_schema_cookie.is_none() {
+            if let Some(cache) = &self.cache {
+                let mut old_page0 = vec![0u8; page_size as usize];
+                if cache.read_page(0, &mut old_page0).is_ok() && old_page0.len() >= 28 {
+                    let cookie = u32::from_be_bytes([old_page0[24], old_page0[25], old_page0[26], old_page0[27]]);
+                    if cookie != 0 {
+                        self.last_schema_cookie = Some(cookie);
+                    }
+                }
+            }
+            // If cache didn't have page 0 yet, read from the incoming write
+            if self.last_schema_cookie.is_none() && buf.len() >= 28 {
+                let cookie = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+                if cookie != 0 {
+                    self.last_schema_cookie = Some(cookie);
+                }
+            }
+        }
+
         // Phase Verdun-i: track dirty B-tree name for write decay (once per tree per session)
         if self.prediction.is_some() && self.lock_session.active {
             if let Some(tree_name) = self.manifest.read().page_to_tree_name.get(&page_num) {
@@ -1471,8 +1504,133 @@ impl DatabaseHandle for TieredHandle {
             return Ok(());
         }
 
-        let s3 = self.s3();
-        let cache = self.disk_cache();
+        let page_size = *self.page_size.read();
+
+        // Phase Midway: detect VACUUM by checking schema cookie change.
+        // VACUUM rewrites the entire database with new page numbers.
+        // When detected, re-walk B-trees and rebuild group_pages from scratch.
+        // Done before borrowing cache/s3 to avoid borrow conflicts with self mutation.
+        {
+            let cache_arc = self.cache.as_ref().expect("cache required").clone();
+            let cache_ref = &*cache_arc;
+            if dirty_snapshot.contains(&0) && self.manifest.read().strategy == GroupingStrategy::BTreeAware {
+                let mut page0 = vec![0u8; page_size as usize];
+                if cache_ref.read_page(0, &mut page0).is_ok() && page0.len() >= 28 {
+                    let cookie = u32::from_be_bytes([page0[24], page0[25], page0[26], page0[27]]);
+                    let mut do_rewalk = false;
+                    if let Some(prev) = self.last_schema_cookie {
+                        if cookie != prev {
+                            let manifest = self.manifest.read();
+                            let dirty_ratio = dirty_snapshot.len() as f64 / manifest.page_count.max(1) as f64;
+                            if dirty_ratio > 0.5 {
+                                eprintln!(
+                                    "[sync] VACUUM detected: schema cookie {} -> {}, {:.0}% pages dirty, re-walking B-trees",
+                                    prev, cookie, dirty_ratio * 100.0,
+                                );
+                                do_rewalk = true;
+                            }
+                        }
+                    }
+                    self.last_schema_cookie = Some(cookie);
+
+                    if do_rewalk {
+                        let mut manifest = self.manifest.write();
+                        let page_count = manifest.page_count;
+
+                        let walk = crate::btree_walker::walk_all_btrees(page_count, page_size, &|pnum| {
+                            let mut buf = vec![0u8; page_size as usize];
+                            cache_ref.read_page(pnum, &mut buf).ok()?;
+                            Some(buf)
+                        });
+
+                        eprintln!(
+                            "[sync] VACUUM re-walk: {} B-trees, {} unowned pages",
+                            walk.btrees.len(), walk.unowned_pages.len(),
+                        );
+
+                        // Rebuild group_pages using import's packing logic
+                        let mut new_group_pages: Vec<Vec<u64>> = Vec::new();
+                        let mut btree_list: Vec<(&u64, &crate::btree_walker::BTreeEntry)> =
+                            walk.btrees.iter().collect();
+                        btree_list.sort_by(|a, b| b.1.pages.len().cmp(&a.1.pages.len()));
+
+                        let threshold = std::cmp::max(ppg as usize / 4, 1);
+                        let mut small_pages: Vec<u64> = Vec::new();
+
+                        for (_, entry) in &btree_list {
+                            let mut sorted_pages = entry.pages.clone();
+                            sorted_pages.sort_unstable();
+                            if sorted_pages.len() >= threshold {
+                                for chunk in sorted_pages.chunks(ppg as usize) {
+                                    new_group_pages.push(chunk.to_vec());
+                                }
+                            } else {
+                                small_pages.extend_from_slice(&sorted_pages);
+                            }
+                        }
+
+                        let mut sorted_unowned = walk.unowned_pages.clone();
+                        sorted_unowned.sort_unstable();
+                        small_pages.extend_from_slice(&sorted_unowned);
+
+                        for chunk in small_pages.chunks(ppg as usize) {
+                            new_group_pages.push(chunk.to_vec());
+                        }
+
+                        // Rebuild btrees manifest entries
+                        let mut page_to_gid: HashMap<u64, u64> = HashMap::new();
+                        for (gid, pages) in new_group_pages.iter().enumerate() {
+                            for &p in pages {
+                                page_to_gid.insert(p, gid as u64);
+                            }
+                        }
+
+                        let mut new_btrees: HashMap<u64, BTreeManifestEntry> = HashMap::new();
+                        for (&root_page, entry) in &walk.btrees {
+                            let mut gid_set: HashSet<u64> = HashSet::new();
+                            for &p in &entry.pages {
+                                if let Some(&gid) = page_to_gid.get(&p) {
+                                    gid_set.insert(gid);
+                                }
+                            }
+                            let mut gids: Vec<u64> = gid_set.into_iter().collect();
+                            gids.sort_unstable();
+                            new_btrees.insert(root_page, BTreeManifestEntry {
+                                name: entry.name.clone(),
+                                obj_type: entry.obj_type.clone(),
+                                group_ids: gids,
+                            });
+                        }
+
+                        eprintln!(
+                            "[sync] VACUUM: repacked {} pages into {} groups (was {} groups)",
+                            page_count, new_group_pages.len(), manifest.group_pages.len(),
+                        );
+
+                        // Collect old keys for GC
+                        let mut vacuum_keys: Vec<String> = manifest.page_group_keys.iter()
+                            .filter(|k| !k.is_empty()).cloned().collect();
+                        vacuum_keys.extend(manifest.interior_chunk_keys.values().cloned());
+                        vacuum_keys.extend(manifest.index_chunk_keys.values().cloned());
+
+                        // Replace manifest group state
+                        manifest.group_pages = new_group_pages;
+                        manifest.btrees = new_btrees;
+                        manifest.page_group_keys = Vec::new();
+                        manifest.interior_chunk_keys.clear();
+                        manifest.index_chunk_keys.clear();
+                        manifest.frame_tables.clear();
+                        manifest.build_page_index();
+
+                        self.vacuum_replaced_keys = Some(vacuum_keys);
+                    }
+                }
+            }
+        }
+
+        // Clone Arcs to avoid borrow conflicts with self.vacuum_replaced_keys
+        let s3 = self.s3.as_ref().expect("s3 required").clone();
+        let cache = self.cache.as_ref().expect("cache required").clone();
 
         // Assign new pages (not in page_index) to new groups before grouping
         {
@@ -1512,7 +1670,10 @@ impl DatabaseHandle for TieredHandle {
         // Track old keys being replaced (for post-checkpoint GC)
         let mut replaced_keys: Vec<String> = Vec::new();
 
-        let page_size = *self.page_size.read();
+        // Consume VACUUM old keys (populated during VACUUM detection above)
+        if let Some(vacuum_keys) = self.vacuum_replaced_keys.take() {
+            replaced_keys.extend(vacuum_keys);
+        }
 
         // Carry forward seekable encoding from the manifest.
         // If the manifest was imported with seekable format, sync re-encodes dirty
