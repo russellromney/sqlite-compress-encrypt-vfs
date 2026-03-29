@@ -15,18 +15,19 @@
 
 Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
 
-### Compaction (g)
-- [ ] Trigger: B-tree's groups have > 30% dead space, or total waste exceeds threshold
-- [ ] Repack: read all pages for B-tree, dense-pack into new groups, upload, update manifest
-- [ ] GC old groups after manifest swap
-- [ ] VACUUM triggers full repack (all page numbers change)
+### Compaction (g) -- DONE
+- [x] `analyze_dead_space()`: re-walk B-trees, compare against manifest, report dead ratio per tree
+- [x] `compact_btree()`: read live pages, dense-pack into new groups
+- [x] `turbolite_compact()` SQL function: compact all B-trees exceeding 30% dead space threshold
+- [x] GC old groups after manifest swap (async)
+- [x] Cold reader verification: data readable after compaction
+- [x] Tests: dead space reclaimed, no-op when clean, threshold respected
 
 ### Remaining tests (h)
 - [ ] Re-walk B-trees at checkpoint to update mapping for new/moved pages
 - [ ] Prefetch: root page access triggers only relevant B-tree's group fetches
 - [ ] Checkpoint: new pages packed into correct B-tree's groups, only dirty groups re-uploaded
 - [ ] Write amplification: INSERT into indexed table dirties fewer groups than positional packing
-- [ ] Compaction: dead space reclaimed, B-tree groups repacked optimally
 - [ ] VACUUM: full repack produces correct mapping
 
 ---
@@ -34,40 +35,13 @@ Remaining items from B-Tree-Aware Page Groups (completed work in CHANGELOG).
 ## Gallipoli: Local Manifest Persistence
 > After: Midway (remaining) · Before: Somme
 
-The manifest only lives in S3 and in-memory on the VFS. No local persistence. This causes two problems:
-1. **Performance:** Every `open()` hits S3 to fetch the manifest, even when the VFS has a fresh copy.
-2. **Durability bug (LocalThenFlush):** If the process dies between a local checkpoint and `flush_to_s3()`, dirty pages are on disk in the cache file but the S3 manifest doesn't reference them. On restart, the stale S3 manifest is fetched, and unflushed work is silently lost.
+### a-c. Completed (see CHANGELOG)
 
-### a. Persist manifest locally
-
-Write `manifest.msgpack` to `cache_dir/` alongside the cache file. This is the same manifest that goes to S3, plus a `dirty_groups` field for unflushed pages.
-
-- [ ] On every checkpoint (both Durable and LocalThenFlush): write manifest to `cache_dir/manifest.msgpack`
-- [ ] Include `dirty_groups: Vec<u64>` in local manifest (not in S3 manifest) for unflushed page tracking
-- [ ] On flush_to_s3(): clear dirty_groups from local manifest after successful upload
-- [ ] Test: local checkpoint writes manifest to disk, manifest contains dirty_groups
-- [ ] Test: process restart after local checkpoint, dirty_groups survive, flush_to_s3 works
-
-### b. Manifest source config
-
-- [ ] `manifest_source: Auto | S3` on TieredConfig
-  - `Auto` (default): load local manifest if present, fall back to S3. Correct for single-writer.
-  - `S3`: always fetch from S3 on open. For HA followers and multi-reader setups.
-- [ ] `TURBOLITE_MANIFEST_SOURCE` env var
-- [ ] `turbolite_config_set('manifest_source', 'auto')` runtime toggle
-- [ ] Test: Auto mode uses local on warm reconnect (zero S3 GETs on second open)
-- [ ] Test: S3 mode always fetches (S3 GET count increments on every open)
-
-### c. Dirty group recovery
-
-- [ ] On open with Auto mode: if local manifest has dirty_groups, log warning and populate s3_dirty_groups
-- [ ] `flush_to_s3()` picks up recovered dirty groups and uploads them
-- [ ] Test: crash simulation (kill after local checkpoint, restart, verify flush recovers all data)
-- [ ] Test: no dirty_groups on clean shutdown (Durable mode never has dirty_groups in local manifest)
+Local manifest persistence, manifest source config (Auto/S3), dirty group recovery.
 
 ### d. Packaging cleanup
-- [ ] Test: missing .so in Python package produces clear error message
-- [ ] pkg-config `.pc` file for system install discovery
+- [x] Python package: clear `FileNotFoundError` when .so missing
+- [x] `turbolite.pc.in` template for pkg-config system install discovery
 
 ---
 
