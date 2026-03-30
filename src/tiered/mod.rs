@@ -165,16 +165,16 @@ pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
 }
 
 /// Read the file change counter from page 0 in the disk cache.
-/// Returns the current manifest version as fallback if page 0 is not cached.
-pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32, fallback_version: u64) -> u64 {
+/// Panics if page 0 is not cached or counter is 0. A wrong version
+/// number would corrupt data on recovery (walrust would replay WAL
+/// segments over the wrong page state).
+pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32) -> u64 {
     let mut page0 = vec![0u8; page_size as usize];
-    if cache.read_page(0, &mut page0).is_ok() {
-        let counter = read_file_change_counter(&page0);
-        if counter > 0 {
-            return counter;
-        }
-    }
-    fallback_version
+    cache.read_page(0, &mut page0)
+        .expect("page 0 must be in cache at checkpoint time");
+    let counter = read_file_change_counter(&page0);
+    assert!(counter > 0, "file change counter must be > 0 at checkpoint time");
+    counter
 }
 
 // ===== Page group coordinate math =====
