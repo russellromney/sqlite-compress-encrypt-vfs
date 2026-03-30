@@ -16,6 +16,9 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "tiered")]
+use turbolite::tiered::{import_sqlite_file, TieredConfig};
+
 #[derive(Parser)]
 #[command(name = "sqlces")]
 #[command(about = "SQLite Compress Encrypt VFS management tool", long_about = None)]
@@ -119,6 +122,37 @@ enum Commands {
         #[arg(long)]
         dict_out: Option<PathBuf>,
     },
+
+    /// Import a SQLite database to S3 as turbolite page groups
+    #[cfg(feature = "tiered")]
+    Import {
+        /// Path to local SQLite database file
+        db: PathBuf,
+        /// S3 bucket name
+        #[arg(long, env = "TURBOLITE_BUCKET")]
+        bucket: String,
+        /// S3 key prefix (e.g. "databases/my-app")
+        #[arg(long, env = "TURBOLITE_PREFIX")]
+        prefix: String,
+        /// S3-compatible endpoint URL (e.g. for R2, Tigris, MinIO)
+        #[arg(long, env = "TURBOLITE_ENDPOINT")]
+        endpoint: Option<String>,
+        /// AWS region (default: auto)
+        #[arg(long, env = "AWS_REGION", default_value = "auto")]
+        region: String,
+        /// Zstd compression level (1-22)
+        #[arg(long, default_value = "3")]
+        level: i32,
+        /// Pages per page group (default 256)
+        #[arg(long, default_value = "256")]
+        pages_per_group: u32,
+        /// Pages per sub-chunk frame for seekable encoding (0 = legacy, default 4)
+        #[arg(long, default_value = "4")]
+        sub_pages_per_frame: u32,
+        /// Output manifest info as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -153,6 +187,18 @@ fn main() -> Result<()> {
         } => cmd_decrypt(&db, &password, keep_compression),
         Commands::EmbedDict { db, dict, backup } => cmd_embed_dict(&db, &dict, backup),
         Commands::ExtractDict { db, dict_out } => cmd_extract_dict(&db, dict_out),
+        #[cfg(feature = "tiered")]
+        Commands::Import {
+            db,
+            bucket,
+            prefix,
+            endpoint,
+            region,
+            level,
+            pages_per_group,
+            sub_pages_per_frame,
+            json,
+        } => cmd_import(&db, &bucket, &prefix, endpoint, &region, level, pages_per_group, sub_pages_per_frame, json),
     }
 }
 
@@ -916,6 +962,72 @@ fn cmd_extract_dict(db: &Path, dict_out: Option<PathBuf>) -> Result<()> {
     println!("Dictionary extracted successfully");
     println!("  Size: {} bytes", dict_size);
     println!("  Output: {}", out_path.display());
+
+    Ok(())
+}
+
+#[cfg(feature = "tiered")]
+fn cmd_import(
+    db: &Path,
+    bucket: &str,
+    prefix: &str,
+    endpoint: Option<String>,
+    region: &str,
+    level: i32,
+    pages_per_group: u32,
+    sub_pages_per_frame: u32,
+    json: bool,
+) -> Result<()> {
+    if !db.exists() {
+        bail!("File not found: {}", db.display());
+    }
+
+    if !is_sqlite_file(db)? {
+        bail!("Not a SQLite database: {}", db.display());
+    }
+
+    let config = TieredConfig {
+        bucket: bucket.to_string(),
+        prefix: prefix.to_string(),
+        endpoint_url: endpoint,
+        region: Some(region.to_string()),
+        compression_level: level,
+        pages_per_group,
+        sub_pages_per_frame,
+        ..Default::default()
+    };
+
+    let manifest = import_sqlite_file(&config, db)
+        .map_err(|e| anyhow!("Import failed: {}", e))?;
+
+    if json {
+        let output = serde_json::json!({
+            "version": manifest.version,
+            "page_count": manifest.page_count,
+            "page_size": manifest.page_size,
+            "pages_per_group": manifest.pages_per_group,
+            "groups": manifest.page_group_keys.len(),
+            "interior_chunks": manifest.interior_chunk_keys.len(),
+            "index_chunks": manifest.index_chunk_keys.len(),
+            "btrees": manifest.btrees.len(),
+            "seekable": manifest.sub_pages_per_frame > 0,
+            "bucket": bucket,
+            "prefix": prefix,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Import complete:");
+        println!("  Source:           {}", db.display());
+        println!("  Bucket:           {}", bucket);
+        println!("  Prefix:           {}", prefix);
+        println!("  Pages:            {}", manifest.page_count);
+        println!("  Page size:        {} bytes", manifest.page_size);
+        println!("  Groups:           {}", manifest.page_group_keys.len());
+        println!("  Interior chunks:  {}", manifest.interior_chunk_keys.len());
+        println!("  Index chunks:     {}", manifest.index_chunk_keys.len());
+        println!("  B-trees:          {}", manifest.btrees.len());
+        println!("  Seekable:         {}", manifest.sub_pages_per_frame > 0);
+    }
 
     Ok(())
 }
