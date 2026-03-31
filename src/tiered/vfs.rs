@@ -171,7 +171,7 @@ impl TieredVfs {
         }
         let pending_flushes = Arc::new(Mutex::new(recovered_staging));
 
-        Ok(Self {
+        let vfs = Self {
             s3,
             cache,
             prefetch_pool,
@@ -187,7 +187,34 @@ impl TieredVfs {
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
             runtime_handle,
-        })
+        };
+
+        // Phase Somme: WAL recovery on cold start
+        #[cfg(feature = "wal")]
+        if vfs.config.wal_replication {
+            let manifest_version = vfs.shared_manifest.read().version;
+            if manifest_version > 0 {
+                let wal_prefix = format!("{}/wal/", vfs.config.prefix);
+                let shared = vfs.shared_state();
+                match wal_replication::recover_wal_from_shared_state(
+                    &shared,
+                    &vfs.cache,
+                    manifest_version,
+                    vfs.shared_manifest.read().page_size,
+                    &wal_prefix,
+                    &vfs.config.bucket,
+                    vfs.config.endpoint_url.as_deref(),
+                    &vfs.runtime_handle,
+                    &vfs.config.cache_dir,
+                ) {
+                    Ok(0) => eprintln!("[tiered] WAL recovery: no WAL segments to replay"),
+                    Ok(n) => eprintln!("[tiered] WAL recovery: loaded {} pages from WAL", n),
+                    Err(e) => eprintln!("[tiered] WARNING: WAL recovery failed: {}", e),
+                }
+            }
+        }
+
+        Ok(vfs)
     }
 
     /// Load manifest based on ManifestSource config.
