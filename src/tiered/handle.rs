@@ -1609,10 +1609,11 @@ impl DatabaseHandle for TieredHandle {
             }
         }
 
-        // Phase Somme: use SQLite's file change counter as manifest version.
-        // Both turbolite and walrust derive version/txid from this counter,
-        // so they stay synchronized without any coordination protocol.
-        let next_version = read_change_counter_from_cache(&cache, page_size);
+        // Dual counter (Phase Borodino):
+        // - version: monotonic +1, for S3 key uniqueness
+        // - change_counter: SQLite file change counter, for walrust WAL replay
+        let next_version = self.manifest.read().version + 1;
+        let change_counter = read_change_counter_from_cache(&cache, page_size);
         let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
         let mut new_keys = self.manifest.read().page_group_keys.clone();
         // Track old keys being replaced (for post-checkpoint GC)
@@ -2010,6 +2011,7 @@ impl DatabaseHandle for TieredHandle {
         let old_manifest = self.manifest.read().clone();
         let mut new_manifest = Manifest {
             version: next_version,
+            change_counter,
             page_count: old_manifest.page_count,
             page_size: old_manifest.page_size,
             pages_per_group: ppg,
@@ -2083,12 +2085,13 @@ impl DatabaseHandle for TieredHandle {
         }
 
         // Phase Somme-e: GC old WAL segments after checkpoint.
-        // WAL segments with txid <= new manifest version are redundant.
+        // WAL segments with txid <= change_counter are in the page groups (redundant).
+        // Uses change_counter (not version) because walrust txids are file change counters.
         #[cfg(feature = "wal")]
         if self.gc_enabled {
             let gc_s3 = self.s3.as_ref().expect("s3 required").clone();
             let wal_prefix = format!("{}/wal/", gc_s3.prefix);
-            let version = next_version;
+            let version = change_counter;
             let runtime = gc_s3.runtime.clone();
             runtime.spawn(async move {
                 // List all WAL segment keys under the wal prefix

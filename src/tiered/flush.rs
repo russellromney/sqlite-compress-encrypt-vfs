@@ -148,7 +148,8 @@ fn flush_inner(
         dirty_groups.len(),
     );
 
-    let next_version = read_change_counter_from_cache(cache, manifest_snap.page_size);
+    let next_version = manifest_snap.version + 1;
+    let change_counter = read_change_counter_from_cache(cache, manifest_snap.page_size);
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();
@@ -516,6 +517,7 @@ fn flush_inner(
         let old_manifest = manifest_snap;
         let mut m = Manifest {
             version: next_version,
+            change_counter,
             page_count: old_manifest.page_count,
             page_size: old_manifest.page_size,
             pages_per_group: ppg,

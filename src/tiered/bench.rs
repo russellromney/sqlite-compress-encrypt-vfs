@@ -22,8 +22,6 @@ pub struct TieredSharedState {
     pub(super) dictionary: Option<Vec<u8>>,
     pub(super) encryption_key: Option<[u8; 32]>,
     pub(super) gc_enabled: bool,
-    pub(super) prediction: Option<prediction::SharedPrediction>,
-    pub(super) access_history: Option<prediction::SharedAccessHistory>,
 }
 
 impl TieredSharedState {
@@ -204,8 +202,6 @@ impl TieredSharedState {
             self.dictionary.as_deref(),
             self.encryption_key,
             self.gc_enabled,
-            self.access_history.as_ref(),
-            self.prediction.as_ref(),
         )
     }
 
@@ -743,13 +739,15 @@ impl TieredSharedState {
         }
 
         eprintln!(
-            "[materialize] wrote {:.1}MB to {} (version {})",
+            "[materialize] wrote {:.1}MB to {} (version {}, change_counter {})",
             total_size as f64 / (1024.0 * 1024.0),
             output.display(),
             manifest.version,
+            manifest.change_counter,
         );
 
-        Ok(manifest.version)
+        // Return change_counter for walrust WAL replay (txid > change_counter)
+        Ok(manifest.change_counter)
     }
 
     /// Full GC: list all S3 objects, diff against manifest, delete orphans.

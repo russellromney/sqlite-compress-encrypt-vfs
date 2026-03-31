@@ -5,8 +5,14 @@ use super::*;
 /// S3 manifest — updated atomically after all page group uploads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Monotonically increasing version (bumped on each checkpoint)
+    /// Monotonically increasing version (bumped +1 on each checkpoint).
+    /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
     pub version: u64,
+    /// SQLite file change counter (page 0, offset 24) at checkpoint time.
+    /// Used by walrust for WAL segment replay: replay segments with txid > change_counter.
+    /// Default 0 for backward compat (walrust replays everything).
+    #[serde(default)]
+    pub change_counter: u64,
     /// Number of pages in the database
     pub page_count: u64,
     /// Page size in bytes
@@ -73,15 +79,6 @@ pub struct Manifest {
     /// Used by per-query prefetch schedule selection (SEARCH vs default hops).
     #[serde(skip)]
     pub group_to_tree_name: HashMap<u64, String>,
-
-    /// Phase Verdun: B-tree access frequency for prediction confidence and decay.
-    /// Keyed by tree name (survives VACUUM).
-    #[serde(default)]
-    pub btree_access_freq: HashMap<String, f32>,
-
-    /// Phase Verdun-i: persisted prediction patterns (name set, confidence).
-    #[serde(default)]
-    pub prediction_patterns: Vec<(std::collections::BTreeSet<String>, f32)>,
 }
 
 fn default_strategy() -> GroupingStrategy {
@@ -150,6 +147,7 @@ impl Manifest {
     pub(crate) fn empty() -> Self {
         Self {
             version: 0,
+            change_counter: 0,
             page_count: 0,
             page_size: 0,
             pages_per_group: 0,
@@ -166,8 +164,6 @@ impl Manifest {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
-            btree_access_freq: HashMap::new(),
-            prediction_patterns: Vec::new(),
         }
     }
 

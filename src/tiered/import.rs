@@ -333,6 +333,7 @@ pub fn import_sqlite_file(
     // Build and upload manifest (Phase Midway: explicit B-tree-aware groups)
     let mut manifest = Manifest {
         version,
+        change_counter: version, // import uses the same value; walrust not relevant for import
         page_count,
         page_size,
         pages_per_group: ppg,
@@ -349,8 +350,6 @@ pub fn import_sqlite_file(
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
-        btree_access_freq: HashMap::new(),
-        prediction_patterns: Vec::new(),
     };
     manifest.build_page_index();
     s3.put_manifest(&manifest)?;

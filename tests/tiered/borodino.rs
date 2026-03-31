@@ -322,39 +322,49 @@ fn borodino_eviction_protects_pending_staging() {
 
 // ===== g. Multiple databases on same VFS =====
 
-/// Two databases on the same VFS, both using LocalThenFlush.
+/// Multiple databases require separate VFS instances (separate S3 prefixes).
+/// This test verifies that two VFS instances with LocalThenFlush work correctly
+/// when each has its own prefix.
 #[test]
-fn borodino_multi_db_same_vfs() {
-    let cache_dir = TempDir::new().unwrap();
-    let config = ltf_config("multi_db", cache_dir.path());
-    let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
+fn borodino_multi_db_separate_vfs() {
+    // DB 1: own VFS + prefix
+    let cache_dir1 = TempDir::new().unwrap();
+    let config1 = ltf_config("multi_db1", cache_dir1.path());
+    let (bucket1, prefix1, endpoint1) = (config1.bucket.clone(), config1.prefix.clone(), config1.endpoint_url.clone());
 
-    let vfs = TieredVfs::new(config).unwrap();
-    let shared = vfs.shared_state();
-    let vfs_name = unique_vfs_name("multi_db");
-    turbolite::tiered::register(&vfs_name, vfs).unwrap();
+    let vfs1 = TieredVfs::new(config1).unwrap();
+    let shared1 = vfs1.shared_state();
+    let vfs_name1 = unique_vfs_name("multi_db1");
+    turbolite::tiered::register(&vfs_name1, vfs1).unwrap();
 
-    // DB 1
-    let conn1 = open_conn(&vfs_name, "multi_db_1.db");
+    let conn1 = open_conn(&vfs_name1, "multi_db1.db");
     insert_rows(&conn1, 0, 50, "db1");
     conn1.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    shared1.flush_to_s3().unwrap();
+    drop(conn1);
 
-    // DB 2
-    let conn2 = open_conn(&vfs_name, "multi_db_2.db");
+    // DB 2: own VFS + prefix
+    let cache_dir2 = TempDir::new().unwrap();
+    let config2 = ltf_config("multi_db2", cache_dir2.path());
+    let (bucket2, prefix2, endpoint2) = (config2.bucket.clone(), config2.prefix.clone(), config2.endpoint_url.clone());
+
+    let vfs2 = TieredVfs::new(config2).unwrap();
+    let shared2 = vfs2.shared_state();
+    let vfs_name2 = unique_vfs_name("multi_db2");
+    turbolite::tiered::register(&vfs_name2, vfs2).unwrap();
+
+    let conn2 = open_conn(&vfs_name2, "multi_db2.db");
     insert_rows(&conn2, 0, 50, "db2");
     conn2.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
-
-    // Flush all
-    shared.flush_to_s3().unwrap();
-    drop(conn1);
+    shared2.flush_to_s3().unwrap();
     drop(conn2);
 
-    // Verify each DB independently
-    let cold1 = cold_reader(&bucket, &prefix, &endpoint, "multi_db_1.db");
+    // Verify each independently
+    let cold1 = cold_reader(&bucket1, &prefix1, &endpoint1, "multi_db1.db");
     let v1: String = cold1.query_row("SELECT value FROM data WHERE id = 25", [], |r| r.get(0)).unwrap();
     assert_eq!(v1, "db1_25");
 
-    let cold2 = cold_reader(&bucket, &prefix, &endpoint, "multi_db_2.db");
+    let cold2 = cold_reader(&bucket2, &prefix2, &endpoint2, "multi_db2.db");
     let v2: String = cold2.query_row("SELECT value FROM data WHERE id = 25", [], |r| r.get(0)).unwrap();
     assert_eq!(v2, "db2_25");
 }
