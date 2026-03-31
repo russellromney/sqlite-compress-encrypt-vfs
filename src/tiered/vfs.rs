@@ -27,10 +27,6 @@ pub struct TieredVfs {
     config: TieredConfig,
     /// Owned runtime (if we created one ourselves)
     _runtime: Option<tokio::runtime::Runtime>,
-    /// Phase Verdun: shared prediction table (None when prediction_enabled=false).
-    prediction: Option<prediction::SharedPrediction>,
-    /// Phase Verdun: shared access history (None when prediction_enabled=false).
-    access_history: Option<prediction::SharedAccessHistory>,
     /// Shared manifest state. Written by TieredHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
     shared_manifest: Arc<RwLock<Manifest>>,
@@ -141,19 +137,6 @@ impl TieredVfs {
             config.encryption_key,
         ));
 
-        // Phase Verdun: initialize prediction table + access history from manifest (if enabled)
-        let (prediction, access_history) = if config.prediction_enabled {
-            let table = prediction::PredictionTable::from_persisted(&manifest.prediction_patterns);
-            let mut history = prediction::AccessHistory::new();
-            history.freq = manifest.btree_access_freq.clone();
-            (
-                Some(Arc::new(RwLock::new(table))),
-                Some(Arc::new(RwLock::new(history))),
-            )
-        } else {
-            (None, None)
-        };
-
         // Shared state for two-phase checkpoint (flush_to_s3)
         let shared_manifest = Arc::new(RwLock::new(manifest));
         // Phase Gallipoli: recover dirty groups from local manifest
@@ -185,8 +168,6 @@ impl TieredVfs {
             page_count,
             config,
             _runtime: owned_runtime,
-            prediction,
-            access_history,
             shared_manifest,
             shared_dirty_groups,
             pending_flushes,
@@ -200,14 +181,17 @@ impl TieredVfs {
         // Phase Somme: WAL recovery on cold start
         #[cfg(feature = "wal")]
         if vfs.config.wal_replication {
-            let manifest_version = vfs.shared_manifest.read().version;
-            if manifest_version > 0 {
+            // Phase Borodino: use change_counter (not version) for WAL replay cutoff.
+            // change_counter = SQLite file change counter at checkpoint time.
+            // WAL segments with txid > change_counter are not yet in the page groups.
+            let manifest_cc = vfs.shared_manifest.read().change_counter;
+            if manifest_cc > 0 {
                 let wal_prefix = format!("{}/wal/", vfs.config.prefix);
                 let shared = vfs.shared_state();
                 match wal_replication::recover_wal_from_shared_state(
                     &shared,
                     &vfs.cache,
-                    manifest_version,
+                    manifest_cc,
                     vfs.shared_manifest.read().page_size,
                     &wal_prefix,
                     &vfs.config.bucket,
@@ -282,8 +266,6 @@ impl TieredVfs {
             dictionary: self.config.dictionary.clone(),
             encryption_key: self.config.encryption_key,
             gc_enabled: self.config.gc_enabled,
-            prediction: self.prediction.clone(),
-            access_history: self.access_history.clone(),
         }
     }
 
@@ -388,8 +370,6 @@ impl TieredVfs {
             self.config.dictionary.as_deref(),
             self.config.encryption_key,
             self.config.gc_enabled,
-            self.access_history.as_ref(),
-            self.prediction.as_ref(),
         )
     }
 
@@ -606,11 +586,11 @@ impl Vfs for TieredVfs {
                 if !wal.is_started() {
                     let db_path = self.config.cache_dir.join(db);
                     let wal_prefix = format!("{}/wal/", self.config.prefix);
-                    let manifest_version = self.shared_manifest.read().version;
+                    let manifest_cc = self.shared_manifest.read().change_counter;
                     if let Err(e) = wal.start(
                         db_path,
                         wal_prefix,
-                        manifest_version,
+                        manifest_cc,
                         self.config.wal_sync_interval_ms,
                         self.config.bucket.clone(),
                         self.config.endpoint_url.clone(),
@@ -642,8 +622,6 @@ impl Vfs for TieredVfs {
                 #[cfg(feature = "zstd")]
                 self.config.dictionary.as_deref(),
                 self.config.encryption_key,
-                self.prediction.clone(),
-                self.access_history.clone(),
                 self.config.query_plan_prefetch,
                 self.config.max_cache_bytes,
                 self.config.evict_on_checkpoint,

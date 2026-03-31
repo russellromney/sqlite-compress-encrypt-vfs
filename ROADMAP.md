@@ -5,27 +5,58 @@
 
 Blocking bugs and untested interactions discovered during Kursk stress testing. Each subsection is a specific issue with a failing test that must pass before shipping.
 
-### a. Version counter: file change counter produces duplicate versions in WAL mode
+### a. Dual counter: manifest.version (S3 keys) + manifest.change_counter (walrust)
 
-**Problem:** In WAL mode, SQLite does not guarantee the file change counter (page 0, offset 24) increments on every transaction. The counter may stay the same across consecutive checkpoints. This causes duplicate S3 keys (`pg/0_v2` written twice), and GC deletes "old" versions that are actually the current version.
+**Problem:** In WAL mode, SQLite's file change counter (page 0, offset 24) may not increment on every checkpoint. Using it as the S3 key version causes duplicate keys (`pg/0_v2` written twice), and GC deletes "old" versions that are actually current.
 
-**Failing tests:**
-- [ ] `test_manifest_version_increments`: two INSERT batches + checkpoints produce v1=2, v2=2
-- [ ] `test_gc_disabled_preserves_old_versions`: same version means GC can't distinguish old from current
-- [ ] `test_materialize_after_multiple_checkpoints`: materialize fetches `pg/0_v2` which GC deleted
-- [ ] `test_materialize_after_vfs_writes`: same root cause
+**Root cause:** turbolite and walrust need different things from the version number:
+- turbolite needs a unique-per-checkpoint number for S3 key deduplication. `version + 1` is perfect.
+- walrust needs to know which transactions are already in the page groups, so it can replay only WAL segments after that point. The file change counter answers this.
 
-**Fix:** Use both counters. `manifest.version` stays monotonic (`version + 1`) for S3 key uniqueness. Add `manifest.change_counter` field that stores the file change counter for walrust WAL segment replay. S3 keys use `manifest.version`. walrust uses `manifest.change_counter`.
+These are independent concerns. One number can't serve both.
 
-### b. Walrust sync after version fix
+**Fix: dual counter.**
+- `manifest.version`: monotonic `version + 1`. Used for S3 keys (`pg/0_v{version}`). Never reused.
+- `manifest.change_counter`: SQLite file change counter from page 0 at checkpoint time. Used by walrust to determine WAL replay window (`replay segments with txid > change_counter`).
 
-**Problem:** Somme designed `manifest.version = file change counter` so walrust knows which WAL segments to replay. Splitting into two fields means walrust must use `manifest.change_counter` instead of `manifest.version`. Cold start flow: `restore_with_snapshot_source()` replays WAL segments with txid > `manifest.change_counter`.
+**Safety:** WAL replay is always safe to over-replay (idempotent), never under-replay. If `change_counter` is stale (same value for two checkpoints), walrust replays extra segments (wasted work, not data loss). `change_counter` can never jump ahead of what's in the page groups because it's read from the same page 0 in the checkpoint.
+
+**Implementation:**
+- [ ] Add `change_counter: u64` to `Manifest` struct (serde, default 0 for backward compat)
+- [ ] In `sync()` durable path: `next_version = manifest.version + 1`, read change counter from cache, store both
+- [ ] In `flush_to_s3()`: `next_version = manifest_snap.version + 1` (not change counter)
+- [ ] In `sync()` LocalThenFlush path: no change (version assigned at flush time)
+- [ ] `page_group_key(gid, next_version)` uses `manifest.version` (already correct)
+- [ ] Backward compat: old manifests with `change_counter = 0` work fine (walrust replays everything)
+
+**Failing tests (must pass after fix):**
+- [ ] `borodino_version_increments_per_checkpoint`: v1 != v2 after two checkpoints
+- [ ] `borodino_gc_does_not_delete_current_version`: GC deletes v(N-1) keys, not v(N)
+- [ ] `test_manifest_version_increments`: existing test, same fix
+- [ ] `test_gc_disabled_preserves_old_versions`: existing test, same fix
+- [ ] `test_materialize_after_multiple_checkpoints`: correct S3 key after fix
+- [ ] `test_materialize_after_vfs_writes`: same
+
+### b. Walrust uses manifest.change_counter for WAL replay
+
+**Problem:** Somme's `materialize_to_file` and `restore_with_snapshot_source` use `manifest.version` as the snapshot version for WAL replay. After the dual counter fix, walrust must use `manifest.change_counter` instead.
+
+**Cold start flow:**
+1. Fetch manifest. `change_counter = N`.
+2. `materialize_to_file()` from page groups. DB at state N.
+3. walrust `restore_with_snapshot_source()` replays WAL segments with `txid > N`.
+4. Checkpoint (turbolite uploads dirty pages, walrust GCs old segments).
+
+**Implementation:**
+- [ ] `materialize_to_file()` returns `manifest.change_counter` (not `manifest.version`)
+- [ ] WAL recovery in `TieredVfs::new()` uses `manifest.change_counter` for replay cutoff
+- [ ] WAL segment GC after checkpoint uses `manifest.change_counter`
 
 **Tests (require `wal` feature):**
-- [ ] WAL segment replay uses `change_counter`, not `version`, for txid comparison
-- [ ] After checkpoint, `manifest.change_counter` matches `PRAGMA data_version` or file change counter
-- [ ] Cold start with WAL segments: replays correct segments based on `change_counter`
 - [ ] `change_counter` survives manifest roundtrip (serialize/deserialize)
+- [ ] After checkpoint, `manifest.change_counter` matches file change counter from page 0
+- [ ] Cold start with WAL segments: replays correct segments based on `change_counter`
+- [ ] WAL segment GC deletes segments with txid <= `change_counter`
 
 ### c. Encryption + staging log interaction
 
