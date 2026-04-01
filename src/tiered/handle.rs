@@ -728,6 +728,62 @@ impl TieredHandle {
         }
     }
 
+    /// Phase Jena-f: on interior page read, prefetch sibling interior page groups.
+    ///
+    /// For very large databases where interior pages span multiple groups,
+    /// this prevents a blocking fault when SQLite descends to the next
+    /// interior page. Only fires for pages that ARE interior pages and
+    /// whose siblings are in different groups.
+    fn try_interior_lookahead(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
+        let hdr_off = if page_num == 0 { 100 } else { 0 };
+        let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
+        if type_byte != 0x05 && type_byte != 0x02 {
+            return; // not an interior page
+        }
+
+        // Find siblings of this interior page (they share the same parent)
+        let sibling_groups = self.interior_map.sibling_groups(page_num);
+        if sibling_groups.is_empty() {
+            return;
+        }
+
+        let pool = match &self.prefetch_pool {
+            Some(p) => p,
+            None => return,
+        };
+        let manifest = self.manifest.read();
+        let ps = manifest.page_size;
+        let sub_ppf = manifest.sub_pages_per_frame;
+
+        let mut submitted = 0usize;
+        for &gid in &sibling_groups {
+            if cache.group_state(gid) != GroupState::None { continue; }
+            if !cache.try_claim_group(gid) { continue; }
+            if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                if !key.is_empty() {
+                    let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
+                    let gp = manifest.group_page_nums(gid).into_owned();
+                    if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                        submitted += 1;
+                    } else {
+                        cache.unclaim_group(gid);
+                    }
+                } else {
+                    cache.unclaim_group(gid);
+                }
+            } else {
+                cache.unclaim_group(gid);
+            }
+        }
+
+        if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "  [jena-lookahead] interior page={} prefetched {} sibling interior groups",
+                page_num, submitted,
+            );
+        }
+    }
+
     /// Phase Jena-e: detect overflow in a leaf page and prefetch overflow page groups.
     fn try_overflow_prefetch(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
         let page_size = *self.page_size.read();
@@ -1178,6 +1234,7 @@ impl DatabaseHandle for TieredHandle {
             self.detect_interior_page(buf, page_num, cache);
             self.try_leaf_chase(buf, page_num, &cache_arc);
             self.try_overflow_prefetch(buf, page_num, &cache_arc);
+            self.try_interior_lookahead(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
