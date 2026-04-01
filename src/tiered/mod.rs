@@ -67,6 +67,7 @@ mod import;
 mod interior_map;
 mod leaf_chaser;
 mod record_parser;
+mod schema;
 mod manifest;
 mod prediction;
 mod prefetch;

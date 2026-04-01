@@ -86,6 +86,11 @@ pub struct TieredHandle {
     interior_map: interior_map::InteriorMap,
     /// Counter for interior page writes since last map rebuild.
     interior_writes_since_rebuild: u32,
+    /// Phase Jena-d: chase rules for cross-tree leaf prefetch.
+    /// Built from schema info + query plan on first query.
+    chase_rules: Vec<leaf_chaser::ChaseRule>,
+    /// Schema info (table/index column names). Populated from global cache on first query.
+    schema_info: Option<schema::SchemaInfo>,
 
     // --- Passthrough mode (WAL/journal) ---
     passthrough_file: Option<RwLock<File>>,
@@ -327,6 +332,8 @@ impl TieredHandle {
             staging_dir,
             interior_map,
             interior_writes_since_rebuild: 0,
+            chase_rules: Vec::new(),
+            schema_info: None,
             passthrough_file: None,
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -370,6 +377,8 @@ impl TieredHandle {
             staging_dir: PathBuf::new(),
             interior_map: interior_map::InteriorMap::default(),
             interior_writes_since_rebuild: 0,
+            chase_rules: Vec::new(),
+            schema_info: None,
             passthrough_file: Some(RwLock::new(file)),
             lock: RwLock::new(LockKind::None),
             db_path,
@@ -623,6 +632,100 @@ impl TieredHandle {
             unassigned.len(),
             manifest.group_pages.len(),
         );
+    }
+
+    /// Phase Jena-d: attempt cross-tree leaf chasing after reading a leaf page.
+    ///
+    /// If chase rules exist for the current tree, parse the leaf page,
+    /// extract join column values, predict target leaf groups, and submit
+    /// them for prefetch.
+    fn try_leaf_chase(&mut self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
+        if self.chase_rules.is_empty() {
+            return;
+        }
+
+        let hdr_off = if page_num == 0 { 100 } else { 0 };
+        let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
+
+        // Only chase from leaf pages (0x0D = table leaf, 0x0A = index leaf)
+        let is_table_leaf = type_byte == 0x0D;
+        let is_index_leaf = type_byte == 0x0A;
+        if !is_table_leaf && !is_index_leaf {
+            return;
+        }
+
+        // Find which tree this page belongs to
+        let manifest = self.manifest.read();
+        let tree_name = manifest.group_to_tree_name
+            .get(&manifest.page_location(page_num).map(|l| l.group_id).unwrap_or(u64::MAX))
+            .cloned();
+        drop(manifest);
+
+        let tree_name = match tree_name {
+            Some(n) => n,
+            None => return,
+        };
+
+        // Check all chase rules for this source tree
+        let pool = match &self.prefetch_pool {
+            Some(p) => Arc::clone(p),
+            None => return,
+        };
+        let manifest = self.manifest.read().clone();
+        let ps = manifest.page_size;
+        let sub_ppf = manifest.sub_pages_per_frame;
+
+        for rule in &self.chase_rules {
+            if rule.source_tree != tree_name {
+                continue;
+            }
+
+            // Extract chase keys from the leaf page
+            let keys = leaf_chaser::extract_chase_keys(
+                buf, hdr_off, rule.col_index, is_table_leaf, 64, // max 64 keys per page
+            );
+            if keys.is_empty() {
+                continue;
+            }
+
+            // Predict target groups
+            let groups = leaf_chaser::chase_predict_groups(
+                &keys, rule.target_root_page, &self.interior_map,
+            );
+
+            // Submit for prefetch
+            let mut submitted = 0usize;
+            for gid in &groups {
+                if cache.group_state(*gid) != GroupState::None {
+                    continue;
+                }
+                if !cache.try_claim_group(*gid) {
+                    continue;
+                }
+                if let Some(key) = manifest.page_group_keys.get(*gid as usize) {
+                    if !key.is_empty() {
+                        let ft = manifest.frame_tables.get(*gid as usize).cloned().unwrap_or_default();
+                        let gp = manifest.group_page_nums(*gid).into_owned();
+                        if pool.submit(*gid, key.clone(), ft, ps, sub_ppf, gp) {
+                            submitted += 1;
+                        } else {
+                            cache.unclaim_group(*gid);
+                        }
+                    } else {
+                        cache.unclaim_group(*gid);
+                    }
+                } else {
+                    cache.unclaim_group(*gid);
+                }
+            }
+
+            if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+                eprintln!(
+                    "  [jena-chase] {} -> {}: {} keys, {} groups predicted, {} submitted",
+                    rule.source_tree, rule.target_tree, keys.len(), groups.len(), submitted,
+                );
+            }
+        }
     }
 
     /// Ensure interior map is up to date before making prefetch decisions.
@@ -951,6 +1054,26 @@ impl DatabaseHandle for TieredHandle {
                         self.search_trees.insert(access.tree_name.clone());
                     }
                 }
+
+                // Phase Jena-d: build chase rules from plan + schema.
+                // Take schema info from global cache (pushed by extension trace callback).
+                if self.schema_info.is_none() {
+                    self.schema_info = schema::take_schema();
+                }
+                if let Some(ref schema) = self.schema_info {
+                    self.chase_rules = leaf_chaser::build_chase_rules(
+                        &planned,
+                        &schema.tree_roots,
+                        &schema.index_columns,
+                        &schema.table_columns,
+                    );
+                    if !self.chase_rules.is_empty() && std::env::var("BENCH_VERBOSE").is_ok() {
+                        eprintln!(
+                            "  [jena-chase] built {} chase rules from {} planned accesses",
+                            self.chase_rules.len(), planned.len(),
+                        );
+                    }
+                }
                 if std::env::var("BENCH_VERBOSE").is_ok() {
                     let manifest_snap = self.manifest.read();
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
@@ -1005,6 +1128,7 @@ impl DatabaseHandle for TieredHandle {
             self.reset_misses(current_tree_name.as_ref());
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
+            self.try_leaf_chase(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
