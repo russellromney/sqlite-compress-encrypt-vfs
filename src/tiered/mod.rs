@@ -66,6 +66,7 @@ mod handle;
 mod import;
 mod interior_map;
 mod leaf_chaser;
+mod overflow;
 mod record_parser;
 mod schema;
 mod manifest;

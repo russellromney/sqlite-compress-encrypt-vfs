@@ -728,6 +728,54 @@ impl TieredHandle {
         }
     }
 
+    /// Phase Jena-e: detect overflow in a leaf page and prefetch overflow page groups.
+    fn try_overflow_prefetch(&self, buf: &[u8], page_num: u64, cache: &Arc<DiskCache>) {
+        let page_size = *self.page_size.read();
+        if page_size == 0 { return; }
+
+        let overflow_pages = overflow::detect_overflow_pages(buf, page_num, page_size);
+        if overflow_pages.is_empty() { return; }
+
+        let pool = match &self.prefetch_pool {
+            Some(p) => p,
+            None => return,
+        };
+        let manifest = self.manifest.read();
+        let ps = manifest.page_size;
+        let sub_ppf = manifest.sub_pages_per_frame;
+
+        let mut submitted = 0usize;
+        for ovfl_page in &overflow_pages {
+            if let Some(loc) = manifest.page_location(*ovfl_page) {
+                let gid = loc.group_id;
+                if cache.group_state(gid) != GroupState::None { continue; }
+                if !cache.try_claim_group(gid) { continue; }
+                if let Some(key) = manifest.page_group_keys.get(gid as usize) {
+                    if !key.is_empty() {
+                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
+                        let gp = manifest.group_page_nums(gid).into_owned();
+                        if pool.submit(gid, key.clone(), ft, ps, sub_ppf, gp) {
+                            submitted += 1;
+                        } else {
+                            cache.unclaim_group(gid);
+                        }
+                    } else {
+                        cache.unclaim_group(gid);
+                    }
+                } else {
+                    cache.unclaim_group(gid);
+                }
+            }
+        }
+
+        if submitted > 0 && std::env::var("BENCH_VERBOSE").is_ok() {
+            eprintln!(
+                "  [jena-overflow] page={} detected {} overflow pages, submitted {} groups",
+                page_num, overflow_pages.len(), submitted,
+            );
+        }
+    }
+
     /// Ensure interior map is up to date before making prefetch decisions.
     /// Rebuilds if interior pages were written since last rebuild.
     fn ensure_interior_map_fresh(&mut self) {
@@ -1129,6 +1177,7 @@ impl DatabaseHandle for TieredHandle {
             cache.read_page(page_num, buf)?;
             self.detect_interior_page(buf, page_num, cache);
             self.try_leaf_chase(buf, page_num, &cache_arc);
+            self.try_overflow_prefetch(buf, page_num, &cache_arc);
             cache.touch_group(gid);
             cache.stat_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
