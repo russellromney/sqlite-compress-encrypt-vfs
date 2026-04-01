@@ -92,7 +92,10 @@ def test_s3_requires_bucket():
 
 
 if __name__ == "__main__":
-    test_local_basic_crud()
+    # S3 write test must run FIRST: the extension init only runs once per
+    # process, and TURBOLITE_BUCKET must be set before loading to register
+    # turbolite-s3. Local mode works regardless of load order.
     test_s3_write_read()
+    test_local_basic_crud()
     test_s3_requires_bucket()
     print("\nAll tests passed!")
