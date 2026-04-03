@@ -7,8 +7,8 @@ use super::*;
 
 /// Lightweight handle for benchmarking -- shares the same S3 client, cache,
 /// manifest, and dirty groups as the VFS.
-/// Obtained via [`TieredVfs::shared_state`] before registering the VFS.
-pub struct TieredSharedState {
+/// Obtained via [`TurboliteVfs::shared_state`] before registering the VFS.
+pub struct TurboliteSharedState {
     pub(super) s3: Arc<S3Client>,
     pub(super) cache: Arc<DiskCache>,
     pub(super) prefetch_pool: Arc<PrefetchPool>,
@@ -24,7 +24,7 @@ pub struct TieredSharedState {
     pub(super) gc_enabled: bool,
 }
 
-impl TieredSharedState {
+impl TurboliteSharedState {
     /// Evict data pages only -- interior B-tree pages and group 0 stay warm.
     /// Simulates production where structural pages are always hot.
     ///
@@ -224,7 +224,7 @@ impl TieredSharedState {
     }
 
     /// Upload locally-checkpointed dirty pages to S3 without holding any SQLite lock.
-    /// See [`TieredVfs::flush_to_s3`] for full documentation.
+    /// See [`TurboliteVfs::flush_to_s3`] for full documentation.
     pub fn flush_to_s3(&self) -> io::Result<()> {
         let _guard = self.flush_lock.lock().unwrap();
         flush::flush_dirty_groups_to_s3(

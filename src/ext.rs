@@ -34,7 +34,7 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
 #[cfg(feature = "cloud")]
-static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TieredSharedState> = std::sync::OnceLock::new();
+static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TurboliteSharedState> = std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
@@ -80,7 +80,7 @@ fn register_local() -> Result<(), std::io::Error> {
 #[cfg(feature = "cloud")]
 fn register_tiered() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
-    use crate::tiered::{TieredConfig, TieredVfs};
+    use crate::tiered::{TurboliteConfig, TurboliteVfs};
 
     let bucket = std::env::var("TURBOLITE_BUCKET")
         .expect("TURBOLITE_BUCKET must be set for tiered mode");
@@ -107,7 +107,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
         .map(|s| s == "1" || s == "true")
         .unwrap_or(false);
 
-    let mut config = TieredConfig {
+    let mut config = TurboliteConfig {
         bucket,
         prefix,
         cache_dir,
@@ -121,7 +121,7 @@ fn register_tiered() -> Result<(), std::io::Error> {
         config.prefetch_threads = prefetch_threads;
     }
 
-    let vfs = TieredVfs::new(config)?;
+    let vfs = TurboliteVfs::new(config)?;
     let _ = BENCH_HANDLE.set(vfs.shared_state());
     crate::tiered::register("turbolite-s3", vfs)
 }

@@ -1,12 +1,12 @@
 use super::*;
 
-// ===== TieredHandle =====
+// ===== TurboliteHandle =====
 
 /// Database handle for tiered S3-backed storage.
 ///
 /// MainDb files are backed by S3 with a local page-level cache.
 /// WAL/journal files are passthrough to local disk.
-pub struct TieredHandle {
+pub struct TurboliteHandle {
     // --- Tiered mode (MainDb) ---
     s3: Option<Arc<S3Client>>,
     /// Unified storage client for local page group flush (local mode only).
@@ -45,6 +45,9 @@ pub struct TieredHandle {
     encoder_dict: Option<zstd::dict::EncoderDictionary<'static>>,
     #[cfg(feature = "zstd")]
     decoder_dict: Option<zstd::dict::DecoderDictionary<'static>>,
+    /// Raw dictionary bytes for local flush (EncoderDictionary is not Clone).
+    #[cfg(feature = "zstd")]
+    dictionary_bytes: Option<Vec<u8>>,
 
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
@@ -107,7 +110,7 @@ const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
 
-impl TieredHandle {
+impl TurboliteHandle {
     /// Create a tiered handle backed by S3 + local page cache.
     pub(crate) fn new_tiered(
         s3: Option<Arc<S3Client>>,
@@ -321,6 +324,8 @@ impl TieredHandle {
             encoder_dict,
             #[cfg(feature = "zstd")]
             decoder_dict,
+            #[cfg(feature = "zstd")]
+            dictionary_bytes: dictionary.map(|d| d.to_vec()),
             query_plan_prefetch,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
@@ -369,6 +374,8 @@ impl TieredHandle {
             encoder_dict: None,
             #[cfg(feature = "zstd")]
             decoder_dict: None,
+            #[cfg(feature = "zstd")]
+            dictionary_bytes: None,
             query_plan_prefetch: false,
             last_schema_cookie: None,
             vacuum_replaced_keys: None,
@@ -980,7 +987,7 @@ impl TieredHandle {
 
 }
 
-impl DatabaseHandle for TieredHandle {
+impl DatabaseHandle for TurboliteHandle {
     type WalIndex = FileWalIndex;
 
     fn size(&self) -> Result<u64, io::Error> {
@@ -1266,7 +1273,7 @@ impl DatabaseHandle for TieredHandle {
                             let has_ft = manifest.sub_pages_per_frame > 0
                                 && ft.map(|f| !f.is_empty()).unwrap_or(false);
 
-                            if has_ft {
+                            let decoded_ok = if has_ft {
                                 if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
                                     &pg_data,
                                     ft.expect("checked above"),
@@ -1281,7 +1288,8 @@ impl DatabaseHandle for TieredHandle {
                                     cache.write_pages_scattered(
                                         &pages_in_group, &bulk_data, gid, 0,
                                     )?;
-                                }
+                                    true
+                                } else { false }
                             } else if let Ok((_pc, _ps, bulk_data)) = decode_page_group_bulk(
                                 &pg_data,
                                 #[cfg(feature = "zstd")]
@@ -1291,10 +1299,13 @@ impl DatabaseHandle for TieredHandle {
                                 cache.write_pages_scattered(
                                     &pages_in_group, &bulk_data, gid, 0,
                                 )?;
-                            }
+                                true
+                            } else { false };
 
-                            cache.mark_group_present(gid);
-                            cache.touch_group(gid);
+                            if decoded_ok {
+                                cache.mark_group_present(gid);
+                                cache.touch_group(gid);
+                            }
 
                             // Now read the page from cache
                             if cache.is_present(page_num) {
@@ -1629,7 +1640,7 @@ impl DatabaseHandle for TieredHandle {
         if self.read_only {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "TieredHandle is read-only",
+                "TurboliteHandle is read-only",
             ));
         }
 
@@ -1712,6 +1723,16 @@ impl DatabaseHandle for TieredHandle {
             }
             if manifest.pages_per_group == 0 {
                 manifest.pages_per_group = self.pages_per_group;
+            }
+            // Seed sub_pages_per_frame from DiskCache config so local and cloud
+            // produce identical page group encoding (seekable multi-frame format).
+            if manifest.sub_pages_per_frame == 0 {
+                if let Some(cache) = &self.cache {
+                    let spf = cache.sub_pages_per_frame;
+                    if spf > 0 {
+                        manifest.sub_pages_per_frame = spf;
+                    }
+                }
             }
 
             // Ensure group states capacity for new groups
@@ -1798,7 +1819,7 @@ impl DatabaseHandle for TieredHandle {
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
-            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} groups pending S3", n, interior_found, total_interior, pending_groups_snapshot.len());
+            eprintln!("[sync] local-only checkpoint: {} pages, {} interior this batch, {} interior total, {} dirty groups", n, interior_found, total_interior, pending_groups_snapshot.len());
 
             // Phase Kursk: finalize staging log (fsync + close) and push PendingFlush.
             // The staging log captured exact page contents during write_all_at(),
@@ -1844,7 +1865,7 @@ impl DatabaseHandle for TieredHandle {
                     &self.pending_flushes,
                     self.compression_level,
                     #[cfg(feature = "zstd")]
-                    None, // TODO: pass dictionary raw bytes when available on handle
+                    self.dictionary_bytes.as_deref(),
                     self.encryption_key,
                 )?;
             }

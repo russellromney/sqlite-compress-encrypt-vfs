@@ -228,7 +228,7 @@ pub extern "C" fn turbolite_register_tiered(
     let endpoint_url = nullable_cstr_to_option(endpoint_url);
     let region = nullable_cstr_to_option(region);
 
-    let config = crate::tiered::TieredConfig {
+    let config = crate::tiered::TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         cache_dir: std::path::PathBuf::from(cache_dir),
@@ -237,7 +237,7 @@ pub extern "C" fn turbolite_register_tiered(
         ..Default::default()
     };
 
-    let vfs = match crate::tiered::TieredVfs::new(config) {
+    let vfs = match crate::tiered::TurboliteVfs::new(config) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(&format!("tiered vfs creation failed: {}", e));

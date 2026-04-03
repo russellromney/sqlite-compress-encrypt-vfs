@@ -22,9 +22,9 @@ use crate::compress;
 /// **Offline operation**: close all connections before rotating. Open connections
 /// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
 /// keys, uncached reads from stale connections will fail with NotFound.
-#[cfg(feature = "encryption")]
+#[cfg(all(feature = "encryption", feature = "cloud"))]
 pub fn rotate_encryption_key(
-    config: &TieredConfig,
+    config: &TurboliteConfig,
     new_key: Option<[u8; 32]>,
 ) -> io::Result<()> {
     if config.is_local() {
@@ -68,7 +68,7 @@ pub fn rotate_encryption_key(
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let handle = runtime.handle().clone();
 
-    let s3_cfg = TieredConfig {
+    let s3_cfg = TurboliteConfig {
         bucket: config.bucket.clone(),
         prefix: config.prefix.clone(),
         endpoint_url: config.endpoint_url.clone(),

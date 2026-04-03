@@ -15,7 +15,7 @@ use super::*;
 ///
 /// Returns the manifest that was uploaded.
 pub fn import_sqlite_file(
-    config: &TieredConfig,
+    config: &TurboliteConfig,
     file_path: &Path,
 ) -> io::Result<Manifest> {
     use std::os::unix::fs::FileExt;
@@ -25,7 +25,7 @@ pub fn import_sqlite_file(
     let handle = runtime.handle().clone();
 
     // Build a minimal config for S3Client
-    let s3_cfg = TieredConfig {
+    let s3_cfg = TurboliteConfig {
         bucket: config.bucket.clone(),
         prefix: config.prefix.clone(),
         endpoint_url: config.endpoint_url.clone(),

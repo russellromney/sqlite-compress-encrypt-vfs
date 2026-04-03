@@ -616,10 +616,41 @@ pub(crate) fn flush_local_groups(
         return Ok(());
     }
 
+    // Run inner flush, restoring drained state on error (same pattern as flush_to_s3)
+    let result = flush_local_inner(
+        storage, cache, shared_manifest, compression_level,
+        #[cfg(feature = "zstd")] dictionary,
+        encryption_key,
+        &flushes, &legacy_dirty,
+    );
+
+    if let Err(ref e) = result {
+        eprintln!("[flush-local] ERROR: flush failed, restoring pending state: {}", e);
+        if !flushes.is_empty() {
+            pending_flushes.lock().unwrap().extend(flushes);
+        }
+        if !legacy_dirty.is_empty() {
+            shared_dirty_groups.lock().unwrap().extend(legacy_dirty);
+        }
+    }
+
+    result
+}
+
+fn flush_local_inner(
+    storage: &StorageClient,
+    cache: &DiskCache,
+    shared_manifest: &RwLock<Manifest>,
+    compression_level: i32,
+    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
+    encryption_key: Option<[u8; 32]>,
+    flushes: &[staging::PendingFlush],
+    legacy_dirty: &HashSet<u64>,
+) -> io::Result<()> {
     // 2. Read staged pages
     let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
-    for flush_entry in &flushes {
+    for flush_entry in flushes {
         let pages = staging::read_staging_log(
             &flush_entry.staging_path,
             flush_entry.page_size,
@@ -646,7 +677,7 @@ pub(crate) fn flush_local_groups(
         .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
 
     // 5. Determine dirty groups
-    let mut dirty_groups: HashSet<u64> = legacy_dirty;
+    let mut dirty_groups: HashSet<u64> = legacy_dirty.clone();
     for &pnum in staged_pages.keys() {
         if let Some(loc) = manifest_snap.page_location(pnum) {
             dirty_groups.insert(loc.group_id);
