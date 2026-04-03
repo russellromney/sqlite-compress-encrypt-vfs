@@ -280,21 +280,21 @@ fn test_local_atomic_write() {
 
 #[test]
 fn test_storage_backend_default_is_local() {
-    let config = TieredConfig::default();
+    let config = TurboliteConfig::default();
     assert!(matches!(config.storage_backend, StorageBackend::Local));
     assert!(config.is_local());
 }
 
 #[test]
 fn test_effective_backend_local_with_empty_bucket() {
-    let config = TieredConfig::default();
+    let config = TurboliteConfig::default();
     assert!(matches!(config.effective_backend(), StorageBackend::Local));
 }
 
 #[cfg(feature = "cloud")]
 #[test]
 fn test_effective_backend_auto_upgrade_with_bucket() {
-    let mut config = TieredConfig::default();
+    let mut config = TurboliteConfig::default();
     config.bucket = "my-bucket".to_string();
     config.prefix = "my-prefix".to_string();
 
@@ -310,7 +310,7 @@ fn test_effective_backend_auto_upgrade_with_bucket() {
 #[cfg(feature = "cloud")]
 #[test]
 fn test_effective_backend_explicit_s3() {
-    let mut config = TieredConfig::default();
+    let mut config = TurboliteConfig::default();
     config.storage_backend = StorageBackend::S3 {
         bucket: "explicit-bucket".to_string(),
         prefix: "explicit-prefix".to_string(),

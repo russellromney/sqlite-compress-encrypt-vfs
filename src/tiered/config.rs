@@ -66,7 +66,7 @@ pub enum SyncMode {
     /// - Process crash: data survives (on local disk)
     /// - Machine loss: data lost (not yet on S3)
     ///
-    /// Call `flush_to_s3()` (on TieredVfs or TieredSharedState) to upload.
+    /// Call `flush_to_s3()` (on TurboliteVfs or TurboliteSharedState) to upload.
     LocalThenFlush,
 }
 
@@ -117,7 +117,7 @@ pub enum GroupState {
 /// The top-level `bucket`/`prefix` fields are kept for backward compatibility;
 /// if `storage_backend` is Local and `bucket` is non-empty, the VFS will
 /// auto-upgrade to S3 mode.
-pub struct TieredConfig {
+pub struct TurboliteConfig {
     /// Storage backend: Local (default) or S3.
     pub storage_backend: StorageBackend,
     /// S3 bucket name (legacy; prefer StorageBackend::S3)
@@ -231,7 +231,7 @@ pub struct TieredConfig {
     pub wal_sync_interval_ms: u64,
 }
 
-impl Default for TieredConfig {
+impl Default for TurboliteConfig {
     fn default() -> Self {
         Self {
             storage_backend: StorageBackend::default(),
@@ -303,7 +303,7 @@ impl Default for TieredConfig {
     }
 }
 
-impl TieredConfig {
+impl TurboliteConfig {
     /// Resolve the effective storage backend.
     /// If `storage_backend` is explicitly S3, use it.
     /// If Local but `bucket` is non-empty, auto-upgrade to S3 (backward compat).

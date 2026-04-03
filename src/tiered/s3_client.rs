@@ -30,7 +30,7 @@ pub(crate) struct S3Client {
 #[cfg(feature = "cloud")]
 impl S3Client {
     /// Create a new S3 client.
-    pub(crate) async fn new_async(config: &TieredConfig) -> io::Result<Self> {
+    pub(crate) async fn new_async(config: &TurboliteConfig) -> io::Result<Self> {
         eprintln!("[s3] new_async: loading aws_config...");
         let mut aws_config = aws_config::from_env();
 
@@ -61,7 +61,7 @@ impl S3Client {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    "No tokio runtime available. Pass runtime_handle in TieredConfig \
+                    "No tokio runtime available. Pass runtime_handle in TurboliteConfig \
                      or call from within a tokio context.",
                 )
             })?;
@@ -79,7 +79,7 @@ impl S3Client {
     }
 
     /// Blocking constructor.
-    pub(crate) fn new_blocking(config: &TieredConfig, runtime: &TokioHandle) -> io::Result<Self> {
+    pub(crate) fn new_blocking(config: &TurboliteConfig, runtime: &TokioHandle) -> io::Result<Self> {
         Self::block_on(runtime, Self::new_async(config))
     }
 

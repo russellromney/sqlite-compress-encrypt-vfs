@@ -1,23 +1,25 @@
 use super::*;
 
-// ===== TieredVfs =====
+// ===== TurboliteVfs =====
 
-/// S3-backed tiered storage VFS.
+/// Turbolite SQLite VFS with compression, encryption, and optional S3 backing.
 ///
-/// # Usage
+/// Works in two modes based on [`StorageBackend`]:
+/// - **Local** (default): page groups stored on local disk. No cloud deps.
+/// - **Cloud**: S3 is the source of truth, local disk is a cache. Requires `cloud` feature.
+///
+/// # Local mode
 /// ```ignore
-/// use turbolite::tiered::{TieredVfs, TieredConfig};
+/// use turbolite::{TurboliteVfs, TurboliteConfig};
 ///
-/// let config = TieredConfig {
-///     bucket: "my-bucket".into(),
-///     prefix: "databases/tenant-1".into(),
-///     cache_dir: "/tmp/cache".into(),
+/// let config = TurboliteConfig {
+///     cache_dir: "/data/mydb".into(),
 ///     ..Default::default()
 /// };
-/// let vfs = TieredVfs::new(config).expect("failed to create TieredVfs");
-/// turbolite::tiered::register("tiered", vfs).unwrap();
+/// let vfs = TurboliteVfs::new(config)?;
+/// turbolite::tiered::register("mydb", vfs)?;
 /// ```
-pub struct TieredVfs {
+pub struct TurboliteVfs {
     /// Unified storage client: Local (filesystem) or S3.
     pub(crate) storage: Arc<StorageClient>,
     /// S3 client (only set in cloud mode). Kept separate because PrefetchPool
@@ -28,14 +30,14 @@ pub struct TieredVfs {
     /// Shared page_count for prefetch workers (kept alive by PrefetchPool workers).
     #[allow(dead_code)]
     page_count: Arc<AtomicU64>,
-    config: TieredConfig,
+    config: TurboliteConfig,
     /// Owned runtime (if we created one ourselves)
     #[cfg(feature = "cloud")]
     _runtime: Option<tokio::runtime::Runtime>,
-    /// Shared manifest state. Written by TieredHandle during sync/checkpoint,
+    /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
     shared_manifest: Arc<RwLock<Manifest>>,
-    /// Shared pending S3 groups. Accumulated by TieredHandle during local-only
+    /// Shared pending S3 groups. Accumulated by TurboliteHandle during local-only
     /// checkpoints, drained by flush_to_s3(). Legacy path for global
     /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
@@ -60,9 +62,9 @@ pub struct TieredVfs {
     runtime_handle: Option<tokio::runtime::Handle>,
 }
 
-impl TieredVfs {
+impl TurboliteVfs {
     /// Create a new VFS. Dispatches to local or cloud construction based on config.
-    pub fn new(config: TieredConfig) -> io::Result<Self> {
+    pub fn new(config: TurboliteConfig) -> io::Result<Self> {
         match config.effective_backend() {
             StorageBackend::Local => Self::new_local(config),
             #[cfg(feature = "cloud")]
@@ -72,21 +74,28 @@ impl TieredVfs {
 
     /// Construct a local-only VFS. No S3, no tokio, no async.
     /// Page groups and manifest stored at `{cache_dir}/`.
-    fn new_local(mut config: TieredConfig) -> io::Result<Self> {
+    fn new_local(mut config: TurboliteConfig) -> io::Result<Self> {
         // Local mode always uses LocalThenFlush (no S3 to upload to)
         config.sync_mode = SyncMode::LocalThenFlush;
         let storage = Arc::new(StorageClient::local(config.cache_dir.clone())?);
 
-        // Load manifest from local disk (or empty for new database)
-        let (mut manifest, recovered_dirty_groups) = match storage.get_manifest()? {
-            Some(m) => {
-                eprintln!(
-                    "[local] loaded manifest (v{}, {} pages)",
-                    m.version, m.page_count,
-                );
-                (m, Vec::new())
+        // Load manifest + any dirty groups from crash recovery
+        let (mut manifest, recovered_dirty_groups) = match storage.get_manifest_with_dirty_groups()? {
+            (Some(m), dirty) => {
+                if !dirty.is_empty() {
+                    eprintln!(
+                        "[local] loaded manifest (v{}, {} pages, {} dirty groups pending flush)",
+                        m.version, m.page_count, dirty.len(),
+                    );
+                } else {
+                    eprintln!(
+                        "[local] loaded manifest (v{}, {} pages)",
+                        m.version, m.page_count,
+                    );
+                }
+                (m, dirty)
             }
-            None => {
+            (None, _) => {
                 eprintln!("[local] no manifest found, starting empty database");
                 (Manifest::empty(), Vec::new())
             }
@@ -143,7 +152,7 @@ impl TieredVfs {
 
     /// Construct a cloud (S3-backed) VFS. Requires tokio runtime.
     #[cfg(feature = "cloud")]
-    fn new_cloud(config: TieredConfig) -> io::Result<Self> {
+    fn new_cloud(config: TurboliteConfig) -> io::Result<Self> {
         let (runtime_handle, owned_runtime) =
             if let Some(ref handle) = config.runtime_handle {
                 (handle.clone(), None)
@@ -321,8 +330,8 @@ impl TieredVfs {
     /// The handle shares the same cache, S3 client, manifest, and dirty groups as the VFS.
     /// Panics if called in local-only mode (no S3 client).
     #[cfg(feature = "cloud")]
-    pub fn shared_state(&self) -> bench::TieredSharedState {
-        TieredSharedState {
+    pub fn shared_state(&self) -> bench::TurboliteSharedState {
+        TurboliteSharedState {
             s3: self.s3.as_ref().expect("shared_state requires S3 backend").clone(),
             cache: Arc::clone(&self.cache),
             prefetch_pool: self.prefetch_pool.as_ref().expect("shared_state requires prefetch pool").clone(),
@@ -628,8 +637,8 @@ impl TieredVfs {
     }
 }
 
-impl Vfs for TieredVfs {
-    type Handle = TieredHandle;
+impl Vfs for TurboliteVfs {
+    type Handle = TurboliteHandle;
 
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
         let path = self.config.cache_dir.join(db);
@@ -706,7 +715,7 @@ impl Vfs for TieredVfs {
                 }
             }
 
-            Ok(TieredHandle::new_tiered(
+            Ok(TurboliteHandle::new_tiered(
                 self.s3.clone(),
                 if self.storage.is_local() { Some(Arc::clone(&self.storage)) } else { None },
                 Arc::clone(&self.cache),
@@ -741,7 +750,7 @@ impl Vfs for TieredVfs {
                 .write(true)
                 .create(true)
                 .open(&path)?;
-            Ok(TieredHandle::new_passthrough(file, path, self.config.encryption_key))
+            Ok(TurboliteHandle::new_passthrough(file, path, self.config.encryption_key))
         }
     }
 

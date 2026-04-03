@@ -13,14 +13,14 @@
 //! # Quick start (local mode)
 //!
 //! ```ignore
-//! use turbolite::tiered::{TieredVfs, TieredConfig, StorageBackend};
+//! use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 //!
-//! let config = TieredConfig {
+//! let config = TurboliteConfig {
 //!     storage_backend: StorageBackend::Local,
 //!     cache_dir: "/data/mydb".into(),
 //!     ..Default::default()
 //! };
-//! let vfs = TieredVfs::new(config)?;
+//! let vfs = TurboliteVfs::new(config)?;
 //! turbolite::tiered::register("mydb", vfs)?;
 //! // Now open with rusqlite: "file:test.db?vfs=mydb"
 //! ```
@@ -98,17 +98,28 @@ mod wal_replication;
 
 // Public API (visible outside the crate)
 #[cfg(feature = "cloud")]
-pub use bench::TieredSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TieredConfig, PageLocation, BTreeManifestEntry};
-pub use handle::TieredHandle;
+pub use bench::TurboliteSharedState;
+pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
+pub use handle::TurboliteHandle;
 #[cfg(feature = "cloud")]
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest};
-pub use vfs::TieredVfs;
+pub use vfs::TurboliteVfs;
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query};
 pub use settings::{turbolite_config_set, push_setting};
-#[cfg(feature = "encryption")]
+#[cfg(all(feature = "encryption", feature = "cloud"))]
 pub use rotation::rotate_encryption_key;
+
+// Backward-compat type aliases (deprecated, use Turbolite* names)
+#[deprecated(note = "renamed to TurboliteVfs")]
+pub type TieredVfs = TurboliteVfs;
+#[deprecated(note = "renamed to TurboliteHandle")]
+pub type TieredHandle = TurboliteHandle;
+#[deprecated(note = "renamed to TurboliteConfig")]
+pub type TieredConfig = TurboliteConfig;
+#[cfg(feature = "cloud")]
+#[deprecated(note = "renamed to TurboliteSharedState")]
+pub type TieredSharedState = TurboliteSharedState;
 
 // Crate-internal re-exports (accessible within tiered submodules via super::*)
 pub(crate) use cache_tracking::*;
@@ -161,11 +172,11 @@ pub fn is_local_checkpoint_only() -> bool {
 /// Useful for checking whether data has already been imported before re-importing.
 /// Requires the `cloud` feature (creates S3Client + tokio runtime).
 #[cfg(feature = "cloud")]
-pub fn get_manifest(config: &TieredConfig) -> std::io::Result<Option<Manifest>> {
+pub fn get_manifest(config: &TurboliteConfig) -> std::io::Result<Option<Manifest>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let handle = runtime.handle().clone();
-    let s3_cfg = TieredConfig {
+    let s3_cfg = TurboliteConfig {
         bucket: config.bucket.clone(),
         prefix: config.prefix.clone(),
         endpoint_url: config.endpoint_url.clone(),
@@ -256,8 +267,8 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
     true
 }
 
-/// Register a tiered VFS with SQLite.
-pub fn register(name: &str, vfs: TieredVfs) -> Result<(), io::Error> {
+/// Register a TurboliteVfs with SQLite under the given name.
+pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
     sqlite_vfs::register(name, vfs, false)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
 }

@@ -120,20 +120,30 @@ impl StorageClient {
 
     /// Fetch the manifest. Returns Ok(None) if no manifest exists (new database).
     pub(crate) fn get_manifest(&self) -> io::Result<Option<Manifest>> {
+        let (manifest, _dirty_groups) = self.get_manifest_with_dirty_groups()?;
+        Ok(manifest)
+    }
+
+    /// Fetch the manifest and any dirty groups that haven't been flushed.
+    /// For local mode, dirty groups come from the LocalManifest (crash recovery).
+    /// For S3 mode, dirty groups are always empty (S3 manifest is clean).
+    pub(crate) fn get_manifest_with_dirty_groups(&self) -> io::Result<(Option<Manifest>, Vec<u64>)> {
         match self {
             StorageClient::Local { base_dir } => {
-                // Load from local manifest (same format as LocalManifest)
                 match manifest::LocalManifest::load(base_dir)? {
                     Some(local) => {
+                        let dirty = local.dirty_groups;
                         let mut m = local.manifest;
                         m.build_page_index();
-                        Ok(Some(m))
+                        Ok((Some(m), dirty))
                     }
-                    None => Ok(None),
+                    None => Ok((None, Vec::new())),
                 }
             }
             #[cfg(feature = "cloud")]
-            StorageClient::S3(s3) => s3.get_manifest(),
+            StorageClient::S3(s3) => {
+                Ok((s3.get_manifest()?, Vec::new()))
+            }
         }
     }
 

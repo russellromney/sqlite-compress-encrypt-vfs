@@ -1,18 +1,18 @@
 use super::*;
 use tempfile::TempDir;
 
-/// RED TEST: TieredVfs::new() with StorageBackend::Local should succeed
+/// RED TEST: TurboliteVfs::new() with StorageBackend::Local should succeed
 /// without any S3 credentials, tokio runtime, or cloud dependencies.
 #[test]
 fn test_local_vfs_construction() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
 
-    let vfs = TieredVfs::new(config).expect("local VFS construction should succeed");
+    let vfs = TurboliteVfs::new(config).expect("local VFS construction should succeed");
 
     // Verify it's local
     assert!(vfs.storage.is_local());
@@ -22,12 +22,12 @@ fn test_local_vfs_construction() {
 #[test]
 fn test_local_vfs_exists_empty() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TieredVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
     assert!(!vfs.storage.exists().unwrap());
 }
 
@@ -35,14 +35,14 @@ fn test_local_vfs_exists_empty() {
 #[test]
 fn test_local_vfs_sqlite_roundtrip() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
 
     let vfs_name = format!("local_rt_{}", std::process::id());
-    let vfs = TieredVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -64,7 +64,7 @@ fn test_local_vfs_with_compression() {
     let dir = TempDir::new().unwrap();
 
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
@@ -72,7 +72,7 @@ fn test_local_vfs_with_compression() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmp_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("local VFS with compression");
+        let vfs = TurboliteVfs::new(config).expect("local VFS with compression");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -85,7 +85,7 @@ fn test_local_vfs_with_compression() {
 
     // Cold reopen with compression
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
@@ -93,7 +93,7 @@ fn test_local_vfs_with_compression() {
             ..Default::default()
         };
         let vfs_name = format!("local_cmp2_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("reopen with compression");
+        let vfs = TurboliteVfs::new(config).expect("reopen with compression");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -107,13 +107,13 @@ fn test_local_vfs_with_compression() {
 #[test]
 fn test_local_vfs_schema_changes() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
     let vfs_name = format!("local_schema_{}", std::process::id());
-    let vfs = TieredVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
     crate::tiered::register(&vfs_name, vfs).expect("register");
 
     let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -153,12 +153,12 @@ fn test_local_vfs_schema_changes() {
 #[test]
 fn test_local_vfs_cloud_methods_error() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TieredVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
 
     // Cloud-only methods should return Unsupported errors, not panic
     let gc_err = vfs.gc();
@@ -175,12 +175,12 @@ fn test_local_vfs_cloud_methods_error() {
 #[test]
 fn test_local_vfs_s3_counters_zero() {
     let dir = TempDir::new().unwrap();
-    let config = TieredConfig {
+    let config = TurboliteConfig {
         storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TieredVfs::new(config).expect("local VFS");
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
 
     assert_eq!(vfs.s3_counters(), (0, 0));
     assert_eq!(vfs.reset_s3_counters(), (0, 0));
@@ -193,13 +193,13 @@ fn test_local_vfs_recover_from_page_groups() {
 
     // Phase 1: write data and checkpoint
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_pg1_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -230,13 +230,13 @@ fn test_local_vfs_recover_from_page_groups() {
     let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
 
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_pg2_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("reopen VFS after cache loss");
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS after cache loss");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -259,13 +259,13 @@ fn test_local_vfs_multi_checkpoint() {
     let dir = TempDir::new().unwrap();
 
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_mc_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -300,13 +300,13 @@ fn test_local_vfs_multi_checkpoint() {
     let _ = std::fs::remove_file(dir.path().join("cache_index.json"));
 
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_mc2_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -333,13 +333,13 @@ fn test_local_vfs_checkpoint_reopen() {
 
     // Write + checkpoint
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_ck1_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("local VFS");
+        let vfs = TurboliteVfs::new(config).expect("local VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
@@ -352,13 +352,13 @@ fn test_local_vfs_checkpoint_reopen() {
 
     // Cold reopen
     {
-        let config = TieredConfig {
+        let config = TurboliteConfig {
             storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
         let vfs_name = format!("local_ck2_{}", std::process::id());
-        let vfs = TieredVfs::new(config).expect("reopen VFS");
+        let vfs = TurboliteVfs::new(config).expect("reopen VFS");
         crate::tiered::register(&vfs_name, vfs).expect("register2");
 
         let db_path = format!("file:test.db?vfs={}", vfs_name);
