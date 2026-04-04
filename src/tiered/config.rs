@@ -5,7 +5,7 @@ use super::*;
 /// Where page groups and manifests are stored.
 /// Local: everything on local disk. No S3, no tokio, no async deps.
 /// S3: cloud-backed with local NVMe cache (requires `cloud` feature).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StorageBackend {
     /// Local-only mode. Page groups stored at `{cache_dir}/pg/`, manifest at
     /// `{cache_dir}/manifest.msgpack`. No cloud dependencies.
@@ -34,7 +34,7 @@ impl Default for StorageBackend {
 // ===== Manifest source =====
 
 /// Where to load the manifest on connection open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManifestSource {
     /// Use local manifest if present, fall back to S3. Correct for single-writer.
     /// Checkpoints keep the local manifest fresh. No S3 fetch on warm reconnect.
@@ -53,7 +53,7 @@ impl Default for ManifestSource {
 // ===== Sync mode =====
 
 /// Controls whether checkpoint uploads to S3 synchronously (blocking) or defers to flush_to_s3().
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncMode {
     /// Default. `sync()` uploads dirty pages to S3 during checkpoint.
     /// The SQLite EXCLUSIVE lock is held for the entire S3 upload duration.
@@ -68,6 +68,18 @@ pub enum SyncMode {
     ///
     /// Call `flush_to_s3()` (on TurboliteVfs or TurboliteSharedState) to upload.
     LocalThenFlush,
+    /// S3 is the database. Local disk is disposable cache. Every `xSync()` uploads
+    /// dirty frames as subframe overrides and publishes the manifest to S3.
+    /// The manifest publish is the atomic commit.
+    ///
+    /// Requires `journal_mode=OFF` or `MEMORY` (no WAL, no rollback journal).
+    /// Requires the `cloud` feature (S3 on every commit).
+    ///
+    /// Per-commit cost: ~256KB per dirty frame + manifest publish (~2-50ms).
+    /// Best for ephemeral compute (Lambda, scale-to-zero) where local disk is
+    /// not durable but S3 is.
+    #[cfg(feature = "cloud")]
+    S3Primary,
 }
 
 impl Default for SyncMode {
@@ -117,6 +129,8 @@ pub enum GroupState {
 /// The top-level `bucket`/`prefix` fields are kept for backward compatibility;
 /// if `storage_backend` is Local and `bucket` is non-empty, the VFS will
 /// auto-upgrade to S3 mode.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct TurboliteConfig {
     /// Storage backend: Local (default) or S3.
     pub storage_backend: StorageBackend,
@@ -134,6 +148,7 @@ pub struct TurboliteConfig {
     pub read_only: bool,
     /// Tokio runtime handle (pass in, or a new runtime is created)
     #[cfg(feature = "cloud")]
+    #[serde(skip)]
     pub runtime_handle: Option<TokioHandle>,
     /// Pages per page group (default 256 = 16MB uncompressed at 64KB page size, ~8MB compressed).
     /// Each S3 object contains this many contiguous compressed pages.
@@ -241,7 +256,7 @@ impl Default for TurboliteConfig {
             storage_backend: StorageBackend::default(),
             bucket: String::new(),
             prefix: String::new(),
-            cache_dir: PathBuf::from("/tmp/sqlces-cache"),
+            cache_dir: PathBuf::from("/tmp/turbolite-cache"),
             compression_level: 1,
             endpoint_url: None,
             read_only: false,
@@ -252,7 +267,7 @@ impl Default for TurboliteConfig {
             cache_ttl_secs: 3600,
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
-            prefetch_threads: std::env::var("SQLCES_PREFETCH_THREADS")
+            prefetch_threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(|| {

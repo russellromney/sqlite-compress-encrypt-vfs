@@ -78,14 +78,18 @@ Mechanical rename across codebase.
 
 ### f. Update FFI bindings
 
-- [ ] Add `turbolite_register_local(cache_dir, ...)` -- creates TurboliteVfs with Local backend
-- [ ] Rename `turbolite_register_tiered()` -> `turbolite_register_cloud()` (keep old name as alias)
-- [ ] `turbolite_register_cloud()` creates TurboliteVfs with S3 backend (behind `#[cfg(feature = "cloud")]`)
-- [ ] Add `turbolite_register()` unified entry point taking config JSON
-- [ ] `turbolite_register_compressed()` delegates to local TurboliteVfs (or stays for CompressedVfs compat)
-- [ ] Update ext.rs loadable extension entry point
-- [ ] Update cbindgen header generation
-- [ ] Tests: FFI roundtrip in local mode
+- [x] Add `turbolite_register_local(cache_dir, ...)` -- creates TurboliteVfs with Local backend
+- [x] Rename `turbolite_register_tiered()` -> `turbolite_register_cloud()` (keep old name as alias)
+- [x] `turbolite_register_cloud()` creates TurboliteVfs with S3 backend (behind `#[cfg(feature = "cloud")]`)
+- [x] Add `turbolite_register()` unified entry point taking config JSON
+- [x] `turbolite_register_compressed()` stays for CompressedVfs compat (deprecated in docs, delegates in Phase h)
+- [x] Update ext.rs loadable extension entry point (local VFS now uses TurboliteVfs)
+- [x] Update cbindgen header generation (`TURBOLITE_CLOUD` guard)
+- [x] Tests: 16 new FFI tests (local roundtrip, JSON config, persistence, edge cases)
+- [x] Add `Serialize`/`Deserialize` to TurboliteConfig, StorageBackend, SyncMode, ManifestSource
+- [x] Fix stale default cache_dir (`/tmp/sqlces-cache` -> `/tmp/turbolite-cache`)
+- [x] Fix stale env var (`SQLCES_PREFETCH_THREADS` -> `TURBOLITE_PREFETCH_THREADS`)
+- [x] Update README: Rust examples, feature flag references (`tiered` -> `cloud`), Go FFI example
 
 ### g. Migration tool for CompressedVfs databases
 

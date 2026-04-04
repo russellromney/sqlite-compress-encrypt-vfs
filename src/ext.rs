@@ -5,7 +5,7 @@
 //!
 //! ## VFS registration
 //!
-//! Always registers **"turbolite"** — local compressed VFS (zstd).
+//! Always registers **"turbolite"** — local TurboliteVfs (manifest + page groups).
 //!
 //! If `TURBOLITE_BUCKET` is set, also registers **"turbolite-s3"** — tiered
 //! S3 VFS. Fails hard if bucket is set but configuration is invalid.
@@ -39,7 +39,7 @@ static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TurboliteSharedState> = 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
 /// Returns 0 on success, 1 on error. Idempotent: second call is a no-op.
 ///
-/// Always registers "turbolite" (local compressed VFS).
+/// Always registers "turbolite" (local TurboliteVfs).
 /// If TURBOLITE_BUCKET is set, also registers "turbolite-s3" (tiered VFS).
 /// Panics if TURBOLITE_BUCKET is set but tiered VFS creation fails.
 #[no_mangle]
@@ -69,12 +69,24 @@ pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
 
 fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
+    use crate::tiered::{TurboliteConfig, TurboliteVfs, StorageBackend};
+
     let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    let vfs = crate::CompressedVfs::new(PathBuf::from("."), level);
-    crate::register("turbolite", vfs)
+    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir,
+        compression_level: level,
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config)?;
+    crate::tiered::register("turbolite", vfs)
 }
 
 #[cfg(feature = "cloud")]
@@ -388,7 +400,7 @@ pub extern "C" fn turbolite_gc() -> i32 {
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "TURBOLITE_BUCKET is set but this extension was built without the 'tiered' feature. \
-         Rebuild with: make ext  (includes tiered by default)",
+        "TURBOLITE_BUCKET is set but this extension was built without the 'cloud' feature. \
+         Rebuild with: make ext  (includes cloud by default)",
     ))
 }
