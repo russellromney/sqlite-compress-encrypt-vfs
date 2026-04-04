@@ -722,3 +722,261 @@ fn test_cache_validation_cold_start_after_cache_delete() {
         assert_eq!(val, "persisted", "should recover data from page groups after cache delete");
     }
 }
+
+// ===== Phase Zenith-c: Transaction Rollback Handling =====
+
+/// After a constraint violation (failed INSERT), subsequent reads must see
+/// the correct data, not stale dirty pages from the rolled-back transaction.
+#[test]
+fn test_constraint_violation_does_not_corrupt_reads() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_c_constraint_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'original')", []).unwrap();
+
+    // Force a checkpoint so the data is committed to page groups
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Try to insert a duplicate value (should fail with UNIQUE constraint)
+    let result = conn.execute("INSERT INTO t VALUES (2, 'original')", []);
+    assert!(result.is_err(), "duplicate insert should fail");
+
+    // Read should still see only the original row, not corrupted data
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "should have exactly 1 row after failed insert");
+
+    let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(val, "original");
+
+    // Can still write after the failed transaction
+    conn.execute("INSERT INTO t VALUES (2, 'second')", []).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2);
+}
+
+/// Explicit BEGIN + rollback (via DROP or error) should not leave stale dirty pages.
+#[test]
+fn test_explicit_transaction_rollback() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_c_rollback_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'committed')", []).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Begin a transaction, write something, then rollback
+    conn.execute_batch("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'will_rollback')", []).unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+
+    // After rollback, we should see only the committed row
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1, "rolled-back row should not be visible");
+
+    let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(val, "committed");
+}
+
+/// Multiple constraint violations in a row should not accumulate stale pages.
+#[test]
+fn test_repeated_constraint_violations() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_c_repeated_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn = rusqlite::Connection::open(format!("file:test.db?vfs={}", vfs_name)).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT UNIQUE)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one')", []).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    // Several failing inserts
+    for i in 0..5 {
+        let result = conn.execute(&format!("INSERT INTO t VALUES ({}, 'one')", i + 10), []);
+        assert!(result.is_err(), "duplicate should fail on iteration {}", i);
+    }
+
+    // Data should still be correct
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+
+    // Successful write after repeated failures
+    conn.execute("INSERT INTO t VALUES (2, 'two')", []).unwrap();
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2);
+}
+
+// ===== Phase Zenith-d: WAL Migration Path =====
+
+/// turbolite_migrate_to_s3_primary checkpoints WAL and prepares for journal_mode=OFF.
+/// The turbolite VFS creates WAL stub files on open (unless S3Primary mode), so
+/// the full migration from WAL to OFF requires:
+/// 1. Call migrate (checkpoints WAL)
+/// 2. Close the connection
+/// 3. Reopen with a VFS configured for S3Primary or non-WAL mode
+#[test]
+fn test_migrate_to_s3_primary_from_wal() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_d_migrate_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let uri = format!("file:test.db?vfs={}", vfs_name);
+
+    // Step 1: create data in WAL mode, then migrate (checkpoints WAL)
+    {
+        let conn = rusqlite::Connection::open(&uri).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'before_migrate')", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'second')", []).unwrap();
+
+        crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+    }
+
+    // Step 2: verify data survived the checkpoint by reopening (still WAL mode
+    // in local VFS, but all data is in the main database file, not the WAL)
+    {
+        let conn = rusqlite::Connection::open(&uri).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2, "all rows should survive WAL checkpoint");
+
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(val, "before_migrate");
+    }
+}
+
+/// Migrating a database that is already in DELETE mode switches to OFF directly.
+#[test]
+fn test_migrate_from_delete_to_off() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_d_delete_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let uri = format!("file:test.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&uri).unwrap();
+    // Start with DELETE mode (not WAL), then migrate to OFF
+    conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+
+    // Migrate should succeed and switch to OFF
+    crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    assert!(mode == "off" || mode == "memory", "got: {}", mode);
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 1);
+}
+
+/// Migration is a no-op when already in journal_mode=OFF.
+#[test]
+fn test_migrate_already_off() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_d_already_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let uri = format!("file:test.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&uri).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", []).unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+
+    // First call: switches to OFF
+    crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    assert!(mode == "off" || mode == "memory", "got: {}", mode);
+
+    // Second call: should be a no-op
+    crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+    let mode2: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    assert_eq!(mode, mode2);
+}
+
+/// Migration from WAL preserves data across many rows.
+#[test]
+fn test_migrate_preserves_large_dataset() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        storage_backend: StorageBackend::Local,
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs_name = format!("zenith_d_large_{}", std::process::id());
+    let vfs = TurboliteVfs::new(config).expect("VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let uri = format!("file:test.db?vfs={}", vfs_name);
+    let row_count = 500i64;
+
+    // Create data in WAL mode and migrate
+    {
+        let conn = rusqlite::Connection::open(&uri).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+
+        for i in 0..row_count {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, format!("row_{}", i)]).unwrap();
+        }
+
+        crate::tiered::turbolite_migrate_to_s3_primary(&conn).unwrap();
+    }
+
+    // Verify all data survived
+    {
+        let conn = rusqlite::Connection::open(&uri).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, row_count);
+
+        let val: String = conn.query_row("SELECT val FROM t WHERE id = 250", [], |r| r.get(0)).unwrap();
+        assert_eq!(val, "row_250");
+
+        // Can still write after migration
+        conn.execute("INSERT INTO t VALUES (?1, 'new')", rusqlite::params![row_count]).unwrap();
+        let new_count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(new_count, row_count + 1);
+    }
+}
