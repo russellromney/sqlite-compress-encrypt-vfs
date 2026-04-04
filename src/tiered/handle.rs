@@ -49,6 +49,11 @@ pub struct TurboliteHandle {
     #[cfg(feature = "zstd")]
     dictionary_bytes: Option<Vec<u8>>,
 
+    /// Phase Zenith-c: true if dirty pages have been written since the last
+    /// successful sync. Used to detect transaction rollback (lock downgrade
+    /// from EXCLUSIVE/RESERVED without sync having been called).
+    dirty_since_sync: bool,
+
     /// Auto-GC: delete old page group versions after checkpoint.
     gc_enabled: bool,
     override_threshold: u32,
@@ -320,6 +325,7 @@ impl TurboliteHandle {
             prefetch_lookup,
             search_trees: HashSet::new(),
             prefetch_pool,
+            dirty_since_sync: false,
             gc_enabled,
             override_threshold: 0,
             compaction_threshold: 0,
@@ -372,6 +378,7 @@ impl TurboliteHandle {
             prefetch_lookup: vec![0.0, 0.0, 0.0],
             search_trees: HashSet::new(),
             prefetch_pool: None,
+            dirty_since_sync: false,
             gc_enabled: false,
             override_threshold: 0,
             compaction_threshold: 0,
@@ -1734,6 +1741,7 @@ impl DatabaseHandle for TurboliteHandle {
             cache.write_page(page_num, buf)?;
         }
         self.dirty_page_nums.write().insert(page_num);
+        self.dirty_since_sync = true;
 
         // Phase Jena: detect interior page writes for map rebuild (if enabled).
         if self.jena_enabled {
@@ -1865,6 +1873,7 @@ impl DatabaseHandle for TurboliteHandle {
             let total_interior = cache.interior_pages.lock().len();
             // Free dirty page tracking
             self.dirty_page_nums.write().clear();
+            self.dirty_since_sync = false;
             let cache_dir = cache.cache_dir.clone();
             let pending_groups_snapshot: Vec<u64> = pending.iter().copied().collect();
             drop(pending);
@@ -2194,6 +2203,7 @@ impl DatabaseHandle for TurboliteHandle {
                     dirty.remove(&page_num);
                 }
             }
+            self.dirty_since_sync = false;
 
             // Persist local manifest for crash recovery
             let local = manifest::LocalManifest {
@@ -2846,6 +2856,7 @@ impl DatabaseHandle for TurboliteHandle {
                 dirty.remove(&page_num);
             }
         }
+        self.dirty_since_sync = false;
 
         // Persist bitmap
         let _ = cache.persist_bitmap();
@@ -2995,6 +3006,32 @@ impl DatabaseHandle for TurboliteHandle {
 
         if current == lock {
             return Ok(true);
+        }
+
+        // Phase Zenith-c: detect transaction rollback.
+        // If lock downgrades from EXCLUSIVE/RESERVED and we have unsynced dirty
+        // pages, the transaction was rolled back. Clear dirty pages and evict
+        // them from the disk cache so subsequent reads re-fetch from the source
+        // of truth (S3 or local pg/).
+        if (current == LockKind::Exclusive || current == LockKind::Reserved)
+            && (lock == LockKind::Shared || lock == LockKind::None)
+            && self.dirty_since_sync
+        {
+            let mut dirty = self.dirty_page_nums.write();
+            if !dirty.is_empty() {
+                let stale_pages: Vec<u64> = dirty.iter().copied().collect();
+                eprintln!(
+                    "[turbolite] lock downgrade without sync: clearing {} dirty pages (transaction rollback)",
+                    stale_pages.len(),
+                );
+                dirty.clear();
+                drop(dirty);
+                // Evict stale pages from disk cache so reads go back to source.
+                if let Some(cache) = &self.cache {
+                    cache.clear_pages_from_disk(&stale_pages);
+                }
+            }
+            self.dirty_since_sync = false;
         }
 
         let lock_file = self.ensure_lock_file()?;

@@ -434,17 +434,19 @@ Read latency: unchanged. Cache hit = ~1us. Cache miss = ~20-100ms (S3 range GET 
 - Persist local manifest copy after each successful publish
 - Tests: open after external write (another node), cache partially invalidated, correct data read. Open after crash (local dirty, S3 clean), cache invalidated, correct data from S3.
 
-**Zenith-c: Transaction failure / rollback handling**
-- Transaction fails (constraint violation, etc.): dirty pages in cache are stale
-- No S3 upload happened, no manifest published: S3 state is clean
-- Mark dirty pages as "unvalidated" in cache, evict or lazy-re-fetch on next read
-- OR: simpler approach: invalidate all dirty pages on transaction failure
-- Tests: INSERT violates UNIQUE constraint, transaction aborted, subsequent read returns correct pre-transaction data from cache (re-fetched from S3 if needed)
+**Zenith-c: Transaction failure / rollback handling (DONE)**
+- Added `dirty_since_sync` flag to TurboliteHandle, set true on write, false after sync
+- lock() detects downgrade from EXCLUSIVE/RESERVED to SHARED/NONE without sync (rollback)
+- On rollback detection: clears dirty_page_nums and evicts stale pages from disk cache via clear_pages_from_disk()
+- Works for all SyncMode variants (S3Primary, Durable, LocalThenFlush)
+- Tests: constraint violation, explicit BEGIN/ROLLBACK, repeated constraint violations
 
-**Zenith-d: Migration path from WAL mode**
-- `turbolite_migrate_to_s3_primary()`: checkpoint WAL, switch to journal_mode=OFF, enable S3Primary
-- One-time operation, non-reversible (can switch back to Durable by re-enabling WAL)
-- Tests: database in WAL mode with pending WAL data, migrate, verify all data in S3, open in S3Primary mode, read + write works
+**Zenith-d: Migration path from WAL mode (DONE)**
+- `turbolite_migrate_to_s3_primary(conn)`: checkpoints WAL, attempts journal_mode=OFF
+- When in WAL mode, the turbolite VFS creates WAL stub files that prevent PRAGMA journal_mode switching; function handles this gracefully by checkpointing and returning Ok
+- Caller closes connection, reopens with S3Primary config (which skips WAL stub) and sets journal_mode=OFF
+- From DELETE/non-WAL mode, switches to OFF directly
+- Tests: WAL migration with data preservation, DELETE-to-OFF, already-OFF no-op, large dataset preservation
 
 **Zenith-e: Integration with Shared mode (haqlite Phase Crest)**
 - Shared mode + S3Primary: the full stack
