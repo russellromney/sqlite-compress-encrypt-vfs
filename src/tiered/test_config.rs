@@ -6,7 +6,7 @@ fn test_tiered_config_default() {
     let c = TurboliteConfig::default();
     assert_eq!(c.bucket, "");
     assert_eq!(c.prefix, "");
-    assert_eq!(c.cache_dir, PathBuf::from("/tmp/sqlces-cache"));
+    assert_eq!(c.cache_dir, PathBuf::from("/tmp/turbolite-cache"));
     assert_eq!(c.compression_level, 1);
     assert_eq!(c.endpoint_url, None);
     assert!(!c.read_only);
