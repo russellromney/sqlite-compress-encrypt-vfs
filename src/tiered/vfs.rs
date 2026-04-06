@@ -714,6 +714,20 @@ impl TurboliteVfs {
             eprintln!("[set_manifest] warning: failed to persist bitmap: {}", e);
         }
     }
+
+    /// Sync VFS state after an external process (walrust restore) wrote pages
+    /// directly to the cache file. Marks all pages as present in the bitmap
+    /// and updates the page_count atomic.
+    ///
+    /// Call this after walrust restore writes to the raw cache file path,
+    /// before reopening the SQLite connection through the VFS.
+    pub fn sync_after_external_restore(&self, page_count: u64) {
+        self.cache.mark_all_pages_present(page_count);
+        self.page_count.store(page_count, Ordering::Release);
+        if let Err(e) = self.cache.persist_bitmap() {
+            eprintln!("[sync_after_external_restore] warning: failed to persist bitmap: {}", e);
+        }
+    }
 }
 
 impl Vfs for TurboliteVfs {

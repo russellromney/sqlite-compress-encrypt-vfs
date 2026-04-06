@@ -1230,6 +1230,28 @@ impl DiskCache {
         let _ = index.persist();
     }
 
+    /// Mark all pages as present in the bitmap and all groups as Present.
+    /// Called after an external process (walrust restore) writes pages directly
+    /// to the cache file without going through the VFS.
+    pub(crate) fn mark_all_pages_present(&self, page_count: u64) {
+        let mut bitmap = self.bitmap.lock();
+        bitmap.resize(page_count);
+        for p in 0..page_count {
+            bitmap.mark_present(p);
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let group_count = (page_count + ppg - 1) / ppg;
+            let states = self.group_states.lock();
+            self.ensure_group_states_capacity(&states, group_count.saturating_sub(1));
+            for gid in 0..group_count as usize {
+                if let Some(s) = states.get(gid) {
+                    s.store(GroupState::Present as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
         self.bitmap.lock().persist()?;
