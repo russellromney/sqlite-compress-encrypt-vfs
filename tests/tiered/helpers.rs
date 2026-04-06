@@ -47,6 +47,87 @@ pub fn endpoint_url() -> String {
         .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
+/// Named test mode: controls compression, encryption, and sync behavior.
+#[derive(Debug, Clone, Copy)]
+pub enum TestMode {
+    /// zstd compression, no encryption, Durable sync (default production mode)
+    Compressed,
+    /// zstd compression + AES-256-GCM encryption
+    CompressedEncrypted,
+    /// No compression, no encryption (baseline)
+    Plain,
+    /// zstd compression, LocalThenFlush sync (deferred S3 upload)
+    CompressedLocalFlush,
+}
+
+impl TestMode {
+    /// All modes to test. Use in parameterized tests.
+    pub fn all() -> &'static [TestMode] {
+        &[
+            TestMode::Compressed,
+            TestMode::CompressedEncrypted,
+            TestMode::Plain,
+            TestMode::CompressedLocalFlush,
+        ]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            TestMode::Compressed => "zstd",
+            TestMode::CompressedEncrypted => "zstd_enc",
+            TestMode::Plain => "plain",
+            TestMode::CompressedLocalFlush => "zstd_ltf",
+        }
+    }
+
+    /// Apply this mode's settings to a TurboliteConfig.
+    pub fn apply(&self, config: &mut TurboliteConfig) {
+        match self {
+            TestMode::Compressed => {
+                config.compression_level = 3;
+            }
+            TestMode::CompressedEncrypted => {
+                config.compression_level = 3;
+                #[cfg(feature = "encryption")]
+                {
+                    // Deterministic test key (NOT for production)
+                    config.encryption_key = Some([
+                        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                        0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+                        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+                        0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+                    ]);
+                }
+            }
+            TestMode::Plain => {
+                config.compression_level = 0;
+            }
+            TestMode::CompressedLocalFlush => {
+                config.compression_level = 3;
+                config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+            }
+        }
+    }
+}
+
+/// Create a TurboliteConfig for a specific test mode with a unique prefix.
+pub fn test_config_mode(prefix: &str, cache_dir: &std::path::Path, mode: TestMode) -> TurboliteConfig {
+    let mut config = test_config(prefix, cache_dir);
+    mode.apply(&mut config);
+    config
+}
+
+/// Create a cold reader config that inherits encryption from the writer mode.
+pub fn cold_reader_config_mode(
+    bucket: &str, prefix: &str, endpoint: &Option<String>,
+    cache_dir: &std::path::Path, mode: TestMode,
+) -> TurboliteConfig {
+    let mut config = cold_reader_config(bucket, prefix, endpoint, cache_dir);
+    mode.apply(&mut config);
+    // Cold readers are always read-only (already set by cold_reader_config)
+    config
+}
+
 /// Create a TurboliteConfig with a unique prefix (so tests don't collide).
 pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let unique_prefix = format!(
