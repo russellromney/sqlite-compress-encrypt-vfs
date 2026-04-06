@@ -1895,7 +1895,8 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[sync] ERROR: cache.read_page({}) failed during local checkpoint interior scan: {}", page_num, e);
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("cache.read_page({}) failed during local checkpoint interior scan: {}", page_num, e)));
                     }
                 }
             }
@@ -2615,7 +2616,8 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[sync] ERROR: cache.read_page({}) failed during interior collection: {}", pnum, e);
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("cache.read_page({}) failed during interior collection: {}", pnum, e)));
                     }
                 }
             }
@@ -2734,7 +2736,8 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[sync] ERROR: cache.read_page({}) failed during index leaf collection: {}", pnum, e);
+                        return Err(io::Error::new(io::ErrorKind::Other,
+                            format!("cache.read_page({}) failed during index leaf collection: {}", pnum, e)));
                     }
                 }
             }
@@ -2992,9 +2995,10 @@ impl DatabaseHandle for TurboliteHandle {
         if let Some(cache) = &self.cache {
             let m = self.manifest.read().clone();
             let local = manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
-            if let Err(e) = local.persist(&cache.cache_dir) {
-                eprintln!("[sync] ERROR: failed to persist local manifest: {}", e);
-            }
+            local.persist(&cache.cache_dir).map_err(|e| {
+                io::Error::new(io::ErrorKind::Other,
+                    format!("local manifest persist failed after S3 sync: {}", e))
+            })?;
         }
 
         Ok(())
