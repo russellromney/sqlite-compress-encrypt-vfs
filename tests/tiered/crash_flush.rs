@@ -1,10 +1,5 @@
 //! Crash atomicity tests: verify database recovers correctly after interrupted
-//! checkpoints.
-//!
-//! Strategy: write data, checkpoint to S3, then open a fresh VFS from the same
-//! S3 prefix and verify all pre-checkpoint data is readable and passes integrity
-//! check. This exercises the crash recovery path without actually killing the
-//! process (which is hard to do in a test).
+//! checkpoints. Runs across all TestMode variants.
 //!
 //! The key invariant: after any successful checkpoint, a cold reader opening
 //! from S3 must see exactly the data that was committed before the checkpoint.
@@ -20,20 +15,12 @@ fn cold_read_and_verify(
     bucket: &str,
     prefix: &str,
     endpoint: &Option<String>,
+    mode: TestMode,
     expected_count: i64,
     label: &str,
 ) {
     let cold_dir = TempDir::new().expect("cold dir");
-    let cold_config = TurboliteConfig {
-        bucket: bucket.to_string(),
-        prefix: prefix.to_string(),
-        cache_dir: cold_dir.path().to_path_buf(),
-        endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
-        read_only: true,
-        runtime_handle: Some(shared_runtime_handle()),
-        ..Default::default()
-    };
+    let cold_config = cold_reader_config_mode(bucket, prefix, endpoint, cold_dir.path(), mode);
     let vfs_name = unique_vfs_name("crash_cold");
     let vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register cold");
@@ -48,13 +35,8 @@ fn cold_read_and_verify(
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
         .expect("count query");
-    assert_eq!(
-        count, expected_count,
-        "{}: expected {} rows, got {}",
-        label, expected_count, count
-    );
+    assert_eq!(count, expected_count, "{}: expected {} rows, got {}", label, expected_count, count);
 
-    // Verify specific rows
     let first: i64 = conn
         .query_row("SELECT MIN(id) FROM data", [], |row| row.get(0))
         .expect("min query");
@@ -63,231 +45,156 @@ fn cold_read_and_verify(
     let last: i64 = conn
         .query_row("SELECT MAX(id) FROM data", [], |row| row.get(0))
         .expect("max query");
-    assert_eq!(
-        last,
-        expected_count - 1,
-        "{}: last row should be {}",
-        label,
-        expected_count - 1
-    );
+    assert_eq!(last, expected_count - 1, "{}: last row should be {}", label, expected_count - 1);
 
-    // Integrity check
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity");
-    assert_eq!(
-        integrity, "ok",
-        "{}: integrity check failed: {}",
-        label, integrity
-    );
+    assert_eq!(integrity, "ok", "{}: integrity check failed: {}", label, integrity);
 }
 
-/// After each checkpoint, a cold reader must see exactly the committed data.
-#[test]
-fn crash_recovery_incremental_checkpoints() {
+/// Core crash recovery test: incremental checkpoints with cold-read after each.
+fn run_crash_incremental(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config("crash_incr", writer_dir.path());
+    let config = test_config_mode(&format!("crash_incr_{}", mode.name()), writer_dir.path(), mode);
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
-    let vfs_name = unique_vfs_name("crash_incr");
+    let vfs_name = unique_vfs_name(&format!("crash_incr_{}", mode.name()));
 
     let vfs = TurboliteVfs::new(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
-        "crash_incr_test.db",
+        &format!("crash_incr_{}.db", mode.name()),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
 
     conn.execute_batch(
-        "PRAGMA page_size=65536;
-         PRAGMA journal_mode=WAL;
+        "PRAGMA page_size=65536; PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
     )
     .expect("init");
 
-    // Phase 1: insert 100, checkpoint
+    // Phase 1: insert 100, checkpoint, cold-verify
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 0..100 {
-            tx.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, format!("v{}", i)],
-            )
-            .expect("insert");
+            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("v{}", i)])
+                .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("cp1");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, 100, "phase1");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp1");
+    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 100, &format!("[{}] phase1", mode.name()));
 
-    // Phase 2: insert 100 more, checkpoint
+    // Phase 2: insert 100 more, checkpoint, cold-verify
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 100..200 {
-            tx.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, format!("v{}", i)],
-            )
-            .expect("insert");
+            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("v{}", i)])
+                .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("cp2");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, 200, "phase2");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp2");
+    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 200, &format!("[{}] phase2", mode.name()));
 
-    // Phase 3: update all rows, checkpoint
-    conn.execute_batch("UPDATE data SET value = 'updated_' || id;")
-        .expect("update");
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("cp3");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, 200, "phase3_count");
+    // Phase 3: update all, checkpoint, cold-verify
+    conn.execute_batch("UPDATE data SET value = 'updated_' || id;").expect("update");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp3");
+    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 200, &format!("[{}] phase3", mode.name()));
 
-    // Verify updated values via cold read
-    {
-        let cold_dir = TempDir::new().expect("cold dir");
-        let cold_config = TurboliteConfig {
-            bucket: bucket.clone(),
-            prefix: prefix.clone(),
-            cache_dir: cold_dir.path().to_path_buf(),
-            endpoint_url: endpoint.clone(),
-            region: Some("auto".to_string()),
-            read_only: true,
-            runtime_handle: Some(shared_runtime_handle()),
-            ..Default::default()
-        };
-        let cvn = unique_vfs_name("crash_verify_update");
-        let cvfs = TurboliteVfs::new(cold_config).expect("cold vfs");
-        turbolite::tiered::register(&cvn, cvfs).expect("register");
-
-        let cold = rusqlite::Connection::open_with_flags_and_vfs(
-            "crash_verify_update.db",
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            &cvn,
-        )
-        .expect("open");
-
-        let val: String = cold
-            .query_row("SELECT value FROM data WHERE id = 42", [], |row| row.get(0))
-            .expect("get 42");
-        assert_eq!(val, "updated_42", "update not visible in cold read");
-    }
-
-    // Phase 4: delete half, vacuum, checkpoint
-    conn.execute_batch("DELETE FROM data WHERE id >= 100;")
-        .expect("delete");
+    // Phase 4: delete half, vacuum, checkpoint, cold-verify
+    conn.execute_batch("DELETE FROM data WHERE id >= 100;").expect("delete");
     conn.execute_batch("VACUUM;").expect("vacuum");
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("cp4");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, 100, "phase4_after_vacuum");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp4");
+    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 100, &format!("[{}] phase4", mode.name()));
 }
 
-/// Write uncommitted data (no checkpoint), verify cold reader sees nothing.
-/// This proves the checkpoint is the durability boundary.
-#[test]
-fn uncommitted_data_not_visible_in_s3() {
+/// Uncommitted data must not be visible in S3.
+fn run_uncommitted_not_visible(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config("crash_uncommit", writer_dir.path());
+    let config = test_config_mode(&format!("crash_uncommit_{}", mode.name()), writer_dir.path(), mode);
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
-    let vfs_name = unique_vfs_name("crash_uncommit");
+    let vfs_name = unique_vfs_name(&format!("crash_uncommit_{}", mode.name()));
 
     let vfs = TurboliteVfs::new(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
-        "crash_uncommit_test.db",
+        &format!("crash_uncommit_{}.db", mode.name()),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
 
     conn.execute_batch(
-        "PRAGMA page_size=65536;
-         PRAGMA journal_mode=WAL;
+        "PRAGMA page_size=65536; PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
     )
     .expect("init");
 
-    // Insert 50 rows and checkpoint (the baseline)
+    // Baseline: 50 rows, checkpoint
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 0..50 {
-            tx.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, format!("baseline_{}", i)],
-            )
-            .expect("insert");
+            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("baseline_{}", i)])
+                .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("checkpoint baseline");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp");
 
-    // Insert 50 more rows but do NOT checkpoint
+    // 50 more rows, NO checkpoint
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 50..100 {
-            tx.execute(
-                "INSERT INTO data (id, value) VALUES (?1, ?2)",
-                rusqlite::params![i, format!("uncheckpointed_{}", i)],
-            )
-            .expect("insert");
+            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("uncheckpointed_{}", i)])
+                .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    // NO checkpoint here -- simulates crash before checkpoint
 
-    // Cold reader should only see the 50 baseline rows
-    cold_read_and_verify(
-        &bucket,
-        &prefix,
-        &endpoint,
-        50,
-        "uncommitted_not_visible",
-    );
+    // Cold reader should only see baseline
+    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 50, &format!("[{}] uncommitted", mode.name()));
 }
 
-/// Large dataset: 10,000 rows across multiple page groups, verify cold read.
-#[test]
-fn crash_recovery_large_dataset() {
+/// Large dataset spanning multiple page groups.
+fn run_large_dataset(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config("crash_large", writer_dir.path());
+    let config = test_config_mode(&format!("crash_large_{}", mode.name()), writer_dir.path(), mode);
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
-    let vfs_name = unique_vfs_name("crash_large");
+    let vfs_name = unique_vfs_name(&format!("crash_large_{}", mode.name()));
 
     let vfs = TurboliteVfs::new(config).expect("vfs");
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
-        "crash_large_test.db",
+        &format!("crash_large_{}.db", mode.name()),
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
 
     conn.execute_batch(
-        "PRAGMA page_size=65536;
-         PRAGMA journal_mode=WAL;
+        "PRAGMA page_size=65536; PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT, payload BLOB);",
     )
     .expect("init");
 
-    // Insert 10,000 rows with varying payload sizes to span multiple page groups
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 0..10_000 {
             let payload = vec![(i % 256) as u8; (i % 500) + 100];
             tx.execute(
-                "INSERT INTO data (id, value, payload) VALUES (?1, ?2, ?3)",
+                "INSERT INTO data VALUES (?1, ?2, ?3)",
                 rusqlite::params![i, format!("row_{}", i), payload],
             )
             .expect("insert");
@@ -295,68 +202,59 @@ fn crash_recovery_large_dataset() {
         tx.commit().expect("commit");
     }
 
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-        .expect("checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
 
-    // Cold read verification
+    // Cold read: verify count and spot-check rows
     let cold_dir = TempDir::new().expect("cold dir");
-    let cold_config = TurboliteConfig {
-        bucket: bucket.clone(),
-        prefix: prefix.clone(),
-        cache_dir: cold_dir.path().to_path_buf(),
-        endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
-        read_only: true,
-        runtime_handle: Some(shared_runtime_handle()),
-        ..Default::default()
-    };
-    let cold_name = unique_vfs_name("crash_large_cold");
+    let cold_config = cold_reader_config_mode(&bucket, &prefix, &endpoint, cold_dir.path(), mode);
+    let cold_name = unique_vfs_name(&format!("crash_large_{}_cold", mode.name()));
     let cold_vfs = TurboliteVfs::new(cold_config).expect("cold vfs");
     turbolite::tiered::register(&cold_name, cold_vfs).expect("register cold");
 
     let cold = rusqlite::Connection::open_with_flags_and_vfs(
-        "crash_large_cold.db",
+        &format!("crash_large_{}_cold.db", mode.name()),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
         &cold_name,
     )
     .expect("open cold");
 
-    // Verify count
     let count: i64 = cold
         .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(count, 10_000, "expected 10000 rows in cold read");
+    assert_eq!(count, 10_000, "[{}] expected 10000 rows", mode.name());
 
-    // Verify random samples
     for check_id in [0, 42, 999, 5000, 9999] {
         let val: String = cold
-            .query_row(
-                "SELECT value FROM data WHERE id = ?1",
-                rusqlite::params![check_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT value FROM data WHERE id = ?1", rusqlite::params![check_id], |row| row.get(0))
             .expect("get row");
-        assert_eq!(val, format!("row_{}", check_id));
+        assert_eq!(val, format!("row_{}", check_id), "[{}] value mismatch for id {}", mode.name(), check_id);
 
-        // Verify payload length
         let payload_len: i64 = cold
-            .query_row(
-                "SELECT length(payload) FROM data WHERE id = ?1",
-                rusqlite::params![check_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT length(payload) FROM data WHERE id = ?1", rusqlite::params![check_id], |row| row.get(0))
             .expect("get payload len");
         assert_eq!(
-            payload_len,
-            ((check_id % 500) + 100) as i64,
-            "payload length mismatch for id {}",
-            check_id
+            payload_len, ((check_id % 500) + 100) as i64,
+            "[{}] payload length mismatch for id {}", mode.name(), check_id
         );
     }
 
-    // Full integrity check
     let integrity: String = cold
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity");
-    assert_eq!(integrity, "ok", "large dataset integrity check failed");
+    assert_eq!(integrity, "ok", "[{}] large dataset integrity failed", mode.name());
 }
+
+// --- Parameterized tests: crash recovery x mode ---
+// Skip LocalThenFlush for cold-read tests (checkpoint doesn't upload to S3 in LTF mode)
+
+#[test] fn crash_incremental_compressed() { run_crash_incremental(TestMode::Compressed); }
+#[test] fn crash_incremental_encrypted() { run_crash_incremental(TestMode::CompressedEncrypted); }
+#[test] fn crash_incremental_plain() { run_crash_incremental(TestMode::Plain); }
+
+#[test] fn crash_uncommitted_compressed() { run_uncommitted_not_visible(TestMode::Compressed); }
+#[test] fn crash_uncommitted_encrypted() { run_uncommitted_not_visible(TestMode::CompressedEncrypted); }
+#[test] fn crash_uncommitted_plain() { run_uncommitted_not_visible(TestMode::Plain); }
+
+#[test] fn crash_large_compressed() { run_large_dataset(TestMode::Compressed); }
+#[test] fn crash_large_encrypted() { run_large_dataset(TestMode::CompressedEncrypted); }
+#[test] fn crash_large_plain() { run_large_dataset(TestMode::Plain); }
