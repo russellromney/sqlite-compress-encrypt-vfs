@@ -189,20 +189,6 @@ impl TurboliteVfs {
         };
         manifest.detect_and_normalize_strategy();
 
-        // S3Primary: patch journal_mode in db_header from OFF (0) to DELETE (1).
-        // S3Primary relies on xSync to upload dirty pages to S3. But SQLite with
-        // journal_mode=OFF never calls xSync on commit, silently losing all data.
-        // DELETE mode ensures xSync fires for every commit while keeping S3 as
-        // the durability layer (the rollback journal is just a local safety net).
-        if config.sync_mode == SyncMode::S3Primary {
-            if let Some(ref mut page0) = manifest.db_header {
-                if page0.len() > 18 && page0[18] == 0 {
-                    page0[18] = 1; // DELETE
-                    eprintln!("[tiered] S3Primary: patched journal_mode OFF -> DELETE in db_header");
-                }
-            }
-        }
-
         eprintln!("[tiered] manifest for cache init (page_size={}, ppg={}, strategy={:?})", manifest.page_size, manifest.pages_per_group, manifest.strategy);
         let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
         let ppg = if manifest.pages_per_group > 0 { manifest.pages_per_group } else { config.pages_per_group };
@@ -218,17 +204,6 @@ impl TurboliteVfs {
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
 
-        // Write patched page 0 to cache so the first connection sees DELETE mode.
-        if config.sync_mode == SyncMode::S3Primary {
-            if let Some(ref page0) = manifest.db_header {
-                eprintln!("[tiered] S3Primary: writing patched page 0 to cache (len={}, byte18={})",
-                    page0.len(), if page0.len() > 18 { page0[18] } else { 255 });
-                let _ = cache.write_page(0, page0);
-                cache.bitmap.lock().mark_present(0);
-            } else {
-                eprintln!("[tiered] S3Primary: no db_header in manifest, cannot patch page 0");
-            }
-        }
 
         let s3 = Arc::new(s3);
         let storage = Arc::new(StorageClient::s3(Arc::clone(&s3)));
@@ -777,21 +752,9 @@ impl TurboliteVfs {
         // correct database header (page count, schema cookie) immediately,
         // without needing an S3 fetch or connection reopen.
         if let Some(ref page0) = manifest.db_header {
-            let mut page0_patched = page0.clone();
-            // If S3Primary sync mode and journal_mode is OFF (byte 18 = 0),
-            // patch to DELETE (byte 18 = 1). S3Primary relies on xSync for
-            // S3 uploads, but journal_mode=OFF prevents SQLite from calling
-            // xSync on commit. DELETE mode ensures xSync fires.
-            if self.config.sync_mode == SyncMode::S3Primary
-                && page0_patched.len() > 18
-                && page0_patched[18] == 0
-            {
-                page0_patched[18] = 1; // DELETE = 1
-            }
-            let _ = self.cache.write_page(0, &page0_patched);
-            // Mark page 0 as present so the VFS serves it from cache
-            // instead of re-fetching from S3 (which has the unpatched header).
-            self.cache.bitmap.lock().mark_present(0);
+            let _ = self.cache.write_page(0, page0);
+            // Note: we only write page 0, not the full group. Don't mark the
+            // group as Present since other pages in the group may not be cached.
         }
 
         // Update page_count atomic
