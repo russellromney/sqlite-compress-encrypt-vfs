@@ -32,6 +32,7 @@ fn make_manifest(
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
+        db_header: None,
     }
 }
 
@@ -223,7 +224,7 @@ proptest! {
             page_count,
             page_size: 4096,
             pages_per_group: pages_per_group as u32,
-            page_group_keys: (0..num_groups).map(|gid| format!("pg/{}_v1", gid)).collect(),
+            page_group_keys: (0..num_groups).map(|gid| format!("p/d/{}_v1", gid)).collect(),
             interior_chunk_keys: HashMap::new(),
             index_chunk_keys: HashMap::new(),
             frame_tables: Vec::new(),
@@ -237,6 +238,7 @@ proptest! {
             page_to_tree_name: HashMap::new(),
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
+            db_header: None,
         };
         manifest.build_page_index();
 

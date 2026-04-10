@@ -111,24 +111,24 @@ impl S3Client {
         self.s3_key("manifest.json")
     }
 
-    /// Generate versioned S3 key for a page group.
+    /// Generate versioned S3 key for a data page group.
     pub(crate) fn page_group_key(&self, group_id: u64, version: u64) -> String {
-        self.s3_key(&format!("pg/{}_v{}", group_id, version))
+        self.s3_key(&format!("p/d/{}_v{}", group_id, version))
     }
 
-    /// Generate versioned S3 key for a chunked interior bundle piece.
+    /// Generate versioned S3 key for an interior bundle.
     pub(crate) fn interior_chunk_key(&self, chunk_id: u32, version: u64) -> String {
-        self.s3_key(&format!("ibc/{}_v{}", chunk_id, version))
+        self.s3_key(&format!("p/it/{}_v{}", chunk_id, version))
     }
 
-    /// Generate versioned S3 key for a chunked index leaf bundle piece.
+    /// Generate versioned S3 key for an index leaf bundle.
     pub(crate) fn index_chunk_key(&self, chunk_id: u32, version: u64) -> String {
-        self.s3_key(&format!("ixb/{}_v{}", chunk_id, version))
+        self.s3_key(&format!("p/ix/{}_v{}", chunk_id, version))
     }
 
     /// Phase Drift: override frame key.
     pub(crate) fn override_frame_key(&self, group_id: u64, frame_idx: usize, version: u64) -> String {
-        self.s3_key(&format!("pg/{}_f{}_v{}", group_id, frame_idx, version))
+        self.s3_key(&format!("p/d/{}_f{}_v{}", group_id, frame_idx, version))
     }
 
     // --- Generic GET/PUT ---

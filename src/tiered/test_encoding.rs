@@ -297,7 +297,7 @@ fn test_seekable_manifest_serde_with_frames() {
         page_count: 128,
         page_size: 4096,
         pages_per_group: 64,
-        page_group_keys: vec!["pg/0_v1".to_string(), "pg/1_v1".to_string()],
+        page_group_keys: vec!["p/d/0_v1".to_string(), "p/d/1_v1".to_string()],
         frame_tables: vec![
             vec![
                 FrameEntry { offset: 0, len: 500 },

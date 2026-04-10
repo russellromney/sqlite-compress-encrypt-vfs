@@ -20,7 +20,7 @@ pub struct Manifest {
     /// Pages per page group
     #[serde(default = "default_pages_per_group")]
     pub pages_per_group: u32,
-    /// Map groupId → S3 key. Versioned: "pg/{gid}_v{version}"
+    /// Map groupId → S3 key. Versioned: "p/d/{gid}_v{version}"
     #[serde(default)]
     pub page_group_keys: Vec<String>,
     /// Chunked interior bundle: chunk_id → S3 key. Each chunk covers bundle_chunk_range(page_size) page numbers.

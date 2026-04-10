@@ -69,7 +69,98 @@ impl TurboliteVfs {
             StorageBackend::Local => Self::new_local(config),
             #[cfg(feature = "cloud")]
             StorageBackend::S3 { .. } => Self::new_cloud(config),
+            StorageBackend::Http { endpoint, token, prefix, fence_token } => {
+                Self::new_http(config, &endpoint, &token, &prefix, fence_token)
+            }
         }
+    }
+
+    /// Construct an HTTP-backed VFS. Uses Bearer token auth against a storage API.
+    fn new_http(mut config: TurboliteConfig, endpoint: &str, token: &str, prefix: &str, fence_token: Arc<AtomicU64>) -> io::Result<Self> {
+        // HTTP backend flushes through StorageClient, not S3 directly.
+        // Durable and S3Primary require self.s3 (Arc<S3Client>) which is None for HTTP.
+        config.sync_mode = SyncMode::LocalThenFlush;
+
+        // Check config.runtime_handle (cloud feature only), fall back to try_current()
+        let runtime_handle = {
+            #[cfg(feature = "cloud")]
+            if let Some(ref handle) = config.runtime_handle {
+                handle.clone()
+            } else {
+                TokioHandle::try_current().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "No tokio runtime available for HTTP storage client",
+                    )
+                })?
+            }
+            #[cfg(not(feature = "cloud"))]
+            TokioHandle::try_current().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "No tokio runtime available for HTTP storage client",
+                )
+            })?
+        };
+
+        let http = Arc::new(http_client::HttpClient::new(
+            endpoint, token, prefix, runtime_handle.clone(), fence_token,
+        ));
+        let storage = Arc::new(StorageClient::http(Arc::clone(&http)));
+
+        // Load manifest
+        let (mut manifest, recovered_dirty_groups) = match manifest::LocalManifest::load(&config.cache_dir) {
+            Ok(Some(local)) => (local.manifest, local.dirty_groups),
+            _ => (http.get_manifest()?.unwrap_or_else(Manifest::empty), Vec::new()),
+        };
+        manifest.detect_and_normalize_strategy();
+
+        let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let ppg = if manifest.pages_per_group > 0 { manifest.pages_per_group } else { config.pages_per_group };
+
+        let cache = DiskCache::new_with_compression(
+            &config.cache_dir, config.cache_ttl_secs, ppg, config.sub_pages_per_frame,
+            page_size, manifest.page_count, config.encryption_key,
+            manifest.group_pages.clone(),
+            config.cache_compression, config.cache_compression_level,
+            #[cfg(feature = "zstd")]
+            config.dictionary.clone(),
+        )?;
+        let manifest_groups = manifest.total_groups() as usize;
+        cache.ensure_group_capacity(manifest_groups);
+
+        let cache = Arc::new(cache);
+        let page_count = Arc::new(AtomicU64::new(manifest.page_count));
+        let shared_manifest = Arc::new(RwLock::new(manifest));
+        let initial_dirty: HashSet<u64> = recovered_dirty_groups.into_iter().collect();
+        let shared_dirty_groups = Arc::new(Mutex::new(initial_dirty));
+        let flush_lock = Arc::new(Mutex::new(()));
+
+        let staging_dir = config.cache_dir.join("staging");
+        let recovered_staging = staging::recover_staging_logs(&staging_dir, page_size)?;
+        let max_recovered_version = recovered_staging.iter().map(|p| p.version).max().unwrap_or(0);
+        let staging_seq = Arc::new(AtomicU64::new(max_recovered_version + 1));
+        let pending_flushes = Arc::new(Mutex::new(recovered_staging));
+
+        Ok(Self {
+            storage,
+            s3: None,
+            cache,
+            prefetch_pool: None,
+            page_count,
+            config,
+            #[cfg(feature = "cloud")]
+            _runtime: None,
+            shared_manifest,
+            shared_dirty_groups,
+            pending_flushes,
+            staging_seq,
+            flush_lock,
+            #[cfg(feature = "wal")]
+            wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
+            #[cfg(feature = "cloud")]
+            runtime_handle: Some(runtime_handle),
+        })
     }
 
     /// Construct a local-only VFS. No S3, no tokio, no async.
@@ -649,6 +740,12 @@ impl TurboliteVfs {
     }
 
     /// Fetch the latest manifest from S3 and apply it via set_manifest.
+    /// Whether this VFS has remote storage (S3 or HTTP).
+    /// Local-only VFS stores pages on disk with no cloud sync.
+    pub fn has_remote_storage(&self) -> bool {
+        !self.storage.is_local()
+    }
+
     /// Returns the new manifest version, or None if no manifest exists in S3.
     /// Used by HA followers to catch up from the leader's turbolite state.
     #[cfg(feature = "cloud")]

@@ -70,9 +70,9 @@ fn test_manifest_serde_roundtrip() {
         page_size: 4096,
         pages_per_group: 2048,
         page_group_keys: vec![
-            "pg/0_v1".to_string(),
-            "pg/1_v1".to_string(),
-            "pg/2_v1".to_string(),
+            "p/d/0_v1".to_string(),
+            "p/d/1_v1".to_string(),
+            "p/d/2_v1".to_string(),
         ],
         ..Manifest::empty()
     };
@@ -127,7 +127,7 @@ fn test_seekable_manifest_serde_with_frames() {
         page_count: 128,
         page_size: 4096,
         pages_per_group: 64,
-        page_group_keys: vec!["pg/0_v1".to_string(), "pg/1_v1".to_string()],
+        page_group_keys: vec!["p/d/0_v1".to_string(), "p/d/1_v1".to_string()],
         frame_tables: vec![
             vec![
                 FrameEntry { offset: 0, len: 500 },
@@ -375,7 +375,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
         page_size: 4096,
         pages_per_group: 8,
         page_group_keys: vec![
-            "pg/0_v5".into(), "pg/1_v5".into(), "pg/2_v5".into(),
+            "p/d/0_v5".into(), "p/d/1_v5".into(), "p/d/2_v5".into(),
         ],
         group_pages: vec![
             vec![0, 5, 10, 15],     // B-tree A (scattered)
@@ -478,7 +478,7 @@ fn test_manifest_btree_group_partial_last_group() {
 #[test]
 fn test_manifest_deserialize_btree_fields_default_when_missing() {
     // Old manifests without group_pages/btrees should deserialize cleanly
-    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["pg/0_v1","pg/1_v1","pg/2_v1","pg/3_v1"]}"#;
+    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["p/d/0_v1","p/d/1_v1","p/d/2_v1","p/d/3_v1"]}"#;
     let m: Manifest = serde_json::from_str(json).unwrap();
 
     // B-tree fields default to empty
@@ -873,7 +873,7 @@ fn test_dirty_frames_all_beyond_frame_table() {
 #[test]
 fn test_subframe_override_json_roundtrip() {
     let ovr = SubframeOverride {
-        key: "pg/0_f1_v5".to_string(),
+        key: "p/d/0_f1_v5".to_string(),
         entry: FrameEntry { offset: 0, len: 1234 },
     };
     let json = serde_json::to_string(&ovr).expect("json serialize");
@@ -884,7 +884,7 @@ fn test_subframe_override_json_roundtrip() {
 #[test]
 fn test_subframe_override_msgpack_roundtrip() {
     let ovr = SubframeOverride {
-        key: "pg/3_f2_v10".to_string(),
+        key: "p/d/3_f2_v10".to_string(),
         entry: FrameEntry { offset: 0, len: 5678 },
     };
     let bytes = rmp_serde::to_vec(&ovr).expect("msgpack serialize");
@@ -895,7 +895,7 @@ fn test_subframe_override_msgpack_roundtrip() {
 #[test]
 fn test_manifest_backward_compat_no_overrides() {
     // Old manifest JSON without subframe_overrides should deserialize to empty vec
-    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["pg/0_v1"]}"#;
+    let json = r#"{"version":1,"page_count":100,"page_size":4096,"pages_per_group":32,"page_group_keys":["p/d/0_v1"]}"#;
     let m: Manifest = serde_json::from_str(json).expect("deserialize");
     assert!(m.subframe_overrides.is_empty());
 }
@@ -904,7 +904,7 @@ fn test_manifest_backward_compat_no_overrides() {
 fn test_manifest_with_overrides_serde_roundtrip() {
     let mut overrides = HashMap::new();
     overrides.insert(1, SubframeOverride {
-        key: "pg/0_f1_v5".to_string(),
+        key: "p/d/0_f1_v5".to_string(),
         entry: FrameEntry { offset: 0, len: 1000 },
     });
     let m = Manifest {
@@ -912,7 +912,7 @@ fn test_manifest_with_overrides_serde_roundtrip() {
         page_count: 100,
         page_size: 4096,
         pages_per_group: 32,
-        page_group_keys: vec!["pg/0_v4".to_string()],
+        page_group_keys: vec!["p/d/0_v4".to_string()],
         subframe_overrides: vec![overrides],
         ..Manifest::empty()
     };
@@ -921,7 +921,7 @@ fn test_manifest_with_overrides_serde_roundtrip() {
     assert_eq!(m2.subframe_overrides.len(), 1);
     assert_eq!(m2.subframe_overrides[0].len(), 1);
     let ovr = &m2.subframe_overrides[0][&1];
-    assert_eq!(ovr.key, "pg/0_f1_v5");
+    assert_eq!(ovr.key, "p/d/0_f1_v5");
     assert_eq!(ovr.entry.len, 1000);
 }
 
@@ -929,7 +929,7 @@ fn test_manifest_with_overrides_serde_roundtrip() {
 fn test_vacuum_clears_overrides() {
     let mut overrides = HashMap::new();
     overrides.insert(0, SubframeOverride {
-        key: "pg/0_f0_v3".to_string(),
+        key: "p/d/0_f0_v3".to_string(),
         entry: FrameEntry { offset: 0, len: 500 },
     });
     let mut m = Manifest {
@@ -948,7 +948,7 @@ fn test_vacuum_clears_overrides() {
         }
     }
     m.subframe_overrides.clear();
-    assert_eq!(gc_keys, vec!["pg/0_f0_v3"]);
+    assert_eq!(gc_keys, vec!["p/d/0_f0_v3"]);
     assert!(m.subframe_overrides.is_empty());
 }
 
@@ -959,7 +959,7 @@ fn test_normalize_overrides_extends_to_match_groups() {
         page_count: 100,
         page_size: 4096,
         pages_per_group: 32,
-        page_group_keys: vec!["pg/0_v1".into(), "pg/1_v1".into(), "pg/2_v1".into()],
+        page_group_keys: vec!["p/d/0_v1".into(), "p/d/1_v1".into(), "p/d/2_v1".into()],
         subframe_overrides: Vec::new(), // empty
         ..Manifest::empty()
     };
@@ -976,11 +976,11 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
     // This catches issues with HashMap<usize, SubframeOverride> serialization.
     let mut overrides_g0 = HashMap::new();
     overrides_g0.insert(2usize, manifest::SubframeOverride {
-        key: "pg/0_f2_v3".to_string(),
+        key: "p/d/0_f2_v3".to_string(),
         entry: FrameEntry { offset: 0, len: 500 },
     });
     overrides_g0.insert(5usize, manifest::SubframeOverride {
-        key: "pg/0_f5_v3".to_string(),
+        key: "p/d/0_f5_v3".to_string(),
         entry: FrameEntry { offset: 0, len: 800 },
     });
 
@@ -990,7 +990,7 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
         page_size: 4096,
         pages_per_group: 128,
         sub_pages_per_frame: 8,
-        page_group_keys: vec!["pg/0_v2".to_string(), "pg/1_v2".to_string()],
+        page_group_keys: vec!["p/d/0_v2".to_string(), "p/d/1_v2".to_string()],
         frame_tables: vec![
             vec![FrameEntry { offset: 0, len: 100 }, FrameEntry { offset: 100, len: 200 }],
             vec![FrameEntry { offset: 0, len: 150 }],
@@ -1007,7 +1007,7 @@ fn test_full_manifest_with_overrides_msgpack_roundtrip() {
     assert_eq!(m2.subframe_overrides[0].len(), 2, "group 0 should have 2 overrides");
     assert!(m2.subframe_overrides[0].contains_key(&2), "should have override for frame 2");
     assert!(m2.subframe_overrides[0].contains_key(&5), "should have override for frame 5");
-    assert_eq!(m2.subframe_overrides[0][&2].key, "pg/0_f2_v3");
+    assert_eq!(m2.subframe_overrides[0][&2].key, "p/d/0_f2_v3");
     assert_eq!(m2.subframe_overrides[0][&5].entry.len, 800);
     assert!(m2.subframe_overrides[1].is_empty(), "group 1 should have no overrides");
 }
