@@ -23,6 +23,19 @@ pub enum StorageBackend {
         /// AWS region (default "us-east-1")
         region: Option<String>,
     },
+    /// HTTP-backed mode. Uses Bearer token auth against a storage API
+    /// (e.g., Grabby /v1/sync/pages/). Local disk is a cache.
+    Http {
+        /// Base URL (e.g., "https://storage.iad.cinch.dev")
+        endpoint: String,
+        /// Bearer token for authentication
+        token: String,
+        /// Key prefix (e.g., "database-id")
+        prefix: String,
+        /// Shared fence token, updated by lease renewal loop.
+        #[serde(skip)]
+        fence_token: Arc<std::sync::atomic::AtomicU64>,
+    },
 }
 
 impl Default for StorageBackend {
@@ -342,6 +355,7 @@ impl TurboliteConfig {
         match &self.storage_backend {
             #[cfg(feature = "cloud")]
             StorageBackend::S3 { .. } => self.storage_backend.clone(),
+            StorageBackend::Http { .. } => self.storage_backend.clone(),
             StorageBackend::Local => {
                 #[cfg(feature = "cloud")]
                 if !self.bucket.is_empty() {

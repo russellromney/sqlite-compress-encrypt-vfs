@@ -34,6 +34,7 @@ fn make_manifest(
         page_to_tree_name: HashMap::new(),
         tree_name_to_groups: HashMap::new(),
         group_to_tree_name: HashMap::new(),
+        db_header: None,
     }
 }
 
