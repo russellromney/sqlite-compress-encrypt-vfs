@@ -335,13 +335,10 @@ fn flush_inner(
         }
     }
 
-    // 7. Upload all dirty page groups
-    eprintln!("[flush] uploading {} page groups...", uploads.len());
-    s3.put_page_groups(&uploads)?;
-    eprintln!("[flush] page groups uploaded");
-
-    // 8. Interior chunks: collect from staging + cache, re-upload dirty chunks
-    eprintln!("[flush] building interior chunks...");
+    // 7-9. Build interior + index chunks BEFORE uploading anything,
+    // then upload page groups + interior + index in a single parallel batch.
+    eprintln!("[flush] building interior + index chunks in parallel with page group encoding...");
+    let page_group_upload_count = uploads.len();
     let chunk_range = bundle_chunk_range(page_size);
     let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
     {
@@ -422,11 +419,8 @@ fn flush_inner(
         }
     }
 
-    if !chunk_uploads.is_empty() {
-        eprintln!("[flush] uploading {} interior chunks...", chunk_uploads.len());
-        s3.put_page_groups(&chunk_uploads)?;
-        eprintln!("[flush] interior chunks uploaded");
-    }
+    // Add interior chunks to the combined upload batch
+    uploads.extend(chunk_uploads);
 
     // 9. Index leaf bundles (same pattern as interior)
     // Two sources: (a) staged/cache dirty group pages that are index leaves,
@@ -558,11 +552,18 @@ fn flush_inner(
         }
     }
 
-    if !index_chunk_uploads.is_empty() {
-        eprintln!("[flush] uploading {} index chunks...", index_chunk_uploads.len());
-        s3.put_page_groups(&index_chunk_uploads)?;
-        eprintln!("[flush] index chunks uploaded");
-    }
+    // Add index chunks to the combined upload batch
+    let index_chunk_count = index_chunk_uploads.len();
+    uploads.extend(index_chunk_uploads);
+
+    // 7-9 combined: single parallel upload of ALL objects (page groups + interior + index)
+    let interior_count = uploads.len() - page_group_upload_count - index_chunk_count;
+    eprintln!(
+        "[flush] uploading {} objects ({} page groups + {} interior + {} index)...",
+        uploads.len(), page_group_upload_count, interior_count, index_chunk_count,
+    );
+    s3.put_page_groups(&uploads)?;
+    eprintln!("[flush] all {} objects uploaded", uploads.len());
 
     // 10. Update manifest atomically
     // Phase Drift: GC overrides for fully-rewritten groups before manifest construction

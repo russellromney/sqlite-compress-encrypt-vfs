@@ -2764,12 +2764,8 @@ impl DatabaseHandle for TurboliteHandle {
             new_keys[gid as usize] = key;
         }
 
-        // Parallel upload all dirty page groups
-        eprintln!("[sync] uploading {} dirty page groups...", uploads.len());
-        s3.put_page_groups(&uploads)?;
-        eprintln!("[sync] page groups uploaded");
-
-        eprintln!("[sync] building interior chunks...");
+        let page_group_count = uploads.len();
+        eprintln!("[sync] encoded {} page groups, building interior + index chunks...", page_group_count);
         // Build chunked interior bundles: group interior pages by fixed page-number ranges.
         // Only re-upload chunks that contain dirty interior pages.
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new(); // pnum → data
@@ -2885,15 +2881,9 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Parallel upload all dirty interior chunks
-        if !chunk_uploads.is_empty() {
-            eprintln!("[sync] uploading {} interior chunks...", chunk_uploads.len());
-            s3.put_page_groups(&chunk_uploads)?;
-            eprintln!("[sync] interior chunks uploaded");
-        }
+        uploads.extend(chunk_uploads);
 
         // ── Index leaf bundles (same pattern as interior) ──
-        eprintln!("[sync] building index leaf bundles...");
         let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
         {
             // Phase Marne: read dirty pages from cache for index leaf classification
@@ -3008,11 +2998,12 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        if !index_chunk_uploads.is_empty() {
-            eprintln!("[sync] uploading {} index chunks...", index_chunk_uploads.len());
-            s3.put_page_groups(&index_chunk_uploads)?;
-            eprintln!("[sync] index chunks uploaded");
-        }
+        uploads.extend(index_chunk_uploads);
+
+        // Single parallel upload: page groups + interior + index chunks
+        eprintln!("[sync] uploading {} objects to S3...", uploads.len());
+        s3.put_page_groups(&uploads)?;
+        eprintln!("[sync] all {} objects uploaded", uploads.len());
 
         // Update manifest atomically
         let old_manifest = (**self.manifest.load()).clone();
