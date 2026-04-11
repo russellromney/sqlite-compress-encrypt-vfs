@@ -374,6 +374,80 @@ impl DiskCache {
         })
     }
 
+    /// Promote contiguous decoded pages directly into mem_cache (zero extra I/O).
+    /// Called after write_pages_bulk/write_pages_scattered when pages are decoded from S3.
+    /// The data is already in `raw_data` at page-size offsets, so we just memcpy into the cache.
+    pub(crate) fn promote_bulk_to_mem_cache(&self, start_page: u64, raw_data: &[u8], num_pages: u64) {
+        let mc = match self.mem_cache {
+            Some(ref mc) => mc,
+            None => return,
+        };
+        let ps = self.page_size.load(Ordering::Relaxed) as usize;
+        if ps == 0 { return; }
+
+        for i in 0..num_pages as usize {
+            let pnum = start_page + i as u64;
+            if let Some(slot) = mc.get(pnum as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                if !ptr.is_null() {
+                    // Already cached, update in place
+                    let src_start = i * ps;
+                    let copy_len = ps.min(raw_data.len() - src_start);
+                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, copy_len); }
+                } else {
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 > self.mem_cache_budget { return; } // budget exhausted
+                    let src_start = i * ps;
+                    let src_end = (src_start + ps).min(raw_data.len());
+                    let mut page_buf = vec![0u8; ps].into_boxed_slice();
+                    page_buf[..src_end - src_start].copy_from_slice(&raw_data[src_start..src_end]);
+                    let new_ptr = Box::into_raw(page_buf) as *mut u8;
+                    if slot.compare_exchange(
+                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
+                    ).is_ok() {
+                        self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                    } else {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Promote scattered decoded pages directly into mem_cache (zero extra I/O).
+    pub(crate) fn promote_scattered_to_mem_cache(&self, page_nums: &[u64], raw_data: &[u8]) {
+        let mc = match self.mem_cache {
+            Some(ref mc) => mc,
+            None => return,
+        };
+        let ps = self.page_size.load(Ordering::Relaxed) as usize;
+        if ps == 0 { return; }
+
+        for (i, &pnum) in page_nums.iter().enumerate() {
+            if let Some(slot) = mc.get(pnum as usize) {
+                let ptr = slot.load(Ordering::Relaxed);
+                let src_start = i * ps;
+                if src_start + ps > raw_data.len() { break; }
+                if !ptr.is_null() {
+                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps); }
+                } else {
+                    let current = self.mem_cache_bytes.load(Ordering::Relaxed);
+                    if current + ps as u64 > self.mem_cache_budget { return; }
+                    let mut page_buf = vec![0u8; ps].into_boxed_slice();
+                    page_buf.copy_from_slice(&raw_data[src_start..src_start + ps]);
+                    let new_ptr = Box::into_raw(page_buf) as *mut u8;
+                    if slot.compare_exchange(
+                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
+                    ).is_ok() {
+                        self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
+                    } else {
+                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                    }
+                }
+            }
+        }
+    }
+
     /// Ensure the cache file is at least `needed` bytes. Lock-free fast path
     /// when file is already large enough; mutex only for the rare set_len.
     fn ensure_file_len(&self, needed: u64) -> io::Result<()> {
@@ -606,6 +680,9 @@ impl DiskCache {
             return self.write_pages_bulk_compressed(start_page, data, num_pages);
         }
 
+        // Promote decoded pages to mem_cache BEFORE encryption (we want raw data).
+        self.promote_bulk_to_mem_cache(start_page, data, num_pages);
+
         // CTR encryption: encrypt each page in-place (same size, no overhead)
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
@@ -760,6 +837,9 @@ impl DiskCache {
         if self.cache_compression {
             return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
         }
+
+        // Promote decoded pages to mem_cache before encryption
+        self.promote_scattered_to_mem_cache(written_pages, data);
 
         // Find max page to size the cache file
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
