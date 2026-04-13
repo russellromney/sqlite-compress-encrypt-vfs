@@ -2,37 +2,71 @@
 
 (Formerly `sqlite-compress-encrypt-vfs`, aka `sqlces`)
 
-## Pelican: Lock-Free Manifest + Concurrent Read/Write Performance
+## Pelican: Lock-Free Architecture + Concurrent Performance
 
-Eliminated severe write throughput regression under concurrent readers (55x -> 5x gap to plain SQLite). Three changes:
+Comprehensive performance overhaul: lock-free reads, mmap WAL-index, in-memory page
+cache, parallel S3 uploads, single-fsync checkpoint. 506 tests pass. Also found and
+fixed a concurrent corruption bug in the upstream sqlite-vfs crate.
 
 ### a. Atomic page bitmap
 - Replaced `Mutex<PageBitmap>` with `RwLock<PageBitmap>` backed by `Vec<AtomicU8>`
 - `is_present()` is now lock-free (atomic load), `mark_present()` uses atomic OR
 - `bitmap_mark()` helper auto-grows bitmap via read-then-upgrade pattern
-- Eliminates reader-reader and reader-writer contention on the cache bitmap hot path
 
 ### b. ArcSwap manifest
 - Replaced `Arc<RwLock<Manifest>>` with `Arc<ArcSwap<Manifest>>` (arc-swap crate)
 - Readers call `manifest.load()` (lock-free atomic pointer load, never blocks)
-- Writers clone manifest, mutate clone, atomically swap via `manifest.store()`
-- sync() dirty page iteration no longer holds exclusive lock, readers continue unblocked
-- Changed across handle.rs, vfs.rs, flush.rs, compact.rs, prefetch.rs, bench.rs
+- Writers clone-mutate-swap; sync() no longer holds exclusive lock
 
 ### c. Read fast path + AtomicU32 page_size
-- `read_exact_at()`: if page is in bitmap cache, read directly and return (skips dirty check, manifest lookup, prefetch heuristics, tree detection)
-- Replaced `page_size: RwLock<u32>` with `AtomicU32` (was acquired on every read/write)
+- `read_exact_at()`: generation counter skips dirty check, manifest lookup, prefetch heuristics
+- Replaced `page_size: RwLock<u32>` with `AtomicU32`
 
-### Benchmark results (perf-compare, 4 concurrent reader threads)
+### d. mmap WAL-index
+- WAL-index regions served via `mmap(MAP_SHARED)` instead of `pread`/`pwrite` syscalls
+- Readers see writer's WAL-index updates via shared memory (pointer dereference, no syscall)
+- 5.4x point-lookup improvement (145K/s -> 73K/s gap closed from syscall overhead)
 
-| Metric | Before | After |
-|--------|--------|-------|
-| rdw-write-4t | 210/s | 1,600/s |
-| rdw-read-4t | ~2,000/s | 2,500/s |
-| conc-read-4t | 14,900/s | 15,400/s |
-| point-lookup (single) | 30,000/s | 30,000/s |
+### e. In-memory page cache
+- `AtomicPtr` flat array for zero-lock reads of hot pages
+- Deferred-free eviction (no use-after-free under concurrent readers)
+- Promote decoded pages at decode time (zero extra I/O)
+- OOM guard in staging manifest recovery
 
-Remaining gap to plain SQLite (~5x for writes) is inherent VFS page indirection cost, not lock contention.
+### f. Single-fsync checkpoint
+- Combined staging log + manifest write into single fsync (was two separate fsyncs)
+- Local checkpoint from ~19ms to ~8ms for 1K inserts
+
+### g. Parallel S3 upload
+- Combined page group + interior + index uploads into single parallel batch
+- Parallel page group encoding with rayon
+
+### h. Background local flush
+- Detect interior pages at write time, defer local flush to background thread
+- Writer thread not blocked by local I/O
+
+### i. sqlite-vfs shm_barrier fix
+- Found concurrent corruption bug in upstream sqlite-vfs v0.2.0: `shm_barrier` was a
+  no-op when the writer held an exclusive WAL-index lock (the normal WAL write path).
+  Writer's WAL-index updates were never pushed to shared memory during the barrier;
+  readers saw stale data, causing SQLITE_CORRUPT (40% failure rate under 1W+4R load).
+- Fix: push when holding ANY exclusive lock (db or WAL-index).
+  Patched in fork: russellromney/sqlite-vfs branch fix/shm-barrier-wal-push.
+- sqlite-vfs is unmaintained (last commit 2022), self-described prototype.
+  Migration to sqlite-plugin (orbitinghail) planned as Phase Soyuz.
+
+### Benchmark results (perf-compare, Fly.io performance-2x, 4 concurrent readers)
+
+| Operation | SQLite | turbolite | Overhead |
+|-----------|--------|-----------|----------|
+| Point lookup | 145K/s | 73K/s | 2.0x |
+| Range scan | 8.8K/s | 8.3K/s | parity |
+| Full table scan | 56/s | 60/s | parity |
+| INSERT | 19K/s | 23K/s | faster |
+| UPDATE by PK | 40K/s | 27K/s | 1.5x |
+| Batch INSERT (in txn) | 685K/s | 740K/s | faster |
+| rdw-write-4t | 210/s -> 1,600/s | | |
+| Concurrent corruption | 40% -> 0% (30/30 pass) | | |
 
 ---
 
