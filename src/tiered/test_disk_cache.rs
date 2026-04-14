@@ -2113,3 +2113,93 @@ fn test_drop_frees_all_mem_cache_pages() {
     // If Drop didn't free, this would be caught by miri/valgrind, not by assertion.
     // This test just ensures Drop doesn't panic.
 }
+
+#[test]
+fn test_mem_cache_invalidated_on_write() {
+    // Regression: write_all_at must invalidate mem_cache so reads see the new data,
+    // not a stale in-memory copy from a prior S3 fetch.
+    let dir = TempDir::new().unwrap();
+    let ps: u32 = 4096;
+    let page_count: u64 = 16;
+    let ppg: u32 = 4;
+    let gp = positional_group_pages(ppg, page_count);
+    let budget = 1024 * 1024; // 1MB mem_cache
+
+    let cache = DiskCache::new_with_compression(
+        dir.path(), 0, ppg, 1, ps, page_count, None, gp,
+        false, 3,
+        #[cfg(feature = "zstd")]
+        None,
+        budget,
+    ).unwrap();
+
+    // Simulate S3 fetch: write page 0 to disk cache.
+    let original = vec![0xAAu8; ps as usize];
+    cache.write_page(0, &original).unwrap();
+
+    // Promote to mem_cache (simulates what happens after S3 fetch decode).
+    cache.promote_bulk_to_mem_cache(0, &original, 1);
+
+    // Verify mem_cache has the page.
+    let mut buf = vec![0u8; ps as usize];
+    cache.read_page(0, &mut buf).unwrap();
+    assert_eq!(buf[0], 0xAA, "should read original from mem_cache");
+
+    // Now write a NEW version (simulates SQLite writing a dirty page).
+    let updated = vec![0xBBu8; ps as usize];
+    cache.write_page(0, &updated).unwrap();
+    cache.clear_pages_from_mem_cache(&[0]);
+
+    // Read should return the NEW version, not the stale mem_cache copy.
+    let mut buf2 = vec![0u8; ps as usize];
+    cache.read_page(0, &mut buf2).unwrap();
+    assert_eq!(buf2[0], 0xBB, "should read updated data after write invalidated mem_cache");
+}
+
+#[test]
+fn test_mem_cache_invalidated_on_evict_group() {
+    // Regression: set_manifest -> evict_group must clear mem_cache entries,
+    // not just disk cache. Otherwise follower reads stale data after replication.
+    let dir = TempDir::new().unwrap();
+    let ps: u32 = 4096;
+    let page_count: u64 = 8;
+    let ppg: u32 = 4;
+    let gp = positional_group_pages(ppg, page_count);
+    let budget = 1024 * 1024;
+
+    let cache = DiskCache::new_with_compression(
+        dir.path(), 0, ppg, 1, ps, page_count, None, gp,
+        false, 3,
+        #[cfg(feature = "zstd")]
+        None,
+        budget,
+    ).unwrap();
+    cache.ensure_group_capacity(2);
+
+    // Write pages 0-3 (group 0) and promote to mem_cache.
+    for p in 0..4u64 {
+        let data = vec![(p + 1) as u8; ps as usize];
+        cache.write_page(p, &data).unwrap();
+        cache.promote_bulk_to_mem_cache(p, &data, 1);
+    }
+    cache.mark_group_present(0);
+
+    // Verify mem_cache has bytes allocated.
+    assert!(cache.mem_cache_bytes.load(Ordering::Relaxed) > 0);
+
+    // Evict group 0 (simulates set_manifest with changed group).
+    cache.evict_group(0);
+
+    // mem_cache should be cleared for those pages.
+    assert_eq!(cache.mem_cache_bytes.load(Ordering::Relaxed), 0,
+        "evict_group should clear mem_cache entries");
+
+    // Write NEW data for page 0 (simulates follower receiving updated page from S3).
+    let new_data = vec![0xFFu8; ps as usize];
+    cache.write_page(0, &new_data).unwrap();
+
+    // Read should return the NEW data, not the evicted stale mem_cache copy.
+    let mut buf = vec![0u8; ps as usize];
+    cache.read_page(0, &mut buf).unwrap();
+    assert_eq!(buf[0], 0xFF, "after evict_group + new write, should read new data");
+}

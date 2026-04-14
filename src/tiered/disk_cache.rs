@@ -1268,11 +1268,37 @@ impl DiskCache {
     pub(crate) fn evict_group(&self, gid: u64) {
         let page_nums = self.group_page_nums(gid);
         self.clear_pages_from_disk(&page_nums);
+        self.clear_pages_from_mem_cache(&page_nums);
         self.tracker.lock().remove_group(gid as u32);
 
         let states = self.group_states.lock();
         if let Some(s) = states.get(gid as usize) {
             s.store(GroupState::None as u8, Ordering::Release);
+        }
+    }
+
+    /// Clear pages from the in-memory cache. Nulls out AtomicPtrs and frees the allocations.
+    /// Called by evict_group (set_manifest) and write_all_at (dirty page write) to prevent
+    /// stale mem_cache reads.
+    pub(crate) fn clear_pages_from_mem_cache(&self, page_nums: &[u64]) {
+        let mc = match self.mem_cache {
+            Some(ref mc) => mc,
+            None => return,
+        };
+        let ps = self.page_size.load(Ordering::Relaxed) as u64;
+        for &pn in page_nums {
+            if let Some(slot) = mc.get(pn as usize) {
+                let old = slot.swap(std::ptr::null_mut(), Ordering::AcqRel);
+                if !old.is_null() {
+                    // Safety: we allocated this in promote_*_to_mem_cache via alloc::alloc.
+                    unsafe {
+                        let layout = std::alloc::Layout::from_size_align(ps as usize, 1)
+                            .expect("valid layout");
+                        std::alloc::dealloc(old, layout);
+                    }
+                    self.mem_cache_bytes.fetch_sub(ps, Ordering::Relaxed);
+                }
+            }
         }
     }
 

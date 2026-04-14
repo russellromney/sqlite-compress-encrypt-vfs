@@ -126,7 +126,7 @@ impl TurboliteVfs {
             config.cache_compression, config.cache_compression_level,
             #[cfg(feature = "zstd")]
             config.dictionary.clone(),
-            config.max_cache_bytes.unwrap_or(0),
+            config.mem_cache_budget,
         )?;
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
@@ -235,7 +235,7 @@ impl TurboliteVfs {
             config.cache_compression, config.cache_compression_level,
             #[cfg(feature = "zstd")]
             config.dictionary.clone(),
-            config.max_cache_bytes.unwrap_or(0),
+            config.mem_cache_budget,
         )?;
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
@@ -337,7 +337,7 @@ impl TurboliteVfs {
             config.cache_compression, config.cache_compression_level,
             #[cfg(feature = "zstd")]
             config.dictionary.clone(),
-            config.max_cache_bytes.unwrap_or(0),
+            config.mem_cache_budget,
         )?;
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
