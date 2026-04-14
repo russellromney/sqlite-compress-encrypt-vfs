@@ -236,6 +236,14 @@ pub struct TurboliteConfig {
     pub override_threshold: u32,
     /// Phase Drift-d: compaction threshold. Default 8.
     pub compaction_threshold: u32,
+    /// In-memory page cache budget in bytes. When > 0, turbolite caches decoded pages
+    /// in memory (zero-copy AtomicPtr reads). Pages are promoted on S3 fetch and
+    /// invalidated on manifest change (evict_group clears both disk and mem cache).
+    /// Default: 0 (disabled). For read-only replicas, set to 8MB+ for memory-speed reads.
+    /// Also disables SQLite's page cache (PRAGMA cache_size=0) when enabled, since
+    /// turbolite's cache is manifest-aware and SQLite's is not.
+    /// Also settable via TURBOLITE_MEM_CACHE_BUDGET env var.
+    pub mem_cache_budget: u64,
     /// Compress pages in the local disk cache using zstd before writing.
     /// Saves disk space at the cost of CPU on cache hits (compress on write, decompress on read).
     /// When combined with encryption_key, order is: compress then encrypt on write,
@@ -312,6 +320,10 @@ impl Default for TurboliteConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
+            mem_cache_budget: std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .unwrap_or(64 * 1024 * 1024), // 64MB default
             cache_compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),

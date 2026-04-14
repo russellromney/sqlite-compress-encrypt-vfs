@@ -1497,6 +1497,9 @@ impl DatabaseHandle for TurboliteHandle {
         // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
         if let Some(cache) = &self.cache {
             cache.write_page(page_num, buf)?;
+            // Invalidate mem_cache for this page so reads see the fresh disk write,
+            // not a stale in-memory copy from a prior S3 fetch.
+            cache.clear_pages_from_mem_cache(&[page_num]);
 
             // Detect interior pages at write time (avoids re-reading during sync).
             let hdr_off = if page_num == 0 { 100 } else { 0 };
