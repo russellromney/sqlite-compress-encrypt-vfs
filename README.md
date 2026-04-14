@@ -167,7 +167,7 @@ SQLite (PRAGMA cache_size=0)
 - `TURBOLITE_MEM_CACHE_BUDGET` env var (e.g., `128MB`, `1GB`).
 - Set to `0` to disable the in-memory cache entirely.
 
-For read replicas, set `PRAGMA cache_size=0` on the SQLite connection to disable SQLite's cache and let turbolite's manifest-aware cache handle it. Without this, SQLite may serve stale data from its own cache after replication updates the underlying pages.
+> **Required for read replicas / HA followers:** set `PRAGMA cache_size=0` on the SQLite connection. SQLite's built-in page cache does not invalidate when turbolite receives new pages via replication. Without this pragma, follower reads return stale data. turbolite's own cache (configured above) handles caching correctly.
 
 ### Encryption & Compression
 
