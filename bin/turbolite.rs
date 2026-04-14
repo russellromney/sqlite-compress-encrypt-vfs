@@ -3,11 +3,11 @@
 //! Management commands for turbolite databases: inspect manifests,
 //! import/export, interactive shell, and cache download.
 
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "turbolite", version, about = "turbolite CLI")]
@@ -18,6 +18,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show setup instructions (shell completions, etc.)
+    Setup,
+
+    /// Generate shell completions (bash, zsh, fish)
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
     /// Print manifest summary for a turbolite database
     Info {
         /// Path to the database file
@@ -338,6 +349,134 @@ fn cmd_info(
     Ok(())
 }
 
+// ── Shell tab completion ────────────────────────────────────────────
+
+/// Load table and column names from the database for tab completion.
+fn load_schema_completions(conn: &rusqlite::Connection) -> (Vec<String>, Vec<String>) {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    let mut columns: Vec<String> = Vec::new();
+    for table in &tables {
+        if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table.replace('"', "\"\""))) {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) {
+                for col in rows.flatten() {
+                    if !columns.contains(&col) {
+                        columns.push(col);
+                    }
+                }
+            }
+        }
+    }
+
+    (tables, columns)
+}
+
+struct ShellCompleter {
+    tables: Vec<String>,
+    columns: Vec<String>,
+    dot_commands: Vec<String>,
+}
+
+impl ShellCompleter {
+    fn new(tables: Vec<String>, columns: Vec<String>) -> Self {
+        Self {
+            tables,
+            columns,
+            dot_commands: vec![
+                ".quit".into(), ".exit".into(), ".tables".into(), ".schema".into(),
+            ],
+        }
+    }
+}
+
+impl rustyline::completion::Completer for ShellCompleter {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let before = &line[..pos];
+
+        // Dot commands
+        if before.starts_with('.') {
+            let matches: Vec<String> = self.dot_commands.iter()
+                .filter(|c| c.starts_with(before))
+                .cloned()
+                .collect();
+            return Ok((0, matches));
+        }
+
+        // Find the word being typed
+        let word_start = before.rfind(|c: char| c.is_whitespace() || c == '(' || c == ',')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let partial = &before[word_start..];
+        if partial.is_empty() {
+            return Ok((pos, Vec::new()));
+        }
+
+        let partial_upper = partial.to_uppercase();
+
+        // After FROM, JOIN, INTO, UPDATE, TABLE -- complete table names
+        let upper = before.to_uppercase();
+        let context_is_table = upper.contains("FROM ")
+            || upper.contains("JOIN ")
+            || upper.contains("INTO ")
+            || upper.contains("UPDATE ")
+            || upper.contains("TABLE ");
+
+        let mut matches: Vec<String> = Vec::new();
+
+        if context_is_table {
+            for t in &self.tables {
+                if t.to_uppercase().starts_with(&partial_upper) {
+                    matches.push(t.clone());
+                }
+            }
+        }
+
+        // Always try column names too (covers SELECT, WHERE, ORDER BY, etc.)
+        for c in &self.columns {
+            if c.to_uppercase().starts_with(&partial_upper) && !matches.contains(c) {
+                matches.push(c.clone());
+            }
+        }
+
+        // SQL keywords as fallback
+        let keywords = ["SELECT", "FROM", "WHERE", "INSERT", "UPDATE", "DELETE",
+            "CREATE", "DROP", "ALTER", "INDEX", "TABLE", "INTO", "VALUES",
+            "SET", "AND", "OR", "NOT", "NULL", "ORDER", "BY", "GROUP",
+            "HAVING", "LIMIT", "OFFSET", "JOIN", "LEFT", "INNER", "ON",
+            "AS", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX",
+            "BEGIN", "COMMIT", "ROLLBACK", "PRAGMA", "EXPLAIN"];
+        for kw in &keywords {
+            if kw.starts_with(&partial_upper) && !matches.iter().any(|m| m.to_uppercase() == *kw) {
+                matches.push(kw.to_string());
+            }
+        }
+
+        Ok((word_start, matches))
+    }
+}
+
+impl rustyline::hint::Hinter for ShellCompleter {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for ShellCompleter {}
+impl rustyline::validate::Validator for ShellCompleter {}
+impl rustyline::Helper for ShellCompleter {}
+
+// ── Shell command ──────────────────────────────────────────────────
+
 fn cmd_shell(
     db: PathBuf,
     bucket: Option<String>,
@@ -356,131 +495,148 @@ fn cmd_shell(
     println!("Type .quit to exit, .tables to list tables, .schema to show schema.");
     println!();
 
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    // Load schema for tab completion
+    let (tables, columns) = load_schema_completions(&conn);
+    let completer = ShellCompleter::new(tables, columns);
 
-    loop {
-        print!("turbolite> ");
-        stdout.lock().flush()?;
+    // Use rustyline for interactive TTY, fall back to stdin for piped input
+    let is_tty = atty::is(atty::Stream::Stdin);
 
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            // EOF
-            println!();
-            break;
+    if is_tty {
+        let config = rustyline::Config::builder()
+            .auto_add_history(true)
+            .build();
+        let mut rl = rustyline::Editor::with_config(config)
+            .context("failed to create readline editor")?;
+        rl.set_helper(Some(completer));
+
+        loop {
+            match rl.readline("turbolite> ") {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+                    if trimmed == ".quit" || trimmed == ".exit" { break; }
+                    execute_shell_line(&conn, trimmed);
+                }
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    println!();
+                    break;
+                }
+                Err(rustyline::error::ReadlineError::Interrupted) => {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    break;
+                }
+            }
         }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match trimmed {
-            ".quit" | ".exit" => break,
-            ".tables" => {
-                let sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name";
-                match conn.prepare(sql) {
-                    Ok(mut stmt) => {
-                        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
-                        match rows {
-                            Ok(rows) => {
-                                for row in rows {
-                                    match row {
-                                        Ok(name) => println!("{}", name),
-                                        Err(e) => eprintln!("Error: {}", e),
-                                    }
-                                }
-                            }
-                            Err(e) => eprintln!("Error: {}", e),
-                        }
-                    }
-                    Err(e) => eprintln!("Error: {}", e),
-                }
+    } else {
+        // Piped input (tests, scripts) -- no readline, no completion
+        let stdin = io::stdin();
+        loop {
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                println!();
+                break;
             }
-            ".schema" => {
-                let sql = "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name";
-                match conn.prepare(sql) {
-                    Ok(mut stmt) => {
-                        let rows = stmt.query_map([], |row| row.get::<_, String>(0));
-                        match rows {
-                            Ok(rows) => {
-                                for row in rows {
-                                    match row {
-                                        Ok(sql) => println!("{};", sql),
-                                        Err(e) => eprintln!("Error: {}", e),
-                                    }
-                                }
-                            }
-                            Err(e) => eprintln!("Error: {}", e),
-                        }
-                    }
-                    Err(e) => eprintln!("Error: {}", e),
-                }
-            }
-            _ => {
-                // Try as a query first (SELECT, EXPLAIN, PRAGMA, etc.)
-                let is_query = {
-                    let upper = trimmed.to_uppercase();
-                    upper.starts_with("SELECT")
-                        || upper.starts_with("EXPLAIN")
-                        || upper.starts_with("PRAGMA")
-                        || upper.starts_with("WITH")
-                };
-
-                if is_query {
-                    match conn.prepare(trimmed) {
-                        Ok(mut stmt) => {
-                            let col_count = stmt.column_count();
-                            let col_names: Vec<String> = (0..col_count)
-                                .map(|i| stmt.column_name(i).expect("column name").to_string())
-                                .collect();
-
-                            // Print header
-                            println!("{}", col_names.join("|"));
-
-                            match stmt.query_map([], |row| {
-                                let vals: Vec<String> = (0..col_count)
-                                    .map(|i| {
-                                        row.get::<_, rusqlite::types::Value>(i)
-                                            .map(|v| format_value(&v))
-                                            .unwrap_or_else(|_| "ERROR".to_string())
-                                    })
-                                    .collect();
-                                Ok(vals.join("|"))
-                            }) {
-                                Ok(rows) => {
-                                    for row in rows {
-                                        match row {
-                                            Ok(line) => println!("{}", line),
-                                            Err(e) => eprintln!("Error: {}", e),
-                                        }
-                                    }
-                                }
-                                Err(e) => eprintln!("Error: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Error: {}", e),
-                    }
-                } else {
-                    match conn.execute_batch(trimmed) {
-                        Ok(()) => {}
-                        Err(e) => eprintln!("Error: {}", e),
-                    }
-                }
-            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            if trimmed == ".quit" || trimmed == ".exit" { break; }
+            execute_shell_line(&conn, trimmed);
         }
     }
 
     Ok(())
 }
 
+fn execute_shell_line(conn: &rusqlite::Connection, trimmed: &str) {
+    match trimmed {
+        ".tables" => {
+            let sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name";
+            match conn.prepare(sql) {
+                Ok(mut stmt) => {
+                    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                        for row in rows.flatten() {
+                            println!("{}", row);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        ".schema" => {
+            let sql = "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name";
+            match conn.prepare(sql) {
+                Ok(mut stmt) => {
+                    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                        for row in rows.flatten() {
+                            println!("{};", row);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
+        _ => {
+            let is_query = {
+                let upper = trimmed.to_uppercase();
+                upper.starts_with("SELECT")
+                    || upper.starts_with("EXPLAIN")
+                    || upper.starts_with("PRAGMA")
+                    || upper.starts_with("WITH")
+            };
+
+            if is_query {
+                match conn.prepare(trimmed) {
+                    Ok(mut stmt) => {
+                        let col_count = stmt.column_count();
+                        let col_names: Vec<String> = (0..col_count)
+                            .map(|i| stmt.column_name(i).expect("column name").to_string())
+                            .collect();
+                        println!("{}", col_names.join("|"));
+
+                        if let Ok(rows) = stmt.query_map([], |row| {
+                            let vals: Vec<String> = (0..col_count)
+                                .map(|i| {
+                                    row.get::<_, rusqlite::types::Value>(i)
+                                        .map(|v| format_value(&v))
+                                        .unwrap_or_else(|_| "ERROR".to_string())
+                                })
+                                .collect();
+                            Ok(vals.join("|"))
+                        }) {
+                            for row in rows.flatten() {
+                                println!("{}", row);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            } else {
+                match conn.execute_batch(trimmed) {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+        }
+    }
+}
+
+const MAX_COLUMN_WIDTH: usize = 80;
+
 fn format_value(v: &rusqlite::types::Value) -> String {
-    match v {
-        rusqlite::types::Value::Null => "NULL".to_string(),
-        rusqlite::types::Value::Integer(i) => i.to_string(),
-        rusqlite::types::Value::Real(f) => f.to_string(),
-        rusqlite::types::Value::Text(s) => s.clone(),
-        rusqlite::types::Value::Blob(b) => format!("x'{}'", hex_encode(b)),
+    let s = match v {
+        rusqlite::types::Value::Null => return "NULL".to_string(),
+        rusqlite::types::Value::Integer(i) => return i.to_string(),
+        rusqlite::types::Value::Real(f) => return f.to_string(),
+        rusqlite::types::Value::Text(s) => s.as_str(),
+        rusqlite::types::Value::Blob(b) => return format!("x'{}'", hex_encode(b)),
+    };
+    if s.len() > MAX_COLUMN_WIDTH {
+        format!("{}...", &s[..MAX_COLUMN_WIDTH])
+    } else {
+        s.to_string()
     }
 }
 
@@ -708,6 +864,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Setup => {
+            println!("turbolite setup");
+            println!();
+            println!("  Shell completions:");
+            println!("    bash:  eval \"$(turbolite completions bash)\"");
+            println!("    zsh:   eval \"$(turbolite completions zsh)\"");
+            println!("    fish:  turbolite completions fish > ~/.config/fish/completions/turbolite.fish");
+            println!();
+            println!("  Add the line for your shell to your profile (~/.bashrc, ~/.zshrc, etc.)");
+            println!("  to enable tab completion for turbolite commands and flags.");
+        }
+        Commands::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "turbolite",
+                &mut std::io::stdout(),
+            );
+        }
         Commands::Info { db, bucket, prefix, endpoint, region, cache_dir } => {
             cmd_info(db, bucket, prefix, endpoint, region, cache_dir)?;
         }
