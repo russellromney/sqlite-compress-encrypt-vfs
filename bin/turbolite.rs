@@ -585,13 +585,20 @@ fn execute_shell_line(conn: &rusqlite::Connection, trimmed: &str) {
     }
 }
 
+const MAX_COLUMN_WIDTH: usize = 80;
+
 fn format_value(v: &rusqlite::types::Value) -> String {
-    match v {
-        rusqlite::types::Value::Null => "NULL".to_string(),
-        rusqlite::types::Value::Integer(i) => i.to_string(),
-        rusqlite::types::Value::Real(f) => f.to_string(),
-        rusqlite::types::Value::Text(s) => s.clone(),
-        rusqlite::types::Value::Blob(b) => format!("x'{}'", hex_encode(b)),
+    let s = match v {
+        rusqlite::types::Value::Null => return "NULL".to_string(),
+        rusqlite::types::Value::Integer(i) => return i.to_string(),
+        rusqlite::types::Value::Real(f) => return f.to_string(),
+        rusqlite::types::Value::Text(s) => s.as_str(),
+        rusqlite::types::Value::Blob(b) => return format!("x'{}'", hex_encode(b)),
+    };
+    if s.len() > MAX_COLUMN_WIDTH {
+        format!("{}...", &s[..MAX_COLUMN_WIDTH])
+    } else {
+        s.to_string()
     }
 }
 
