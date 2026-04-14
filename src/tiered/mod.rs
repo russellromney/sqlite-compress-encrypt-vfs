@@ -50,8 +50,7 @@ use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "cloud")]
-use std::sync::mpsc;
+// flume channels used by PrefetchPool (sync/async-agnostic)
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,11 +77,6 @@ mod flush;
 mod handle;
 #[cfg(feature = "cloud")]
 mod import;
-mod interior_map;
-mod leaf_chaser;
-mod overflow;
-mod record_parser;
-mod schema;
 mod manifest;
 mod prediction;
 mod prefetch;

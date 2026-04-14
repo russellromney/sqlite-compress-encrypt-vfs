@@ -146,6 +146,29 @@ You can tune the prefetch schedule for *each query* via `SELECT turbolite_config
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
+### In-memory page cache
+
+turbolite has its own in-memory page cache that replaces SQLite's built-in page cache. SQLite's pager caches pages internally and never re-reads from the VFS for cached pages. This is fine for single-writer databases, but for read replicas (HA followers, manifest-polling readers), SQLite's cache becomes stale when the underlying data changes via replication.
+
+turbolite's cache is **manifest-aware**: when `set_manifest()` fires (new data from replication), it invalidates affected pages in both the disk cache and the in-memory cache. Writes also invalidate their pages in the in-memory cache. This guarantees fresh reads after replication or writes.
+
+**Architecture:**
+
+```
+SQLite (PRAGMA cache_size=0)
+  -> turbolite VFS xRead
+    -> in-memory page cache (64MB default, AtomicPtr, zero-lock reads)
+      -> disk cache (NVMe pread)
+        -> S3 (on miss)
+```
+
+**Configuration:**
+- `mem_cache_budget` in `TurboliteConfig` (bytes). Default: 64MB.
+- `TURBOLITE_MEM_CACHE_BUDGET` env var (e.g., `128MB`, `1GB`).
+- Set to `0` to disable the in-memory cache entirely.
+
+> **Required for read replicas / HA followers:** set `PRAGMA cache_size=0` on the SQLite connection. SQLite's built-in page cache does not invalidate when turbolite receives new pages via replication. Without this pragma, follower reads return stale data. turbolite's own cache (configured above) handles caching correctly.
+
 ### Encryption & Compression
 
 #### Compression
@@ -579,14 +602,6 @@ cargo test --features zstd                    # local VFS tests
 cargo test --features zstd,cloud             # + S3 integration tests
 cargo test --features zstd,encryption         # + encryption tests
 ```
-
-## Experimental: precise prefetch
-
-turbolite includes an experimental "interior page introspection" system (disabled by default) that parses B-tree interior pages to predict exact leaf groups for queries instead of using the hop-schedule heuristic. The idea: if you know the B-tree structure, you can skip guessing and go straight to the right page.
-
-In benchmarks at 1M rows on Tigris, this made things worse. Being precisely wrong turned out to be more expensive than being approximately right. The hop schedule's "guess and overshoot" approach wastes some bandwidth but overlaps S3 I/O effectively. Precise predictions serialized requests, traded speculative parallelism for accuracy, and lost.
-
-The code is there (`TURBOLITE_JENA=true` to enable) for future investigation. It may work better on lower-latency backends (S3 Express, ~4ms GETs) where the cost of an extra GET is cheap and precision matters more. For now, the hop schedule wins.
 
 ## Notes
 
