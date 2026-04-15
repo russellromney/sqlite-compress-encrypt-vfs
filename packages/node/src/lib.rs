@@ -11,8 +11,6 @@ static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct DatabaseOptions {
     /// Storage mode: "local" (default) or "s3".
     pub mode: Option<String>,
-    /// Zstd compression level 1-22 (local mode, default 3). Pass null for no compression.
-    pub compression: Option<i32>,
     /// S3 bucket name (required when mode = "s3").
     pub bucket: Option<String>,
     /// S3 endpoint URL, e.g. for Tigris or MinIO (mode = "s3").
@@ -23,6 +21,13 @@ pub struct DatabaseOptions {
     pub cache_dir: Option<String>,
     /// AWS region (mode = "s3").
     pub region: Option<String>,
+    /// Open in read-only mode.
+    pub read_only: Option<bool>,
+    /// In-memory page cache size (default "64MB"). turbolite manages its own
+    /// manifest-aware cache; set to "0" to disable.
+    pub page_cache: Option<String>,
+    /// Zstd compression level 1-22 (local mode, default 3). Pass null for no compression.
+    pub compression: Option<i32>,
 }
 
 /// A SQLite database connection with TurboliteVfs (local or S3 cloud storage).
@@ -63,8 +68,17 @@ impl Database {
             .as_ref()
             .and_then(|o| o.mode.as_deref())
             .unwrap_or("local");
+        let read_only = options.as_ref().and_then(|o| o.read_only).unwrap_or(false);
+        let page_cache = options.as_ref()
+            .and_then(|o| o.page_cache.clone())
+            .unwrap_or_else(|| "64MB".to_string());
+        let mem_cache_budget = parse_size(&page_cache);
 
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let flags = if read_only {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+        };
 
         let conn = if mode == "s3" {
             let bucket = options
@@ -97,6 +111,8 @@ impl Database {
                     region,
                 },
                 cache_dir,
+                read_only,
+                mem_cache_budget,
                 ..Default::default()
             };
 
@@ -122,6 +138,8 @@ impl Database {
                 storage_backend: StorageBackend::Local,
                 cache_dir: base_dir,
                 compression_level: compression,
+                read_only,
+                mem_cache_budget,
                 ..Default::default()
             };
             let vfs = TurboliteVfs::new(config)
@@ -205,4 +223,20 @@ impl Database {
     pub fn close(&mut self) {
         self.conn.take();
     }
+}
+
+/// Parse a human-readable byte size ("64MB", "1GB", "0") into bytes.
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim().to_uppercase();
+    if s == "0" { return 0; }
+    let (num, mult) = if s.ends_with("GB") {
+        (&s[..s.len()-2], 1024 * 1024 * 1024)
+    } else if s.ends_with("MB") {
+        (&s[..s.len()-2], 1024 * 1024)
+    } else if s.ends_with("KB") {
+        (&s[..s.len()-2], 1024)
+    } else {
+        (s.as_str(), 1)
+    };
+    num.trim().parse::<u64>().unwrap_or(64) * mult
 }
