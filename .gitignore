@@ -41,6 +41,29 @@ packages/python/turbolite/*.dylib
 *.node
 **/node_modules/
 npm-debug.log*
+packages/node/dist/
+packages/node/turbolite
+packages/node/turbolite.dylib
+packages/node/turbolite.so
+packages/node/turbolite.dll
+packages/node/turbolite.*.dylib
+packages/node/turbolite.*.so
+
+# Go
+packages/go/turbolite.dylib
+packages/go/turbolite.so
+
+# turbolite VFS artifacts
+**/data.cache
+**/page_bitmap
+**/sub_chunk_tracker
+**/manifest.msgpack
+**/staging/
+**/locks/
+**/p/
+
+# Python CLI binary (built by CI)
+packages/python/turbolite/turbolite
 
 # OS / editor
 *.DS_Store

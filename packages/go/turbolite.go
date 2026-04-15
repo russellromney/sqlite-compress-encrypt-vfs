@@ -1,45 +1,35 @@
 // Package turbolite provides a Go interface to turbolite-backed SQLite databases.
 //
-// Usage:
+// turbolite is a storage engine, not a query API. Open() returns a standard
+// *sql.DB backed by turbolite's compressed page-group VFS, giving you the full
+// database/sql interface: prepared statements, param binding, transactions,
+// connection pooling, etc.
 //
-//	db, err := turbolite.Open("my.db", nil)                       // local mode
-//	db, err := turbolite.Open("my.db", &turbolite.Options{        // S3 mode
+// Local mode (default):
+//
+//	db, err := turbolite.Open("my.db", nil)
+//	defer db.Close()
+//	db.Exec("INSERT INTO t VALUES (?)", 42)
+//
+// S3 cloud mode:
+//
+//	db, err := turbolite.Open("my.db", &turbolite.Options{
 //	    Mode:     "s3",
 //	    Bucket:   "my-bucket",
 //	    Endpoint: "https://t3.storage.dev",
 //	})
-//	defer db.Close()
-//
-//	db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
-//	rows := db.Query("SELECT * FROM users")
 package turbolite
 
-/*
-#cgo LDFLAGS: -lturbolite
-#include <stdlib.h>
-
-extern const char* turbolite_version();
-extern const char* turbolite_last_error();
-extern int turbolite_register_local(const char* name, const char* base_dir, int level);
-extern int turbolite_register_s3(const char* name, const char* bucket, const char* prefix,
-    const char* endpoint, const char* region, const char* cache_dir);
-extern void* turbolite_open(const char* path, const char* vfs_name);
-extern int turbolite_exec(void* db, const char* sql);
-extern char* turbolite_query_json(void* db, const char* sql);
-extern void turbolite_free_string(char* s);
-extern void turbolite_close(void* db);
-*/
-import "C"
-
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
-	"unsafe"
-)
 
-var vfsCounter uint64
+	sqlite3 "github.com/mattn/go-sqlite3"
+)
 
 // Options for opening a turbolite database.
 type Options struct {
@@ -53,133 +43,221 @@ type Options struct {
 	Prefix string
 	// AWS region.
 	Region string
-	// Local cache directory.
+	// Local cache directory (S3 mode default: /tmp/turbolite).
 	CacheDir string
 	// In-memory page cache size (default "64MB"). Set to "0" to disable.
 	PageCache string
-	// Zstd compression level 1-22 (local mode, default 3).
-	Compression int
+	// Zstd compression level 1-22 (default 3).
+	CompressionLevel int
+	// Prefetch worker threads (default: num_cpus + 1).
+	PrefetchThreads int
+	// Open in read-only mode.
+	ReadOnly bool
 }
 
-// DB is a turbolite-backed SQLite database connection.
-type DB struct {
-	ptr unsafe.Pointer
+var (
+	vfsCounter    uint64
+	driverCounter uint64
+
+	// Bootstrap: load extension once to register SQL functions + global VFS.
+	bootstrapOnce sync.Once
+	bootstrapErr  error
+	bootstrapDB   *sql.DB
+
+	extPathOnce sync.Once
+	extPath     string
+	extPathErr  error
+)
+
+// findExt locates the turbolite loadable extension binary.
+func findExt() (string, error) {
+	extPathOnce.Do(func() {
+		if p := os.Getenv("TURBOLITE_EXT_PATH"); p != "" {
+			if info, err := os.Stat(p); err == nil && !info.IsDir() {
+				extPath = p
+				return
+			}
+			extPathErr = fmt.Errorf("TURBOLITE_EXT_PATH set but not found: %s", p)
+			return
+		}
+
+		candidates := []string{
+			"turbolite.dylib",
+			"turbolite.so",
+			"turbolite.dll",
+			"libturbolite.dylib",
+			"libturbolite.so",
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				extPath = c
+				return
+			}
+		}
+
+		extPathErr = fmt.Errorf(
+			"turbolite extension not found. Set TURBOLITE_EXT_PATH or place " +
+				"turbolite.dylib/turbolite.so in the working directory",
+		)
+	})
+	return extPath, extPathErr
 }
 
-// Open a turbolite database. Pass nil for default options (local mode).
-func Open(path string, opts *Options) (*DB, error) {
+// ensureBootstrap loads the extension into a :memory: connection.
+// This registers the turbolite SQL functions (turbolite_register_vfs, etc.)
+// and the global "turbolite" VFS. The bootstrap connection is kept alive
+// so that subsequent turbolite_register_vfs() calls can be made.
+func ensureBootstrap(ext string) error {
+	bootstrapOnce.Do(func() {
+		driverName := fmt.Sprintf("turbolite_boot_%d", atomic.AddUint64(&driverCounter, 1))
+		sql.Register(driverName, &sqlite3.SQLiteDriver{
+			Extensions: []string{ext},
+		})
+		var err error
+		bootstrapDB, err = sql.Open(driverName, ":memory:")
+		if err != nil {
+			bootstrapErr = fmt.Errorf("turbolite: open bootstrap: %w", err)
+			return
+		}
+		// Force connection creation so ConnectHook runs.
+		if err := bootstrapDB.Ping(); err != nil {
+			bootstrapErr = fmt.Errorf("turbolite: bootstrap ping: %w", err)
+			return
+		}
+	})
+	return bootstrapErr
+}
+
+// Open opens a turbolite database and returns a standard *sql.DB.
+//
+// Each call creates an isolated VFS instance so multiple databases in the
+// same process don't share manifest or cache state.
+//
+// Pass nil for default options (local mode, 64MB page cache).
+func Open(path string, opts *Options) (*sql.DB, error) {
 	if opts == nil {
 		opts = &Options{}
 	}
 	if opts.Mode == "" {
 		opts.Mode = "local"
 	}
+	if opts.Mode != "local" && opts.Mode != "s3" {
+		return nil, fmt.Errorf("turbolite: mode must be 'local' or 's3', got %q", opts.Mode)
+	}
 	if opts.PageCache == "" {
 		opts.PageCache = "64MB"
 	}
 
-	// Set mem cache budget env var (read by turbolite C init)
+	ext, err := findExt()
+	if err != nil {
+		return nil, err
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("turbolite: resolve path: %w", err)
+	}
+	dbDir := filepath.Dir(absPath)
+
+	// Set env vars before the extension loads.
+	if opts.Mode == "s3" {
+		bucket := opts.Bucket
+		if bucket == "" {
+			bucket = os.Getenv("TURBOLITE_BUCKET")
+		}
+		if bucket == "" {
+			return nil, fmt.Errorf("turbolite: mode='s3' requires Bucket or TURBOLITE_BUCKET")
+		}
+		os.Setenv("TURBOLITE_BUCKET", bucket)
+		if opts.Prefix != "" {
+			os.Setenv("TURBOLITE_PREFIX", opts.Prefix)
+		}
+		if opts.Endpoint != "" {
+			os.Setenv("TURBOLITE_ENDPOINT_URL", opts.Endpoint)
+		}
+		if opts.Region != "" {
+			os.Setenv("TURBOLITE_REGION", opts.Region)
+		}
+		if opts.CacheDir != "" {
+			os.Setenv("TURBOLITE_CACHE_DIR", opts.CacheDir)
+		}
+		if opts.ReadOnly {
+			os.Setenv("TURBOLITE_READ_ONLY", "true")
+		}
+	}
+	if opts.CompressionLevel > 0 {
+		os.Setenv("TURBOLITE_COMPRESSION_LEVEL", fmt.Sprintf("%d", opts.CompressionLevel))
+	}
+	if opts.PrefetchThreads > 0 {
+		os.Setenv("TURBOLITE_PREFETCH_THREADS", fmt.Sprintf("%d", opts.PrefetchThreads))
+	}
 	os.Setenv("TURBOLITE_MEM_CACHE_BUDGET", opts.PageCache)
 
-	id := atomic.AddUint64(&vfsCounter, 1)
-	vfsName := fmt.Sprintf("turbolite-go-%d", id)
-	cVfsName := C.CString(vfsName)
-	defer C.free(unsafe.Pointer(cVfsName))
-
-	switch opts.Mode {
-	case "s3":
-		if opts.Bucket == "" {
-			return nil, fmt.Errorf("turbolite: bucket is required for s3 mode")
-		}
-		cBucket := C.CString(opts.Bucket)
-		defer C.free(unsafe.Pointer(cBucket))
-		prefix := opts.Prefix
-		if prefix == "" {
-			prefix = "turbolite"
-		}
-		cPrefix := C.CString(prefix)
-		defer C.free(unsafe.Pointer(cPrefix))
-		cEndpoint := C.CString(opts.Endpoint)
-		defer C.free(unsafe.Pointer(cEndpoint))
-		cRegion := C.CString(opts.Region)
-		defer C.free(unsafe.Pointer(cRegion))
-		cacheDir := opts.CacheDir
-		if cacheDir == "" {
-			cacheDir = "/tmp/turbolite"
-		}
-		cCacheDir := C.CString(cacheDir)
-		defer C.free(unsafe.Pointer(cCacheDir))
-
-		rc := C.turbolite_register_s3(cVfsName, cBucket, cPrefix, cEndpoint, cRegion, cCacheDir)
-		if rc != 0 {
-			return nil, fmt.Errorf("turbolite: register s3 VFS failed: %s", C.GoString(C.turbolite_last_error()))
-		}
-	case "local":
-		cacheDir := opts.CacheDir
-		if cacheDir == "" {
-			cacheDir = "/tmp/turbolite"
-		}
-		cDir := C.CString(cacheDir)
-		defer C.free(unsafe.Pointer(cDir))
-		level := opts.Compression
-		if level == 0 {
-			level = 3
-		}
-		rc := C.turbolite_register_local(cVfsName, cDir, C.int(level))
-		if rc != 0 {
-			return nil, fmt.Errorf("turbolite: register local VFS failed: %s", C.GoString(C.turbolite_last_error()))
-		}
-	default:
-		return nil, fmt.Errorf("turbolite: mode must be 'local' or 's3', got %q", opts.Mode)
+	// Load extension (registers SQL functions + global VFS).
+	if err := ensureBootstrap(ext); err != nil {
+		return nil, err
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
-
-	// turbolite_open sets PRAGMA cache_size=0 internally (turbolite owns the page cache)
-	ptr := C.turbolite_open(cPath, cVfsName)
-	if ptr == nil {
-		return nil, fmt.Errorf("turbolite: open failed: %s", C.GoString(C.turbolite_last_error()))
+	// Determine VFS name.
+	var vfsName string
+	if opts.Mode == "local" {
+		// Check directory exists before VFS registration.
+		if _, err := os.Stat(dbDir); os.IsNotExist(err) {
+			return nil, fmt.Errorf("turbolite: directory does not exist: %s", dbDir)
+		}
+		// Register a per-database VFS with isolated manifest/cache.
+		vfsName = fmt.Sprintf("turbolite-go-%d", atomic.AddUint64(&vfsCounter, 1))
+		_, err := bootstrapDB.Exec("SELECT turbolite_register_vfs(?, ?)", vfsName, dbDir)
+		if err != nil {
+			return nil, fmt.Errorf("turbolite: register VFS %q: %w", vfsName, err)
+		}
+	} else {
+		vfsName = "turbolite-s3"
 	}
 
-	return &DB{ptr: ptr}, nil
-}
+	// Register a driver that sets per-connection pragmas.
+	// The extension is already loaded globally via bootstrap (VFS + SQL
+	// functions are process-wide), so we don't need Extensions here.
+	driverName := fmt.Sprintf("turbolite_%d", atomic.AddUint64(&driverCounter, 1))
+	sql.Register(driverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			conn.Exec("PRAGMA cache_size=0", nil)
+			return nil
+		},
+	})
 
-// Exec executes SQL that returns no rows (DDL, INSERT, UPDATE, DELETE).
-func (db *DB) Exec(sql string) error {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	if C.turbolite_exec(db.ptr, csql) != 0 {
-		return fmt.Errorf("turbolite: %s", C.GoString(C.turbolite_last_error()))
+	// Build DSN with VFS selection.
+	dsn := fmt.Sprintf("file:%s?vfs=%s", absPath, vfsName)
+	if opts.ReadOnly {
+		dsn += "&mode=ro"
 	}
-	return nil
-}
 
-// Query executes SQL and returns results as a slice of maps.
-func (db *DB) Query(sql string) ([]map[string]interface{}, error) {
-	csql := C.CString(sql)
-	defer C.free(unsafe.Pointer(csql))
-	ptr := C.turbolite_query_json(db.ptr, csql)
-	if ptr == nil {
-		return nil, fmt.Errorf("turbolite: %s", C.GoString(C.turbolite_last_error()))
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("turbolite: open: %w", err)
 	}
-	defer C.turbolite_free_string(ptr)
-	var rows []map[string]interface{}
-	if err := json.Unmarshal([]byte(C.GoString(ptr)), &rows); err != nil {
-		return nil, fmt.Errorf("turbolite: parse result: %w", err)
-	}
-	return rows, nil
-}
 
-// Close the database connection.
-func (db *DB) Close() {
-	if db.ptr != nil {
-		C.turbolite_close(db.ptr)
-		db.ptr = nil
+	// Force connection so we catch errors early.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("turbolite: ping: %w", err)
 	}
-}
 
-// Version returns the turbolite library version string.
-func Version() string {
-	return C.GoString(C.turbolite_version())
+	// Local mode is single-writer; limit pool to 1 connection.
+	if opts.Mode == "local" {
+		db.SetMaxOpenConns(1)
+	}
+
+	if opts.Mode == "s3" {
+		if _, err := db.Exec("PRAGMA page_size=65536"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("turbolite: set page_size: %w", err)
+		}
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("turbolite: set journal_mode: %w", err)
+		}
+	}
+
+	return db, nil
 }

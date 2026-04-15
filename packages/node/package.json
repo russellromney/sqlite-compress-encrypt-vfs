@@ -1,38 +1,46 @@
 {
   "name": "turbolite",
-  "version": "0.4.1",
-  "description": "Compressed SQLite — transparent zstd compression via a custom VFS",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "version": "0.5.0",
+  "description": "turbolite -- SQLite with compressed page groups and optional S3 cloud storage. Returns standard better-sqlite3 connections.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "turbolite.dylib",
+    "turbolite.so",
+    "turbolite.dll",
+    "turbolite.*.dylib",
+    "turbolite.*.so",
+    "turbolite.*.dll",
+    "bin/turbolite.js",
+    "turbolite",
+    "postinstall.js"
+  ],
   "bin": {
     "turbolite": "bin/turbolite.js"
   },
-  "files": [
-    "index.js",
-    "index.d.ts",
-    "turbolite.*.node",
-    "bin/turbolite.js",
-    "turbolite",
-    "turbolite.exe"
-  ],
-  "napi": {
-    "name": "turbolite",
-    "triples": {
-      "defaults": true,
-      "additional": [
-        "aarch64-apple-darwin",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-unknown-linux-gnu"
-      ]
-    }
-  },
   "license": "Apache-2.0",
-  "keywords": ["sqlite", "compression", "zstd", "database", "vfs"],
+  "keywords": [
+    "sqlite",
+    "compression",
+    "zstd",
+    "database",
+    "vfs",
+    "s3",
+    "better-sqlite3"
+  ],
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
   "devDependencies": {
-    "@napi-rs/cli": "^2"
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.2"
   },
   "scripts": {
-    "build": "napi build --release --platform",
-    "build-debug": "napi build --platform"
+    "build": "tsc",
+    "postinstall": "node postinstall.js",
+    "test": "npm run build && node test.mjs",
+    "build-ext": "cd ../.. && cargo build --release --features 'loadable-extension,cloud,zstd' --lib && cp target/release/libturbolite.dylib packages/node/turbolite.dylib 2>/dev/null || cp target/release/libturbolite.so packages/node/turbolite.so 2>/dev/null"
   }
 }

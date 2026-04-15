@@ -396,6 +396,75 @@ pub extern "C" fn turbolite_gc() -> i32 {
     -1
 }
 
+/// Create and register a new local VFS with a custom name and cache directory.
+/// Called from SQL: SELECT turbolite_register_vfs('name', '/path/to/cache_dir').
+/// Each registered VFS gets its own manifest, cache, and page group state,
+/// enabling multiple independent databases in the same process.
+/// Returns 0 on success, 1 on error.
+#[no_mangle]
+pub extern "C" fn turbolite_ext_register_named_vfs(
+    name_ptr: *const std::os::raw::c_char,
+    cache_dir_ptr: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let name = unsafe {
+        match std::ffi::CStr::from_ptr(name_ptr).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return 1,
+        }
+    };
+    let cache_dir = unsafe {
+        match std::ffi::CStr::from_ptr(cache_dir_ptr).to_str() {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => return 1,
+        }
+    };
+
+    let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let mem_cache_budget = std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
+        .ok()
+        .and_then(|s| parse_mem_cache_budget(&s))
+        .unwrap_or(64 * 1024 * 1024);
+
+    let config = crate::tiered::TurboliteConfig {
+        storage_backend: crate::tiered::StorageBackend::Local,
+        cache_dir,
+        compression_level: level,
+        mem_cache_budget,
+        ..Default::default()
+    };
+    match crate::tiered::TurboliteVfs::new(config) {
+        Ok(vfs) => match crate::tiered::register(&name, vfs) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("turbolite: failed to register VFS '{}': {}", name, e);
+                1
+            }
+        },
+        Err(e) => {
+            eprintln!("turbolite: failed to create VFS '{}': {}", name, e);
+            1
+        }
+    }
+}
+
+fn parse_mem_cache_budget(s: &str) -> Option<u64> {
+    let s = s.trim().to_uppercase();
+    if s == "0" { return Some(0); }
+    let (num, mult) = if s.ends_with("GB") {
+        (&s[..s.len()-2], 1024 * 1024 * 1024u64)
+    } else if s.ends_with("MB") {
+        (&s[..s.len()-2], 1024 * 1024u64)
+    } else if s.ends_with("KB") {
+        (&s[..s.len()-2], 1024u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    num.trim().parse::<u64>().ok().map(|n| n * mult)
+}
+
 #[cfg(not(feature = "cloud"))]
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(

@@ -25,6 +25,10 @@ SQLITE_EXTENSION_INIT1
 /* Rust function -- registers the compressed VFS. Defined in src/ext.rs. */
 extern int turbolite_ext_register_vfs(void);
 
+/* Rust function -- registers a named local VFS with isolated state.
+ * Defined in src/ext.rs (Phase Apollo). */
+extern int turbolite_ext_register_named_vfs(const char *name, const char *cache_dir);
+
 /* Rust function -- runs EQP on SQL and pushes plan to global queue.
  * Defined in src/tiered/query_plan.rs (Phase Marne). */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
@@ -58,6 +62,35 @@ extern const char *turbolite_cache_info(void);
 extern const char *turbolite_warm(sqlite3 *db, const char *sql);
 extern int turbolite_evict_query(sqlite3 *db, const char *sql);
 /* ── SQL functions ──────────────────────────────────────────────── */
+
+/*
+ * turbolite_register_vfs(name TEXT, cache_dir TEXT)
+ *
+ * Phase Apollo: register a named local VFS with isolated state.
+ * Each call creates a new VFS instance with its own manifest, cache,
+ * and page group state. This enables multiple independent databases
+ * in the same process via the loadable extension.
+ *
+ * Example: SELECT turbolite_register_vfs('turbolite-0', '/path/to/dbdir');
+ * Then:    sqlite3_open_v2("file:db?vfs=turbolite-0", ...)
+ *
+ * Returns 0 on success, 1 on error.
+ */
+static void turbolite_register_vfs_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *name = (const char *)sqlite3_value_text(argv[0]);
+    const char *cache_dir = (const char *)sqlite3_value_text(argv[1]);
+    if (!name || !cache_dir) {
+        sqlite3_result_error(ctx, "turbolite_register_vfs: name and cache_dir required", -1);
+        return;
+    }
+    int rc = turbolite_ext_register_named_vfs(name, cache_dir);
+    sqlite3_result_int(ctx, rc);
+}
 
 static void turbolite_version_func(
     sqlite3_context *ctx,
@@ -403,6 +436,17 @@ int sqlite3_turbolite_init(
     );
     if (rc != SQLITE_OK) {
         *pzErrMsg = sqlite3_mprintf("turbolite: failed to register turbolite_version()");
+        return rc;
+    }
+
+    /* Phase Apollo: register turbolite_register_vfs(name, cache_dir) SQL function.
+     * Creates isolated VFS instances for multi-database support. */
+    rc = sqlite3_create_function_v2(
+        db, "turbolite_register_vfs", 2,
+        SQLITE_UTF8, 0, turbolite_register_vfs_func, 0, 0, 0
+    );
+    if (rc != SQLITE_OK) {
+        *pzErrMsg = sqlite3_mprintf("turbolite: failed to register turbolite_register_vfs()");
         return rc;
     }
 

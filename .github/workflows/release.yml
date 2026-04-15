@@ -12,25 +12,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Python wheels (loadable extension) ────────────────────────────
-  python-build:
+  # ── Build loadable extension for all platforms ──────────────────
+  build-ext:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            plat-name: manylinux2014_x86_64
+            ext: so
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            plat-name: manylinux2014_aarch64
+            ext: so
             cross: true
           - os: macos-13
             target: x86_64-apple-darwin
-            plat-name: macosx_13_0_x86_64
+            ext: dylib
           - os: macos-14
             target: aarch64-apple-darwin
-            plat-name: macosx_14_0_arm64
+            ext: dylib
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -64,22 +64,54 @@ jobs:
           cargo build --release --bin turbolite --target ${{ matrix.target }} \
             --features cloud,zstd,bundled-sqlite,wal
 
-      - name: Determine library filename
-        id: lib
+      - name: Package extension artifact
         run: |
-          if [[ "${{ matrix.os }}" == macos-* ]]; then
-            echo "ext=dylib" >> "$GITHUB_OUTPUT"
-            echo "prefix=lib" >> "$GITHUB_OUTPUT"
-          else
-            echo "ext=so" >> "$GITHUB_OUTPUT"
-            echo "prefix=lib" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Copy extension and CLI binary into Python package
-        run: |
-          cp target/${{ matrix.target }}/release/${{ steps.lib.outputs.prefix }}turbolite.${{ steps.lib.outputs.ext }} \
-            packages/python/turbolite/turbolite.${{ steps.lib.outputs.ext }}
+          mkdir -p artifacts
+          cp target/${{ matrix.target }}/release/libturbolite.${{ matrix.ext }} \
+            artifacts/turbolite-${{ matrix.target }}.${{ matrix.ext }}
           cp target/${{ matrix.target }}/release/turbolite \
+            artifacts/turbolite-cli-${{ matrix.target }}
+          chmod +x artifacts/turbolite-cli-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-${{ matrix.target }}
+          path: artifacts/
+
+  # ── Python wheels ───────────────────────────────────────────────
+  python-build:
+    needs: build-ext
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            plat-name: manylinux2014_x86_64
+            ext: so
+          - target: aarch64-unknown-linux-gnu
+            plat-name: manylinux2014_aarch64
+            ext: so
+          - target: x86_64-apple-darwin
+            plat-name: macosx_13_0_x86_64
+            ext: dylib
+          - target: aarch64-apple-darwin
+            plat-name: macosx_14_0_arm64
+            ext: dylib
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ext-${{ matrix.target }}
+          path: artifacts
+
+      - name: Copy extension and CLI into Python package
+        run: |
+          cp artifacts/turbolite-${{ matrix.target }}.${{ matrix.ext }} \
+            packages/python/turbolite/turbolite.${{ matrix.ext }}
+          cp artifacts/turbolite-cli-${{ matrix.target }} \
             packages/python/turbolite/turbolite
           chmod +x packages/python/turbolite/turbolite
 
@@ -114,85 +146,9 @@ jobs:
         with:
           packages-dir: dist/
 
-  # ── Node.js native addon (napi-rs) ───────────────────────────────
-  node-build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            node-arch: linux-x64-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            node-arch: linux-arm64-gnu
-            cross: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            node-arch: linux-x64-musl
-          - os: macos-13
-            target: x86_64-apple-darwin
-            node-arch: darwin-x64
-          - os: macos-14
-            target: aarch64-apple-darwin
-            node-arch: darwin-arm64
-
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation tools (aarch64)
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install dependencies
-        working-directory: packages/node
-        run: npm install
-
-      - name: Build native addon
-        working-directory: packages/node
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }}
-
-      - name: Build CLI binary for Node package
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-        run: |
-          cargo build --release --bin turbolite --target ${{ matrix.target }} \
-            --features cloud,zstd,bundled-sqlite,wal
-          cp target/${{ matrix.target }}/release/turbolite packages/node/turbolite
-          chmod +x packages/node/turbolite
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: node-${{ matrix.node-arch }}
-          path: |
-            packages/node/turbolite.*.node
-            packages/node/turbolite
-
+  # ── Node.js package (loadable extension) ────────────────────────
   node-publish:
-    needs: node-build
+    needs: build-ext
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -203,14 +159,50 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      # Download all platform extensions into the Node package
       - uses: actions/download-artifact@v4
         with:
-          pattern: node-*
-          path: packages/node
-          merge-multiple: true
+          name: ext-x86_64-unknown-linux-gnu
+          path: artifacts/linux-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ext-aarch64-unknown-linux-gnu
+          path: artifacts/linux-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ext-x86_64-apple-darwin
+          path: artifacts/darwin-x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ext-aarch64-apple-darwin
+          path: artifacts/darwin-arm64
 
-      - name: List artifacts
-        run: ls -la packages/node/turbolite.*.node
+      - name: Copy platform extensions into package
+        run: |
+          cp artifacts/linux-x64/turbolite-x86_64-unknown-linux-gnu.so \
+            packages/node/turbolite.linux-x64.so
+          cp artifacts/linux-arm64/turbolite-aarch64-unknown-linux-gnu.so \
+            packages/node/turbolite.linux-arm64.so
+          cp artifacts/darwin-x64/turbolite-x86_64-apple-darwin.dylib \
+            packages/node/turbolite.darwin-x64.dylib
+          cp artifacts/darwin-arm64/turbolite-aarch64-apple-darwin.dylib \
+            packages/node/turbolite.darwin-arm64.dylib
+          # Copy CLI binary (linux x64 for npx)
+          cp artifacts/linux-x64/turbolite-cli-x86_64-unknown-linux-gnu \
+            packages/node/turbolite
+          chmod +x packages/node/turbolite
+
+      - name: Install dependencies and build TypeScript
+        working-directory: packages/node
+        run: npm install && npx tsc
+
+      - name: List package contents
+        working-directory: packages/node
+        run: |
+          echo "=== Extension binaries ==="
+          ls -lh turbolite.* 2>/dev/null || echo "none"
+          echo "=== Dist ==="
+          ls -lh dist/
 
       - name: Publish to npm
         working-directory: packages/node

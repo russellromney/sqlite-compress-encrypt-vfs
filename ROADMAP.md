@@ -46,26 +46,36 @@ supports xFetch/xUnfetch for memory-mapped page reads.
 
 > After: Flume (page cache) . Before: Valkyrie
 
-**Status:** Not started
+**Status:** Done (Node + Go). CI/publish remaining.
 
 **Goal:** Every language SDK returns the language's standard SQLite connection. turbolite is a storage engine, not a query API.
 
-**Current:** Python and Rust return standard connections. Node and Go return crippled custom wrappers (no prepared statements, no param binding, no transactions).
+**Current:** All four languages return standard connections: Python (sqlite3.Connection), Rust (rusqlite::Connection), Node (better-sqlite3.Database), Go (*sql.DB).
 
-**Target:** `turbolite.connect()` in every language returns the standard SQLite connection for that language, opened through turbolite's VFS.
+**Target:** `turbolite.connect()` / `turbolite.Open()` in every language returns the standard SQLite connection for that language, opened through turbolite's VFS.
 
-### Node (better-sqlite3)
-1. Build turbolite loadable extension against better-sqlite3's bundled SQLite headers
-2. `turbolite.connect(path, opts)` loads extension, opens via VFS URI, returns `better-sqlite3.Database`
-3. Ships platform-specific `.dylib/.so/.dll` alongside JS wrapper
+### Node (better-sqlite3) -- DONE
+- [x] Build turbolite loadable extension with `--features loadable-extension,cloud,zstd` (no bundled SQLite)
+- [x] `turbolite.connect(path, opts)` loads extension, opens via VFS URI, returns `better-sqlite3.Database`
+- [x] Ships platform-specific `.dylib/.so/.dll` alongside JS wrapper
+- [x] Per-database VFS isolation via `turbolite_register_vfs(name, cache_dir)` SQL function
+- [x] Postinstall patches better-sqlite3 to enable SQLITE_USE_URI=1 (required for VFS URI filenames)
+- [x] 33 tests: happy path, persistence, concurrent reads, load(), failure modes, edge cases, S3 (real Tigris)
+- [x] CI: test on ubuntu-latest, release builds for macOS arm64/x86_64 + Linux x86_64/arm64
+- [x] npm publish with platform-specific extension binaries (release.yml)
 
-### Go (mattn/go-sqlite3)
-1. Build turbolite loadable extension against go-sqlite3's bundled SQLite headers
-2. `turbolite.Open(path, opts)` returns `*sql.DB` (full `database/sql` interface)
-3. Custom driver loads turbolite extension on init
+### Go (mattn/go-sqlite3) -- DONE
+- [x] `turbolite.Open(path, opts)` returns `*sql.DB` (full `database/sql` interface)
+- [x] Custom driver loads turbolite extension via go-sqlite3 Extensions field
+- [x] Bootstrap connection registers VFS, real connection uses it via DSN `?vfs=turbolite-go-N`
+- [x] Per-database VFS isolation via `turbolite_register_vfs(name, cache_dir)` SQL function
+- [x] 27 tests: happy path, persistence, concurrent reads, failure modes, edge cases, S3 (real Tigris)
+- [x] CI: test on ubuntu-latest, module path `github.com/russellromney/turbolite/packages/go`
+- [x] Go module published via git tag (subdirectory module)
 
 ### Shared concerns
 - Loadable extension must NOT bundle its own SQLite (links against host's)
+- `turbolite_register_vfs(name, cache_dir)` SQL function enables per-database VFS isolation from any language
 - CI matrix: macOS arm64, macOS x86_64, Linux x86_64, Linux arm64
 - Tests: prepared statements, param binding, transactions, concurrent reads
 
