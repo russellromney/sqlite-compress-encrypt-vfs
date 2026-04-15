@@ -133,6 +133,11 @@ impl Database {
                 .map_err(|e| Error::from_reason(format!("open: {e}")))?
         };
 
+        // turbolite manages its own manifest-aware page cache. Disable SQLite's
+        // built-in cache so all reads go through turbolite's VFS.
+        conn.execute_batch("PRAGMA cache_size=0;")
+            .map_err(|e| Error::from_reason(format!("set cache_size: {e}")))?;
+
         Ok(Database { conn: Some(conn) })
     }
 

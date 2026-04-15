@@ -58,7 +58,49 @@ pub mod ffi;
 pub mod ext;
 pub mod tiered;
 pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
+pub use tiered::{StorageBackend, ManifestSource, SyncMode};
 pub mod btree_walker;
+
+/// Open a turbolite-backed SQLite connection.
+///
+/// Registers the VFS, opens the connection, and disables SQLite's page cache
+/// (turbolite manages its own manifest-aware cache instead). This is the
+/// recommended way to open a turbolite connection from Rust.
+///
+/// Requires the `bundled-sqlite` feature.
+///
+/// ```no_run
+/// let config = turbolite::TurboliteConfig {
+///     read_only: true,
+///     ..Default::default()
+/// };
+/// let conn = turbolite::connect("my.db", config).unwrap();
+/// ```
+#[cfg(feature = "bundled-sqlite")]
+pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connection, anyhow::Error> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let vfs_name = format!("turbolite_{:x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let read_only = config.read_only;
+
+    let vfs = TurboliteVfs::new(config)?;
+    let shared = SharedTurboliteVfs::new(vfs);
+    tiered::register_shared(&vfs_name, shared)?;
+
+    let flags = if read_only {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+    };
+    let conn = Connection::open_with_flags_and_vfs(path, flags, &vfs_name)?;
+
+    // turbolite manages its own manifest-aware page cache. Disable SQLite's
+    // built-in cache so all reads go through turbolite's VFS.
+    conn.execute_batch("PRAGMA cache_size=0;")?;
+
+    Ok(conn)
+}
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};

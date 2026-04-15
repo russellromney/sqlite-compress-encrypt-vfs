@@ -346,6 +346,8 @@ pub extern "C" fn turbolite_open(path: *const c_char, vfs_name: *const c_char) -
 
     match rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs_name) {
         Ok(conn) => {
+            // turbolite manages its own manifest-aware page cache. Disable SQLite's.
+            let _ = conn.execute_batch("PRAGMA cache_size=0;");
             let db = Box::into_raw(Box::new(TurboliteDb { conn }));
             // Clear any stale "closed" marker if this address was reused
             let addr = db as u64;
