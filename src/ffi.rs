@@ -213,7 +213,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
 ///
 /// # Returns
 /// 0 on success, -1 on error.
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_register_cloud(
     name: *const c_char,
@@ -271,7 +271,7 @@ pub extern "C" fn turbolite_register_cloud(
 }
 
 /// Backward-compatible alias for `turbolite_register_cloud`.
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_register_tiered(
     name: *const c_char,

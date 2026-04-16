@@ -19,7 +19,7 @@
 /// **Offline operation**: close all connections before rotating. Open connections
 /// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
 /// keys, uncached reads from stale connections will fail with NotFound.
-#[cfg(all(feature = "encryption", feature = "cloud"))]
+#[cfg(all(feature = "encryption", feature = "s3"))]
 pub fn rotate_encryption_key(
     config: &TurboliteConfig,
     new_key: Option<[u8; 32]>,

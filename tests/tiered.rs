@@ -9,7 +9,7 @@
 //!   cargo test --features tiered,zstd tiered
 //! ```
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 mod tiered {
     pub mod helpers;
     mod basic;

@@ -1,4 +1,4 @@
-//! Append-only staging log for two-phase checkpoint (Phase Kursk).
+//! Append-only staging log for two-phase checkpoint.
 //!
 //! When `SyncMode::LocalThenFlush`, dirty pages are written to a staging log
 //! during `write_all_at()` (alongside the normal disk cache write). The staging
@@ -12,7 +12,7 @@
 //! [MANIFEST_MAGIC: u64 LE][manifest_len: u64 LE][manifest_data]*
 //! ```
 //!
-//! `flush_to_s3()` reads from staging logs instead of the live disk cache,
+//! `flush_to_storage()` reads from staging logs instead of the live disk cache,
 //! guaranteeing it uploads the exact state that was checkpointed.
 
 use std::collections::HashMap;

@@ -26,15 +26,15 @@ SQLITE_EXTENSION_INIT1
 extern int turbolite_ext_register_vfs(void);
 
 /* Rust function -- registers a named local VFS with isolated state.
- * Defined in src/ext.rs (Phase Apollo). */
+ * Defined in src/ext.rs. */
 extern int turbolite_ext_register_named_vfs(const char *name, const char *cache_dir);
 
 /* Rust function -- runs EQP on SQL and pushes plan to global queue.
- * Defined in src/tiered/query_plan.rs (Phase Marne). */
+ * Defined in src/tiered/query_plan.rs. */
 extern void turbolite_trace_push_plan(sqlite3 *db, const char *sql);
 
 /* Rust function -- signals query completion for between-query eviction.
- * Defined in src/tiered/query_plan.rs (Phase Stalingrad). */
+ * Defined in src/tiered/query_plan.rs. */
 extern void turbolite_trace_end_query(void);
 
 /* Rust bench functions -- cache control and S3 counters.
@@ -54,7 +54,7 @@ extern const char *turbolite_compact(void);
  * Defined in src/tiered/settings.rs. */
 extern int turbolite_config_set(const char *key, const char *value);
 
-/* Rust functions -- Phase Stalingrad: cache eviction + observability.
+/* Rust functions -- cache eviction + observability.
  * Defined in src/ext.rs. */
 extern int turbolite_evict_tree(const char *tree_names);
 extern int turbolite_evict(const char *tier);
@@ -66,7 +66,7 @@ extern int turbolite_evict_query(sqlite3 *db, const char *sql);
 /*
  * turbolite_register_vfs(name TEXT, cache_dir TEXT)
  *
- * Phase Apollo: register a named local VFS with isolated state.
+ * Register a named local VFS with isolated state.
  * Each call creates a new VFS instance with its own manifest, cache,
  * and page group state. This enables multiple independent databases
  * in the same process via the loadable extension.
@@ -355,12 +355,12 @@ static void turbolite_compact_func(
 /*
  * Trace callback installed via sqlite3_trace_v2 with two event types:
  *
- * SQLITE_TRACE_STMT (Phase Marne): fires at the start of sqlite3_step(),
+ * SQLITE_TRACE_STMT: fires at the start of sqlite3_step(),
  * before the VDBE executes. Calls Rust to run EQP on the SQL string and
  * push planned accesses to the global queue. The VFS drains the queue on
  * first cache miss.
  *
- * SQLITE_TRACE_PROFILE (Phase Stalingrad): fires when a statement
+ * SQLITE_TRACE_PROFILE: fires when a statement
  * finishes. Signals query completion so the VFS can run between-query
  * eviction on the next read. The x argument points to an int64_t with
  * elapsed nanoseconds (unused for now, available for future stats).
@@ -439,7 +439,7 @@ int sqlite3_turbolite_init(
         return rc;
     }
 
-    /* Phase Apollo: register turbolite_register_vfs(name, cache_dir) SQL function.
+    /* register turbolite_register_vfs(name, cache_dir) SQL function.
      * Creates isolated VFS instances for multi-database support. */
     rc = sqlite3_create_function_v2(
         db, "turbolite_register_vfs", 2,
@@ -498,7 +498,7 @@ int sqlite3_turbolite_init(
         SQLITE_UTF8, 0, turbolite_config_set_func, 0, 0, 0
     );
 
-    /* Phase Stalingrad: cache eviction + observability. */
+    /* cache eviction + observability. */
     sqlite3_create_function_v2(
         db, "turbolite_evict_tree", 1,
         SQLITE_UTF8, 0, turbolite_evict_tree_func, 0, 0, 0
@@ -586,7 +586,7 @@ int sqlite3_uri_boolean(const char *zFilename, const char *zParam, int bDflt) {
     return sqlite3_api->uri_boolean(zFilename, zParam, bDflt);
 }
 
-/* Phase Marne: shims for EQP execution from Rust (query_plan.rs).
+/* shims for EQP execution from Rust (query_plan.rs).
  * The Rust code declares these as extern "C" and calls them directly.
  * In the loadable extension, they must route through the API table. */
 

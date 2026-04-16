@@ -1,22 +1,22 @@
 // When cloud feature is disabled, PrefetchPool is a zero-size stub.
-#[cfg(not(feature = "cloud"))]
+#[cfg(not(feature = "s3"))]
 pub(crate) struct PrefetchJob;
 
-#[cfg(not(feature = "cloud"))]
+#[cfg(not(feature = "s3"))]
 pub(crate) struct PrefetchPool;
 
-#[cfg(not(feature = "cloud"))]
+#[cfg(not(feature = "s3"))]
 impl PrefetchPool {
     pub(crate) fn wait_idle(&self) {}
     pub(crate) fn submit(&self, _gid: u64, _key: String, _ft: Vec<super::FrameEntry>, _ps: u32, _spf: u32, _gp: Vec<u64>, _overrides: std::collections::HashMap<usize, super::manifest::SubframeOverride>, _manifest_version: u64) -> bool { false }
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 use super::*;
 
 // ===== PrefetchPool =====
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 /// A job for the prefetch thread pool.
 pub(crate) struct PrefetchJob {
     pub(crate) gid: u64,
@@ -27,22 +27,22 @@ pub(crate) struct PrefetchJob {
     pub(crate) page_size: u32,
     /// Sub-chunk size (needed for seekable decode).
     pub(crate) sub_pages_per_frame: u32,
-    /// Page numbers in this group (Phase Midway: B-tree groups). Empty = legacy positional.
+    /// Page numbers in this group (B-tree groups). Empty = legacy positional.
     pub(crate) group_page_nums: Vec<u64>,
-    /// Phase Drift-c: override frames for this group.
+    /// Override frames for this group.
     pub(crate) overrides: HashMap<usize, super::manifest::SubframeOverride>,
     /// Manifest version when this job was submitted. If the manifest changed
     /// (set_manifest eviction), the fetched data is stale and should be discarded.
     pub(crate) manifest_version: u64,
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 /// Fixed thread pool for background page group prefetching.
 /// Workers loop on a shared flume receiver, fetching page groups from S3
 /// and writing them to the local cache. Default thread count: num_cpus + 1
 /// (keeps pipeline full when threads block on S3 I/O).
 ///
-/// Uses flume channels instead of std::sync::mpsc (Phase Flume):
+/// Uses flume channels instead of std::sync::mpsc:
 /// 1. flume::Receiver is Clone + Sync, so workers recv directly (no Mutex wrapper)
 /// 2. Completion channel replaces AtomicU64 spin-polling in wait_idle()
 /// 3. Bounded job channel provides backpressure when workers are saturated
@@ -59,11 +59,11 @@ pub(crate) struct PrefetchPool {
     workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 impl PrefetchPool {
     pub(crate) fn new(
         num_workers: u32,
-        s3: Arc<S3Client>,
+        storage: Arc<StorageClient>,
         cache: Arc<DiskCache>,
         pages_per_group: u32,
         page_count: Arc<AtomicU64>,
@@ -84,7 +84,7 @@ impl PrefetchPool {
         for _ in 0..num_workers {
             let job_rx = job_rx.clone();
             let done_tx = done_tx.clone();
-            let s3 = Arc::clone(&s3);
+            let storage = Arc::clone(&storage);
             let cache = Arc::clone(&cache);
             let page_count = Arc::clone(&page_count);
             let _ppg = pages_per_group;
@@ -117,9 +117,9 @@ impl PrefetchPool {
 
                     let worker_start = Instant::now();
 
-                    // Blocking S3 GET
+                    // Blocking storage GET (works for S3, HTTP, or local).
                     let fetch_start = Instant::now();
-                    let pg_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&job.key)) {
+                    let pg_data = match storage.get_page_group(&job.key) {
                         Ok(data) => data,
                         Err(e) => {
                             eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
@@ -189,7 +189,7 @@ impl PrefetchPool {
                         continue;
                     }
 
-                    // Write decoded pages to cache (Phase Midway: B-tree-aware scattered writes)
+                    // Write decoded pages to cache (B-tree-aware scattered writes)
                     turbolite_debug!("[prefetch] gid={} writing {} pages (job_v={}, current_v={})",
                         gid, pg_count, job.manifest_version, current_version);
                     let write_start = Instant::now();
@@ -234,14 +234,14 @@ impl PrefetchPool {
                         }
                     }
 
-                    // Phase Drift-c: apply override frames
+                    // Apply override frames
                     if !job.overrides.is_empty() && job.sub_pages_per_frame > 0 {
                         let spf = job.sub_pages_per_frame as usize;
                         for (&frame_idx, ovr) in &job.overrides {
-                            let ovr_data = match S3Client::block_on(&s3.runtime, s3.get_object_async(&ovr.key)) {
+                            let ovr_data = match storage.get_page_group(&ovr.key) {
                                 Ok(Some(data)) => data,
                                 Ok(None) => {
-                                    turbolite_debug!("[prefetch] gid={} override frame {} key '{}' not found in S3",
+                                    turbolite_debug!("[prefetch] gid={} override frame {} key '{}' not found in storage",
                                         gid, frame_idx, ovr.key);
                                     continue;
                                 }
@@ -338,7 +338,7 @@ impl PrefetchPool {
     }
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
         // Drop the job sender to close the channel, causing workers to exit

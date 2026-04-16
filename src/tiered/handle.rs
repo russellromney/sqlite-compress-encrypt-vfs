@@ -16,25 +16,25 @@ pub struct TurboliteHandle {
     ///
     /// Safety of clone-modify-store pattern: SQLite's EXCLUSIVE lock serializes all
     /// writes within a process. Only one handle calls sync()/write_all_at() at a time.
-    /// flush_to_s3() runs outside the SQLite lock but is serialized by flush_lock.
+    /// flush_to_storage() runs outside the SQLite lock but is serialized by flush_lock.
     /// set_manifest() from HA followers uses monotonic version checks to reject stale updates.
     /// Readers (load()) see a consistent snapshot; they may briefly see an old version
     /// during a store(), which is safe because page data in the cache file is immutable
     /// once written (pages are never overwritten, only new versions are added).
     manifest: Arc<ArcSwap<Manifest>>,
     /// Dirty page numbers (data lives in disk cache, not in memory).
-    /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
+    /// Replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
     /// holding a second copy of every dirty page in memory.
     dirty_page_nums: RwLock<HashSet<u64>>,
     /// Page group IDs that were locally checkpointed but not yet synced to S3.
-    /// Populated during local-checkpoint-only mode; drained by flush_to_s3().
-    /// Arc'd so flush_to_s3 can drain from outside SQLite lock.
+    /// Populated during local-checkpoint-only mode; drained by flush_to_storage().
+    /// Arc'd so flush_to_storage can drain from outside SQLite lock.
     s3_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     page_size: std::sync::atomic::AtomicU32,
     pages_per_group: u32,
     compression_level: i32,
     read_only: bool,
-    /// Per-VFS sync mode (Durable = S3 upload in sync, LocalThenFlush = defer to flush_to_s3)
+    /// Per-VFS sync mode (Durable = upload in sync, LocalThenFlush = defer to flush_to_storage)
     sync_mode: SyncMode,
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
@@ -57,7 +57,7 @@ pub struct TurboliteHandle {
     #[cfg(feature = "zstd")]
     dictionary_bytes: Option<Vec<u8>>,
 
-    /// Phase Zenith-c: true if dirty pages have been written since the last
+    /// True if dirty pages have been written since the last
     /// successful sync. Used to detect transaction rollback (lock downgrade
     /// from EXCLUSIVE/RESERVED without sync having been called).
     dirty_since_sync: bool,
@@ -73,11 +73,11 @@ pub struct TurboliteHandle {
     /// AES-256-GCM encryption key for S3 data and local cache.
     encryption_key: Option<[u8; 32]>,
 
-    // --- Phase Marne: query-plan-aware prefetch ---
+    // Query-plan-aware prefetch
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
 
-    // --- Phase Midway: VACUUM detection ---
+    // VACUUM detection
     /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
     /// and VACUUM. Used to detect VACUUM and trigger B-tree re-walk at checkpoint.
     last_schema_cookie: Option<u32>,
@@ -85,17 +85,17 @@ pub struct TurboliteHandle {
     /// consumed during the upload phase.
     vacuum_replaced_keys: Option<Vec<String>>,
 
-    // --- Phase Stalingrad: cache eviction ---
+    // Cache eviction
     /// Maximum cache size in bytes. None = unlimited.
     cache_limit: Option<u64>,
     /// Evict data tier after successful checkpoint S3 upload.
     evict_on_checkpoint: bool,
 
-    // --- Phase Kursk: staging log for two-phase checkpoint ---
+    // Staging log for two-phase checkpoint
     /// Append-only staging log writer (open during LocalThenFlush checkpoint).
     /// Lazily opened on first dirty write; closed+fsynced in sync().
     staging_writer: Option<staging::StagingWriter>,
-    /// Shared pending flushes. Populated by sync(), drained by flush_to_s3().
+    /// Shared pending flushes. Populated by sync(), drained by flush_to_storage().
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     /// Monotonic counter for staging log filenames (avoids version collisions).
     staging_seq: Arc<AtomicU64>,
@@ -153,7 +153,7 @@ impl TurboliteHandle {
         // Eagerly fetch page group 0 and interior/index chunks from S3.
         // In local mode (s3=None), these are not fetched eagerly; they're fetched
         // on demand from local page groups when first accessed.
-        #[cfg(feature = "cloud")]
+        #[cfg(feature = "s3")]
         if let Some(ref s3_ref) = s3 {
             // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
             if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
@@ -175,7 +175,7 @@ impl TurboliteHandle {
                                     dictionary,
                                     encryption_key.as_ref(),
                                 );
-                                // Phase Drift-c: apply overrides for group 0
+                                // Apply overrides for group 0
                                 if let Some(overrides) = manifest.subframe_overrides.get(0) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
@@ -312,7 +312,7 @@ impl TurboliteHandle {
                     cache.index_pages.lock().len(),
                 );
             }
-        } // end #[cfg(feature = "cloud")] S3 eager fetch block
+        } // end #[cfg(feature = "s3")] S3 eager fetch block
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {
@@ -813,7 +813,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // 1. Check dirty pages first (new pages may not be in manifest yet).
-        // Phase Marne: data lives in disk cache, not in memory.
+        // Data lives in disk cache, not in memory.
         if self.dirty_page_nums.read().contains(&page_num) {
             if let Some(cache) = &self.cache {
                 cache.read_page(page_num, buf)?;
@@ -828,7 +828,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // 3. Look up page location (Phase Midway).
+        // 3. Look up page location.
         // Safe to .expect() here because:
         //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
         //    - Pages beyond page_count are zero-filled (returned above)
@@ -842,7 +842,7 @@ impl DatabaseHandle for TurboliteHandle {
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
-        // 3c. Phase Stalingrad: between-query eviction trigger.
+        // 3c. between-query eviction trigger.
         //
         // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
         // fires on statement completion and sets the end-query signal). If so,
@@ -934,7 +934,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // 3f. Phase Marne: query-plan-aware prefetch.
+        // 3f. query-plan-aware prefetch.
         //
         // Drain the global plan queue and submit ALL planned groups to the
         // prefetch pool in EQP order: all groups for tree 1, then all groups
@@ -1086,7 +1086,7 @@ impl DatabaseHandle for TurboliteHandle {
                             } else { false };
 
                             if decoded_ok {
-                                // Phase Drift-c: apply override frames
+                                // Apply override frames
                                 if let Some(overrides) = manifest.subframe_overrides.get(gid as usize) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
@@ -1147,7 +1147,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // S3 fetch paths (seekable + legacy) only available with cloud feature.
-        #[cfg(feature = "cloud")]
+        #[cfg(feature = "s3")]
         {
         let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
         let miss_start = Instant::now();
@@ -1169,7 +1169,7 @@ impl DatabaseHandle for TurboliteHandle {
                     .expect("gid must be valid index into page_group_keys");
                 let entry = &ft[frame_idx];
 
-                // Phase Drift-c: check for override frame
+                // Check for override frame
                 let override_entry = manifest.subframe_overrides
                     .get(gid as usize)
                     .and_then(|ovs| ovs.get(&frame_idx));
@@ -1419,7 +1419,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
             }
         }
-        } // end #[cfg(feature = "cloud")] S3 fetch block
+        } // end #[cfg(feature = "s3")] S3 fetch block
 
         // Read the page from cache (should be present now after legacy download).
         if cache.is_present(page_num) {
@@ -1430,7 +1430,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // Phase Kursk: fallback read from cache file even if bitmap says absent.
+        // Fallback read from cache file even if bitmap says absent.
         if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
             cache.bitmap_mark(page_num);
             cache.mark_group_present(gid);
@@ -1473,7 +1473,7 @@ impl DatabaseHandle for TurboliteHandle {
         let page_size = self.page_size.load(Ordering::Relaxed) as u64;
         let page_num = offset / page_size;
 
-        // Phase Midway: capture schema cookie from page 0 for VACUUM detection.
+        // Capture schema cookie from page 0 for VACUUM detection.
         // Read the EXISTING cookie before this write overwrites it.
         if page_num == 0 && self.last_schema_cookie.is_none() {
             if let Some(cache) = &self.cache {
@@ -1494,7 +1494,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
+        // Write to local cache and track as dirty (data only in cache, not in memory)
         if let Some(cache) = &self.cache {
             cache.write_page(page_num, buf)?;
             // Invalidate mem_cache for this page so reads see the fresh disk write,
@@ -1515,7 +1515,7 @@ impl DatabaseHandle for TurboliteHandle {
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
 
-        // Phase Kursk: append to staging log for LocalThenFlush mode.
+        // Append to staging log for LocalThenFlush mode.
         // Captures exact page contents at write time, immune to overwrite
         // by subsequent checkpoints.
         if self.sync_mode == SyncMode::LocalThenFlush {
@@ -1589,7 +1589,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // Phase Marne: snapshot is just page numbers, not page data.
+        // Snapshot is just page numbers, not page data.
         let dirty_snapshot: HashSet<u64> = {
             let dirty = self.dirty_page_nums.read();
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
@@ -1716,6 +1716,7 @@ impl DatabaseHandle for TurboliteHandle {
                         #[cfg(feature = "zstd")]
                         self.dictionary_bytes.as_deref(),
                         self.encryption_key,
+                        self.gc_enabled,
                         self.override_threshold,
                         self.compaction_threshold,
                     ) {
@@ -1744,6 +1745,7 @@ impl DatabaseHandle for TurboliteHandle {
                         #[cfg(feature = "zstd")]
                         self.dictionary_bytes.as_deref(),
                         self.encryption_key,
+                        self.gc_enabled,
                         self.override_threshold,
                         self.compaction_threshold,
                     )?;
@@ -1756,7 +1758,7 @@ impl DatabaseHandle for TurboliteHandle {
         // ── S3Primary sync path: upload dirty frames as overrides + publish manifest ──
         // Every xSync is an S3 commit. No staging logs, no deferred flush.
         // Override-only (no full group rewrites) to keep per-commit latency bounded.
-        #[cfg(feature = "cloud")]
+        #[cfg(feature = "s3")]
         if self.sync_mode == SyncMode::S3Primary {
             let page_size = self.page_size.load(Ordering::Relaxed);
             let s3 = self.s3.as_ref().expect("S3Primary requires cloud feature with S3 client").clone();
@@ -2131,18 +2133,18 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // Durable sync path: full S3 upload. Only available with cloud feature.
-        #[cfg(not(feature = "cloud"))]
+        #[cfg(not(feature = "s3"))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "Durable sync requires cloud feature",
         ));
 
-        #[cfg(feature = "cloud")]
+        #[cfg(feature = "s3")]
         {
 
         let page_size = self.page_size.load(Ordering::Relaxed);
 
-        // Phase Midway: detect VACUUM by checking schema cookie change.
+        // Detect VACUUM by checking schema cookie change.
         // VACUUM rewrites the entire database with new page numbers.
         // When detected, re-walk B-trees and rebuild group_pages from scratch.
         // Done before borrowing cache/s3 to avoid borrow conflicts with self mutation.
@@ -2256,7 +2258,7 @@ impl DatabaseHandle for TurboliteHandle {
                         manifest.interior_chunk_keys.clear();
                         manifest.index_chunk_keys.clear();
                         manifest.frame_tables.clear();
-                        // Phase Drift: clear overrides on VACUUM
+                        // Clear overrides on VACUUM
                         for overrides in &manifest.subframe_overrides {
                             for ovr in overrides.values() {
                                 vacuum_keys.push(ovr.key.clone());
@@ -2309,7 +2311,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Dual counter (Phase Borodino):
+        // Dual counter:
         // - version: monotonic +1, for S3 key uniqueness
         // - change_counter: SQLite file change counter, for walrust WAL replay
         let next_version = self.manifest.load().version + 1;
@@ -2465,7 +2467,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Only re-upload chunks that contain dirty interior pages.
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new(); // pnum → data
         {
-            // Phase Marne: collect interior pages from cache (dirty_snapshot is just page numbers)
+            // Collect interior pages from cache (dirty_snapshot is just page numbers)
             let mut dirty_interior_count = 0usize;
             let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
@@ -2581,7 +2583,7 @@ impl DatabaseHandle for TurboliteHandle {
         // ── Index leaf bundles (same pattern as interior) ──
         let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
         {
-            // Phase Marne: read dirty pages from cache for index leaf classification
+            // Read dirty pages from cache for index leaf classification
             let mut dirty_index_count = 0usize;
             let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
@@ -2771,7 +2773,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Persist bitmap
         let _ = cache.persist_bitmap();
 
-        // Phase Marathon: truncate cache file if it's larger than current page_count.
+        // Truncate cache file if it's larger than current page_count.
         // After VACUUM, page_count decreases but the sparse cache file retains its old size.
         {
             let current_page_count = self.manifest.load().page_count;
@@ -2794,7 +2796,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // Post-checkpoint GC: delete old page group/interior chunk versions asynchronously.
-        // Phase Thermopylae: fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
+        // Fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
         if self.gc_enabled && !replaced_keys.is_empty() {
             let gc_s3 = Arc::clone(self.s3.as_ref().expect("s3 client required"));
             let runtime = gc_s3.runtime.clone();
@@ -2804,7 +2806,7 @@ impl DatabaseHandle for TurboliteHandle {
             });
         }
 
-        // Phase Somme-e: GC old WAL segments after checkpoint.
+        // GC old WAL segments after checkpoint.
         // WAL segments with txid <= change_counter are in the page groups (redundant).
         // Uses change_counter (not version) because walrust txids are file change counters.
         #[cfg(feature = "wal")]
@@ -2841,7 +2843,7 @@ impl DatabaseHandle for TurboliteHandle {
             });
         }
 
-        // Phase Stalingrad-e: evict data tier after successful checkpoint upload.
+        // Evict data tier after successful checkpoint upload.
         if self.evict_on_checkpoint {
             if let Some(cache) = &self.cache {
                 let mut tracker = cache.tracker.lock();
@@ -2868,7 +2870,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Phase Gallipoli: persist local manifest (no dirty groups in Durable mode)
+        // Persist local manifest (no dirty groups in Durable mode)
         if let Some(cache) = &self.cache {
             let m = (**self.manifest.load()).clone();
             let local = manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
@@ -2879,7 +2881,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         Ok(())
-        } // end #[cfg(feature = "cloud")] durable sync block
+        } // end #[cfg(feature = "s3")] durable sync block
     }
 
     fn set_len(&mut self, size: u64) -> Result<(), io::Error> {
@@ -2921,7 +2923,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(true);
         }
 
-        // Phase Zenith-c: detect transaction rollback.
+        // Detect transaction rollback.
         // If lock downgrades from EXCLUSIVE/RESERVED and we have unsynced dirty
         // pages, the transaction was rolled back. Clear dirty pages and evict
         // them from the disk cache so subsequent reads re-fetch from the source

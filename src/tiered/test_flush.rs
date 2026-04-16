@@ -80,7 +80,7 @@ fn test_flush_empty_dirty_groups_is_noop() {
 }
 
 // =========================================================================
-// Phase Drift: override threshold tests
+// Override threshold tests
 // =========================================================================
 
 #[test]

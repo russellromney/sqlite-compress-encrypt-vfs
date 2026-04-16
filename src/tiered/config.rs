@@ -12,7 +12,7 @@ pub enum StorageBackend {
     Local,
     /// S3-backed mode. Local disk is a cache; S3 is the source of truth.
     /// Requires the `cloud` feature for AWS SDK + tokio.
-    #[cfg(feature = "cloud")]
+    #[cfg(feature = "s3")]
     S3 {
         /// S3 bucket name
         bucket: String,
@@ -22,19 +22,6 @@ pub enum StorageBackend {
         endpoint_url: Option<String>,
         /// AWS region (default "us-east-1")
         region: Option<String>,
-    },
-    /// HTTP-backed mode. Uses Bearer token auth against a storage API
-    /// (e.g., Grabby /v1/sync/pages/). Local disk is a cache.
-    Http {
-        /// Base URL (e.g., "https://storage.iad.cinch.dev")
-        endpoint: String,
-        /// Bearer token for authentication
-        token: String,
-        /// Key prefix (e.g., "database-id")
-        prefix: String,
-        /// Shared fence token, updated by lease renewal loop.
-        #[serde(skip)]
-        fence_token: Arc<std::sync::atomic::AtomicU64>,
     },
 }
 
@@ -65,7 +52,7 @@ impl Default for ManifestSource {
 
 // ===== Sync mode =====
 
-/// Controls whether checkpoint uploads to S3 synchronously (blocking) or defers to flush_to_s3().
+/// Controls whether checkpoint uploads to S3 synchronously (blocking) or defers to flush_to_storage().
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncMode {
     /// Default. `sync()` uploads dirty pages to S3 during checkpoint.
@@ -73,13 +60,13 @@ pub enum SyncMode {
     /// Full S3 durability on every checkpoint.
     Durable,
     /// `sync()` writes to local disk cache only; dirty groups are recorded for
-    /// later upload via `flush_to_s3()`. The EXCLUSIVE lock is held for ~1ms.
+    /// later upload via `flush_to_storage()`. The EXCLUSIVE lock is held for ~1ms.
     ///
     /// Between checkpoint and flush, data exists only in local disk cache:
     /// - Process crash: data survives (on local disk)
     /// - Machine loss: data lost (not yet on S3)
     ///
-    /// Call `flush_to_s3()` (on TurboliteVfs or TurboliteSharedState) to upload.
+    /// Call `flush_to_storage()` (on TurboliteVfs or TurboliteSharedState) to upload.
     LocalThenFlush,
     /// S3 is the database. Local disk is disposable cache. Every `xSync()` uploads
     /// dirty frames as subframe overrides and publishes the manifest to S3.
@@ -91,7 +78,7 @@ pub enum SyncMode {
     /// Per-commit cost: ~256KB per dirty frame + manifest publish (~2-50ms).
     /// Best for ephemeral compute (Lambda, scale-to-zero) where local disk is
     /// not durable but S3 is.
-    #[cfg(feature = "cloud")]
+    #[cfg(feature = "s3")]
     S3Primary,
 }
 
@@ -160,7 +147,7 @@ pub struct TurboliteConfig {
     /// Open in read-only mode (no writes, no WAL)
     pub read_only: bool,
     /// Tokio runtime handle (pass in, or a new runtime is created)
-    #[cfg(feature = "cloud")]
+    #[cfg(feature = "s3")]
     #[serde(skip)]
     pub runtime_handle: Option<TokioHandle>,
     /// Pages per page group (default 256 = 16MB uncompressed at 64KB page size, ~8MB compressed).
@@ -212,7 +199,7 @@ pub struct TurboliteConfig {
     /// Default: false. Ignored in local mode.
     pub prediction_enabled: bool,
     /// Checkpoint sync mode. In cloud mode: Durable uploads to S3 during checkpoint,
-    /// LocalThenFlush defers to flush_to_s3(). In local mode: always LocalThenFlush
+    /// LocalThenFlush defers to flush_to_storage(). In local mode: always LocalThenFlush
     /// (this field is overridden). Default: Durable.
     pub sync_mode: SyncMode,
     /// **Cloud-only.** Enable query-plan-aware prefetch.
@@ -221,20 +208,20 @@ pub struct TurboliteConfig {
     /// the loadable extension populates the queue via EQP at start of step().
     /// Default: true (no-op if the extension trace callback is not installed).
     pub query_plan_prefetch: bool,
-    /// Phase Stalingrad: maximum cache size in bytes (sub-chunk granularity).
+    /// Maximum cache size in bytes (sub-chunk granularity).
     /// When set, the VFS evicts sub-chunks between queries to stay within budget.
     /// None = unlimited (default). 0 = unlimited.
     /// Active queries can temporarily exceed this limit; eviction only fires between queries.
     /// Also settable via TURBOLITE_CACHE_LIMIT env var or turbolite_config_set('cache_limit', '512MB').
     pub max_cache_bytes: Option<u64>,
-    /// Phase Stalingrad-e: evict data tier after successful checkpoint S3 upload.
+    /// Evict data tier after successful checkpoint S3 upload.
     /// Good for serverless/bursty workloads where you want a clean slate after committing.
     /// Only evicts Data tier (interior + index remain for next query's fast path).
     /// Default: false. Also settable via turbolite_config_set('evict_on_checkpoint', 'true').
     pub evict_on_checkpoint: bool,
-    /// Phase Drift: override threshold. 0 = auto (frames_per_group / 4).
+    /// Override threshold. 0 = auto (frames_per_group / 4).
     pub override_threshold: u32,
-    /// Phase Drift-d: compaction threshold. Default 8.
+    /// Compaction threshold. Default 8.
     pub compaction_threshold: u32,
     /// In-memory page cache budget in bytes. When > 0, turbolite caches decoded pages
     /// in memory (zero-copy AtomicPtr reads). Pages are promoted on S3 fetch and
@@ -258,13 +245,13 @@ pub struct TurboliteConfig {
     /// S3: always fetch from S3 (for HA followers, multi-reader).
     /// In local mode, manifest is always loaded from local disk.
     pub manifest_source: ManifestSource,
-    /// Phase Somme: enable WAL replication via walrust.
+    /// Enable WAL replication via walrust.
     /// Ships WAL frames to S3 for transaction-level durability between checkpoints.
     /// Requires the `wal` feature flag.
     /// Default: false. `TURBOLITE_WAL_REPLICATION=true` to enable.
     #[cfg(feature = "wal")]
     pub wal_replication: bool,
-    /// Phase Somme: WAL sync interval (how often walrust ships WAL frames to S3).
+    /// WAL sync interval (how often walrust ships WAL frames to S3).
     /// Default: 1 second.
     #[cfg(feature = "wal")]
     pub wal_sync_interval_ms: u64,
@@ -280,7 +267,7 @@ impl Default for TurboliteConfig {
             compression_level: 3,
             endpoint_url: None,
             read_only: false,
-            #[cfg(feature = "cloud")]
+            #[cfg(feature = "s3")]
             runtime_handle: None,
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             region: None,
@@ -357,11 +344,10 @@ impl TurboliteConfig {
     /// If Local but `bucket` is non-empty, auto-upgrade to S3 (backward compat).
     pub fn effective_backend(&self) -> StorageBackend {
         match &self.storage_backend {
-            #[cfg(feature = "cloud")]
+            #[cfg(feature = "s3")]
             StorageBackend::S3 { .. } => self.storage_backend.clone(),
-            StorageBackend::Http { .. } => self.storage_backend.clone(),
             StorageBackend::Local => {
-                #[cfg(feature = "cloud")]
+                #[cfg(feature = "s3")]
                 if !self.bucket.is_empty() {
                     return StorageBackend::S3 {
                         bucket: self.bucket.clone(),
@@ -387,7 +373,7 @@ mod tests;
 
 // ===== Manifest =====
 
-/// Location of a page within the explicit group mapping (Phase Midway).
+/// Location of a page within the explicit group mapping.
 #[derive(Debug, Clone, Copy)]
 pub struct PageLocation {
     pub group_id: u64,
@@ -395,7 +381,7 @@ pub struct PageLocation {
     pub index: u32,
 }
 
-/// B-tree metadata stored in the manifest (Phase Midway).
+/// B-tree metadata stored in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BTreeManifestEntry {
     pub name: String,

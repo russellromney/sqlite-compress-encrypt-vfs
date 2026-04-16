@@ -10,7 +10,7 @@ fn test_tiered_config_default() {
     assert_eq!(c.compression_level, 3);
     assert_eq!(c.endpoint_url, None);
     assert!(!c.read_only);
-    #[cfg(feature = "cloud")]
+    #[cfg(feature = "s3")]
     assert!(c.runtime_handle.is_none());
     assert_eq!(c.pages_per_group, DEFAULT_PAGES_PER_GROUP);
     assert_eq!(c.region, None);
@@ -48,7 +48,7 @@ fn test_deserialize_local_backend_explicit() {
     assert_eq!(c.cache_dir, PathBuf::from("/data/test"));
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[test]
 fn test_deserialize_s3_backend() {
     let json = r#"{
@@ -200,7 +200,7 @@ fn test_effective_backend_local_default() {
     assert!(c.is_local());
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[test]
 fn test_effective_backend_legacy_bucket_upgrades_to_s3() {
     let c = TurboliteConfig {

@@ -1,4 +1,4 @@
-//! Phase Somme: WAL replication via walrust integration.
+//! WAL replication via walrust integration.
 //!
 //! When `wal_replication=true`, the VFS starts a background walrust replication
 //! loop that ships WAL frames to S3 on a timer. This provides transaction-level
@@ -7,7 +7,7 @@
 //! Architecture:
 //! - turbolite page groups = snapshot (managed by sync/checkpoint)
 //! - walrust WAL shipping = incremental durability (managed by this module)
-//! - Both use SQLite's file change counter as version/txid (Phase Somme-b)
+//! - Both use SQLite's file change counter as version/txid
 //!
 //! The replication loop starts lazily on the first MainDb open (not in VFS::new)
 //! because the WAL file path isn't known until SQLite calls open().

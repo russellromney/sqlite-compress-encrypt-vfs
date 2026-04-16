@@ -150,7 +150,7 @@ fn test_local_vfs_schema_changes() {
 
 /// Local VFS gc() and destroy_s3() return appropriate errors.
 /// flush_to_storage() is a valid no-op on local VFS (returns Ok).
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[test]
 fn test_local_vfs_cloud_methods_error() {
     let dir = TempDir::new().unwrap();
@@ -374,7 +374,7 @@ fn test_local_vfs_checkpoint_reopen() {
 }
 
 // =========================================================================
-// Phase Drift: override write + cold read tests
+// Override write + cold read tests
 // =========================================================================
 
 /// Write data with override_threshold=100 (high, so overrides are used),
@@ -564,7 +564,7 @@ fn test_local_vfs_override_compaction() {
 }
 
 // =========================================================================
-// Phase Zenith-b: Cache validation on open
+// Cache validation on open
 // =========================================================================
 
 /// Reopen with same manifest version: cache warm, data correct.
@@ -725,7 +725,7 @@ fn test_cache_validation_cold_start_after_cache_delete() {
     }
 }
 
-// ===== Phase Zenith-c: Transaction Rollback Handling =====
+// ===== Transaction Rollback Handling =====
 
 /// After a constraint violation (failed INSERT), subsequent reads must see
 /// the correct data, not stale dirty pages from the rolled-back transaction.
@@ -833,7 +833,7 @@ fn test_repeated_constraint_violations() {
     assert_eq!(count, 2);
 }
 
-// ===== Phase Zenith-d: WAL Migration Path =====
+// ===== WAL Migration Path =====
 
 /// turbolite_migrate_to_s3_primary checkpoints WAL and prepares for journal_mode=OFF.
 /// The turbolite VFS creates WAL stub files on open (unless S3Primary mode), so

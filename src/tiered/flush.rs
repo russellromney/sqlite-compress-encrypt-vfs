@@ -1,4 +1,4 @@
-//! Non-blocking S3 flush for two-phase checkpoint (Phase Kursk).
+//! Non-blocking S3 flush for two-phase checkpoint.
 //!
 //! After a local-only checkpoint (SyncMode::LocalThenFlush), dirty pages are
 //! captured in staging log files on disk. This module reads from staging logs
@@ -13,13 +13,13 @@ use super::*;
 
 /// Upload locally-checkpointed dirty page groups to S3.
 ///
-/// Reads dirty pages from staging logs (Phase Kursk), non-dirty pages from
+/// Reads dirty pages from staging logs, non-dirty pages from
 /// cache or S3. Called outside any SQLite lock.
 ///
 /// # Safety contract
 /// - Must NOT be called concurrently with itself (caller holds flush_lock).
 /// - Staging log files must exist for all pending flushes.
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
@@ -62,7 +62,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 
     if let Err(ref e) = result {
         eprintln!("[flush] ERROR: flush failed, restoring pending state: {}", e);
-        // Push staging logs back so next flush_to_s3() retries them
+        // Push staging logs back so next flush_to_storage() retries them
         if !flushes.is_empty() {
             pending_flushes.lock().unwrap().extend(flushes);
         }
@@ -76,7 +76,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 }
 
 /// Inner flush logic. Separated so the outer function can restore state on error.
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 fn flush_inner(
     s3: &S3Client,
     cache: &DiskCache,
@@ -121,7 +121,7 @@ fn flush_inner(
     if page_size == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "flush_to_s3: manifest has page_size=0",
+            "flush: manifest has page_size=0",
         ));
     }
 
@@ -166,7 +166,7 @@ fn flush_inner(
     let use_seekable = old_sub_ppf > 0;
     let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
 
-    // Phase Drift: carry forward subframe overrides, track which groups get full rewrite
+    // Carry forward subframe overrides, track which groups get full rewrite
     let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
     let effective_threshold = if override_threshold > 0 {
         override_threshold as usize
@@ -189,7 +189,7 @@ fn flush_inner(
             if pnum < page_count { dirty_page_nums.insert(pnum); }
         }
 
-        // Phase Drift: determine if we can use override path
+        // Determine if we can use override path
         let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
             .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
             .copied().collect();
@@ -207,7 +207,7 @@ fn flush_inner(
             && dirty_frames.len() < effective_threshold;
 
         if use_override {
-            // Phase Drift: override path -- encode only dirty frames
+            // Override path -- encode only dirty frames
             while new_subframe_overrides.len() <= gid as usize {
                 new_subframe_overrides.push(HashMap::new());
             }
@@ -566,7 +566,7 @@ fn flush_inner(
     turbolite_debug!("[flush] all {} objects uploaded", uploads.len());
 
     // 10. Update manifest atomically
-    // Phase Drift: GC overrides for fully-rewritten groups before manifest construction
+    // GC overrides for fully-rewritten groups before manifest construction
     while new_subframe_overrides.len() < new_keys.len() {
         new_subframe_overrides.push(HashMap::new());
     }
@@ -634,7 +634,7 @@ fn flush_inner(
         staging::remove_staging_log(path);
     }
 
-    // Phase Gallipoli: persist local manifest with empty dirty_groups (flush complete)
+    // Persist local manifest with empty dirty_groups (flush complete)
     {
         let m = (**shared_manifest.load()).clone();
         let local = super::manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
@@ -643,7 +643,7 @@ fn flush_inner(
         }
     }
 
-    // TODO(Phase Drift-d): S3 compaction requires a StorageClient wrapper around
+    // TODO: S3 compaction requires a StorageClient wrapper around
     // S3Client, or an S3-specific compaction path. For now, compaction only runs
     // on the local flush path. S3 mode is the cloud path where compaction latency
     // matters less (overrides are merged on read).
@@ -670,6 +670,7 @@ pub(crate) fn flush_local_groups(
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
+    gc_enabled: bool,
     override_threshold: u32,
     compaction_threshold: u32,
 ) -> io::Result<()> {
@@ -687,11 +688,12 @@ pub(crate) fn flush_local_groups(
         return Ok(());
     }
 
-    // Run inner flush, restoring drained state on error (same pattern as flush_to_s3)
+    // Run inner flush, restoring drained state on error (same pattern as flush_dirty_groups_to_s3)
     let result = flush_local_inner(
         storage, cache, shared_manifest, compression_level,
         #[cfg(feature = "zstd")] dictionary,
         encryption_key,
+        gc_enabled,
         &flushes, &legacy_dirty,
         override_threshold, compaction_threshold,
     );
@@ -716,6 +718,7 @@ fn flush_local_inner(
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
+    gc_enabled: bool,
     flushes: &[staging::PendingFlush],
     legacy_dirty: &HashSet<u64>,
     override_threshold: u32,
@@ -778,7 +781,7 @@ fn flush_local_inner(
     let mut replaced_keys: Vec<String> = Vec::new();
     let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
 
-    // Phase Drift: carry forward overrides, track full rewrites
+    // Carry forward overrides, track full rewrites
     let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
     let effective_threshold = if override_threshold > 0 {
         override_threshold as usize
@@ -793,7 +796,7 @@ fn flush_local_inner(
         let pages_in_group = manifest_snap.group_page_nums(gid);
         let group_size = pages_in_group.len();
 
-        // Phase Drift: determine if we can use override path
+        // Determine if we can use override path
         let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
             .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
             .copied().collect();
@@ -896,7 +899,7 @@ fn flush_local_inner(
     storage.put_page_groups(&uploads)?;
 
     // 8. Build and persist new manifest
-    // Phase Drift: GC overrides only for fully-rewritten groups
+    // GC overrides only for fully-rewritten groups
     while new_subframe_overrides.len() < new_keys.len() {
         new_subframe_overrides.push(HashMap::new());
     }
@@ -933,8 +936,10 @@ fn flush_local_inner(
         shared_manifest.store(Arc::new(new_manifest));
     }
 
-    // 10. Delete old page group versions
-    if !replaced_keys.is_empty() {
+    // 10. Delete old page group versions (only if GC is enabled).
+    // When disabled, old versions accumulate until explicit gc() runs.
+    // This protects snapshot-referenced page groups from deletion.
+    if gc_enabled && !replaced_keys.is_empty() {
         let _ = storage.delete_page_groups(&replaced_keys);
     }
 
@@ -949,7 +954,7 @@ fn flush_local_inner(
         }
     }
 
-    // Phase Drift-d: auto-compact overrides if threshold reached
+    // Auto-compact overrides if threshold reached
     if compaction_threshold > 0 {
         if let Err(e) = compact::auto_compact_overrides(
             storage, shared_manifest, compaction_threshold, compression_level,

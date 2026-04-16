@@ -40,7 +40,7 @@ pub struct Manifest {
     #[serde(default)]
     pub sub_pages_per_frame: u32,
 
-    /// Phase Drift: per-group subframe overrides. Indexed by group_id, keyed by frame_index.
+    /// Per-group subframe overrides. Indexed by group_id, keyed by frame_index.
     #[serde(default)]
     pub subframe_overrides: Vec<HashMap<usize, SubframeOverride>>,
 
@@ -49,7 +49,7 @@ pub struct Manifest {
     #[serde(default = "default_strategy")]
     pub strategy: GroupingStrategy,
 
-    // --- Phase Midway: B-tree-aware page groups ---
+    // B-tree-aware page groups
 
     /// Explicit page-to-group mapping. group_pages[gid] = ordered list of page numbers
     /// in that group. Empty for Positional strategy (computed on the fly).
@@ -69,12 +69,12 @@ pub struct Manifest {
     #[serde(skip)]
     pub btree_groups: HashMap<u64, Vec<u64>>,
 
-    /// Phase Verdun-i: reverse index page_num -> B-tree name (table/index name).
+    /// Reverse index page_num -> B-tree name (table/index name).
     /// Built on load from `btrees`, not serialized. Survives VACUUM (names stable).
     #[serde(skip)]
     pub page_to_tree_name: HashMap<u64, String>,
 
-    /// Phase Verdun-i: reverse index tree_name -> group IDs.
+    /// Reverse index tree_name -> group IDs.
     /// Built on load from `btrees`, not serialized.
     #[serde(skip)]
     pub tree_name_to_groups: HashMap<String, Vec<u64>>,
@@ -108,7 +108,7 @@ pub struct FrameEntry {
     pub len: u32,
 }
 
-/// Phase Drift: a subframe override entry.
+/// A subframe override entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubframeOverride {
     /// S3 key for the override object
@@ -121,7 +121,7 @@ pub(crate) fn default_pages_per_group() -> u32 {
     DEFAULT_PAGES_PER_GROUP
 }
 
-// ── Phase Gallipoli: local manifest persistence ──
+// Local manifest persistence
 
 /// Wrapper for local manifest persistence. Contains the full manifest
 /// plus dirty_groups that haven't been flushed to S3 yet.
@@ -232,7 +232,7 @@ impl Manifest {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
                 self.group_to_tree_name.insert(gid, entry.name.clone());
             }
-            // Phase Verdun-i: reverse index from pages -> tree name
+            // Reverse index from pages -> tree name
             for &gid in &entry.group_ids {
                 if let Some(pages) = self.group_pages.get(gid as usize) {
                     for &page_num in pages {
@@ -240,7 +240,7 @@ impl Manifest {
                     }
                 }
             }
-            // Phase Verdun-i: tree name -> group IDs
+            // Tree name -> group IDs
             self.tree_name_to_groups.insert(entry.name.clone(), entry.group_ids.clone());
         }
     }
@@ -304,7 +304,7 @@ impl Manifest {
         self.btree_groups.get(&gid).cloned().unwrap_or_default()
     }
 
-    /// Phase Drift: ensure subframe_overrides vec length matches page_group_keys.
+    /// Ensure subframe_overrides vec length matches page_group_keys.
     pub fn normalize_overrides(&mut self) {
         while self.subframe_overrides.len() < self.page_group_keys.len() {
             self.subframe_overrides.push(HashMap::new());
@@ -322,7 +322,7 @@ impl Manifest {
     }
 }
 
-/// Phase Drift: given dirty page numbers and a group's page list, return which
+/// Given dirty page numbers and a group's page list, return which
 /// frame indices contain at least one dirty page.
 pub(crate) fn dirty_frames_for_group(
     dirty_page_nums: &[u64],

@@ -12,7 +12,7 @@ pub struct TurboliteSharedState {
     pub(super) s3: Arc<S3Client>,
     pub(super) cache: Arc<DiskCache>,
     pub(super) prefetch_pool: Arc<PrefetchPool>,
-    // Shared state for flush_to_s3()
+    // Shared state for flush_to_storage()
     pub(super) shared_manifest: Arc<ArcSwap<Manifest>>,
     pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
@@ -189,7 +189,7 @@ impl TurboliteSharedState {
     /// Next connection open must re-fetch interior chunks from S3.
     ///
     /// DANGER: If there are groups pending S3 upload (from local-only checkpoint),
-    /// this will lose unflushed data. Call flush_to_s3() first if durability matters.
+    /// this will lose unflushed data. Call flush_to_storage() first if durability matters.
     pub fn clear_cache_all(&self) {
         self.prefetch_pool.wait_idle();
 
@@ -232,8 +232,8 @@ impl TurboliteSharedState {
     }
 
     /// Upload locally-checkpointed dirty pages to S3 without holding any SQLite lock.
-    /// See [`TurboliteVfs::flush_to_s3`] for full documentation.
-    pub fn flush_to_s3(&self) -> io::Result<()> {
+    /// See [`TurboliteVfs::flush_to_storage`] for full documentation.
+    pub fn flush_to_storage(&self) -> io::Result<()> {
         let _guard = self.flush_lock.lock().unwrap();
         flush::flush_dirty_groups_to_s3(
             &self.s3,
@@ -512,7 +512,7 @@ impl TurboliteSharedState {
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
         let mut manifest = (**self.shared_manifest.load()).clone();
-        // Phase Somme: use file change counter from cache for version
+        // Use file change counter from cache for version
         let next_version = read_change_counter_from_cache(&self.cache, page_size);
 
         for btree_info in &report.btrees {

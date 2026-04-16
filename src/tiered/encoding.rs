@@ -412,7 +412,7 @@ pub(crate) fn decode_interior_bundle(
     Ok(result)
 }
 
-/// Phase Drift: encode a single override frame from dirty pages.
+/// Encode a single override frame from dirty pages.
 pub(crate) fn encode_override_frame(
     dirty_pages: &[(u64, Vec<u8>)],
     page_size: u32,

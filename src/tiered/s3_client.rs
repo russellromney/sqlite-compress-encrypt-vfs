@@ -1,16 +1,16 @@
 // When cloud feature is disabled, S3Client is a zero-size type that can never
 // be constructed. The type exists so Option<Arc<S3Client>> compiles everywhere.
-#[cfg(not(feature = "cloud"))]
+#[cfg(not(feature = "s3"))]
 pub(crate) struct S3Client {
     _private: (),  // prevent construction
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 use super::*;
 
 // ===== S3Client (sync wrapper around async SDK) =====
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 /// Synchronous S3 client wrapping the async AWS SDK.
 pub(crate) struct S3Client {
     pub(crate) client: aws_sdk_s3::Client,
@@ -27,7 +27,7 @@ pub(crate) struct S3Client {
     pub(crate) put_bytes: AtomicU64,
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 impl S3Client {
     /// Create a new S3 client.
     pub(crate) async fn new_async(config: &TurboliteConfig) -> io::Result<Self> {
@@ -126,7 +126,7 @@ impl S3Client {
         self.s3_key(&format!("p/ix/{}_v{}", chunk_id, version))
     }
 
-    /// Phase Drift: override frame key.
+    /// Override frame key.
     pub(crate) fn override_frame_key(&self, group_id: u64, frame_idx: usize, version: u64) -> String {
         self.s3_key(&format!("p/d/{}_f{}_v{}", group_id, frame_idx, version))
     }
@@ -400,7 +400,7 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.get_manifest_async())
     }
 
-    /// Phase Thermopylae: try msgpack first, fall back to JSON for automigration.
+    /// Try msgpack first, fall back to JSON for automigration.
     pub(crate) async fn get_manifest_async(&self) -> io::Result<Option<Manifest>> {
         // Try msgpack first
         let msgpack_key = self.manifest_key_msgpack();
@@ -435,7 +435,7 @@ impl S3Client {
         S3Client::block_on(&self.runtime, self.put_manifest_async(manifest))
     }
 
-    /// Phase Thermopylae: always write msgpack.
+    /// Always write msgpack.
     pub(crate) async fn put_manifest_async(&self, manifest: &Manifest) -> io::Result<()> {
         let key = self.manifest_key_msgpack();
         let data = rmp_serde::to_vec(manifest)
@@ -534,7 +534,7 @@ impl S3Client {
         Ok(all_keys)
     }
 
-    // --- Phase Recall: snapshot manifest helpers ---
+    // Snapshot manifest helpers
 
     /// S3 key for a snapshot manifest copy: `{prefix}/manifest-snap-{snap_id}.msgpack`
     pub(crate) fn snapshot_manifest_key(&self, snap_id: &str) -> String {
@@ -619,7 +619,7 @@ impl S3Client {
     }
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 /// Check if an S3 error is a 404 / NoSuchKey.
 pub(crate) fn is_not_found<E: std::fmt::Display + std::fmt::Debug>(
     err: &aws_sdk_s3::error::SdkError<E>,

@@ -1,4 +1,4 @@
-//! Phase Marne: Query-plan-aware prefetch.
+//! Query-plan-aware prefetch.
 //!
 //! A global queue of planned B-tree accesses populated by the trace callback
 //! (in ext_entry.c) and drained by the VFS on first cache miss.
@@ -67,7 +67,7 @@ pub fn drain_planned_accesses() -> Vec<PlannedAccess> {
 
 /// End-of-query signal. Set by the SQLITE_TRACE_PROFILE callback when a
 /// statement finishes. The VFS checks this on the next read to trigger
-/// between-query eviction (Phase Stalingrad).
+/// between-query eviction.
 ///
 /// AtomicBool is sufficient: we only need "at least one query ended since
 /// last check." Multiple concurrent completions collapse to one eviction

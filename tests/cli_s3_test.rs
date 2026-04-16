@@ -11,7 +11,7 @@
 //!   cargo test --test cli_s3_test --features cloud,zstd
 //! ```
 
-#![cfg(feature = "cloud")]
+#![cfg(feature = "s3")]
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -200,7 +200,7 @@ impl CompactResult {
 }
 
 // =========================================================================
-// Phase Drift-d: Override compaction
+// Override compaction
 // =========================================================================
 
 /// Result of compacting overrides for a single group.

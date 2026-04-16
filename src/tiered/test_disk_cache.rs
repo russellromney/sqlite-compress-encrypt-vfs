@@ -1245,7 +1245,7 @@ fn test_present_group_cannot_be_unclaimed() {
     assert_eq!(cache.group_state(0), GroupState::None);
 }
 
-// ── Phase Stalingrad: evict_to_budget tests ──
+// Evict_to_budget tests
 
 #[test]
 fn test_evict_to_budget_shrinks_cache() {
@@ -1977,7 +1977,7 @@ fn test_prune_noop_when_uncompressed() {
 }
 
 // =========================================================================
-// Phase Pelican: mem_cache tests
+// Mem_cache tests
 // =========================================================================
 
 fn cache_with_mem_budget(dir: &std::path::Path, page_size: u32, page_count: u64, budget: u64) -> DiskCache {

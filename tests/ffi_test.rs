@@ -451,7 +451,7 @@ fn test_register_json_unknown_fields_ignored() {
 
 // --- turbolite_register_tiered alias ---
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[test]
 fn test_register_tiered_null_bucket_fails() {
     let name = CString::new("ffi-tiered-alias").unwrap();

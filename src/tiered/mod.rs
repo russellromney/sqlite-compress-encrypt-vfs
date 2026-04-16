@@ -66,7 +66,7 @@ use crate::compress;
 use crate::FileWalIndex;
 
 // --- Extracted submodules ---
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 mod bench;
 mod cache_tracking;
 mod compact;
@@ -75,14 +75,14 @@ mod disk_cache;
 mod encoding;
 mod flush;
 mod handle;
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 mod import;
 mod manifest;
 mod prediction;
 mod prefetch;
 mod query_plan;
 mod rotation;
-mod http_client;
+mod page_storage;
 mod s3_client;
 mod settings;
 mod staging;
@@ -92,18 +92,19 @@ mod vfs;
 mod wal_replication;
 
 // Public API (visible outside the crate)
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 pub use bench::TurboliteSharedState;
 pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TurboliteHandle;
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
+pub use page_storage::PageStorage;
 pub use vfs::TurboliteVfs;
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query, run_eqp_and_parse};
 pub use settings::{turbolite_config_set, push_setting};
-#[cfg(all(feature = "encryption", feature = "cloud"))]
+#[cfg(all(feature = "encryption", feature = "s3"))]
 pub use rotation::rotate_encryption_key;
 
 /// Result of a database validation run (manifest + data integrity).
@@ -142,7 +143,7 @@ pub type TieredVfs = TurboliteVfs;
 pub type TieredHandle = TurboliteHandle;
 #[deprecated(note = "renamed to TurboliteConfig")]
 pub type TieredConfig = TurboliteConfig;
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 #[deprecated(note = "renamed to TurboliteSharedState")]
 pub type TieredSharedState = TurboliteSharedState;
 
@@ -195,7 +196,7 @@ pub fn is_local_checkpoint_only() -> bool {
 /// Check if a manifest exists at the given S3 prefix. Returns the manifest if found.
 /// Useful for checking whether data has already been imported before re-importing.
 /// Requires the `cloud` feature (creates S3Client + tokio runtime).
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 pub fn get_manifest(config: &TurboliteConfig) -> std::io::Result<Option<Manifest>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -219,7 +220,7 @@ pub fn get_manifest(config: &TurboliteConfig) -> std::io::Result<Option<Manifest
 /// Returns 0 if page data is too short.
 ///
 /// This counter increments on every transaction commit. Used as the unified
-/// version number for both turbolite manifests and walrust WAL txids (Phase Somme).
+/// version number for both turbolite manifests and walrust WAL txids.
 pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
     if page0.len() < 28 {
         return 0;

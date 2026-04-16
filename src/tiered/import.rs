@@ -61,7 +61,7 @@ pub fn import_sqlite_file(
     let compression_level = config.compression_level;
     let sub_ppf = config.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
-    // Phase Somme: use SQLite's file change counter as manifest version.
+    // Use SQLite's file change counter as manifest version.
     let version = read_file_change_counter(&header);
     assert!(version > 0, "file change counter must be > 0 for import (is this a valid SQLite DB with committed data?)");
     eprintln!(
@@ -330,7 +330,7 @@ pub fn import_sqlite_file(
         eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
     }
 
-    // Build and upload manifest (Phase Midway: explicit B-tree-aware groups)
+    // Build and upload manifest (explicit B-tree-aware groups)
     let mut manifest = Manifest {
         version,
         change_counter: version, // import uses the same value; walrust not relevant for import

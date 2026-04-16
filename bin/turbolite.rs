@@ -815,7 +815,7 @@ fn cmd_export(
     Ok(())
 }
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 fn cmd_import(
     input: PathBuf,
     bucket: String,
@@ -902,10 +902,10 @@ fn main() -> Result<()> {
             input, bucket, prefix, endpoint, region,
             pages_per_group, compression_level,
         } => {
-            #[cfg(feature = "cloud")]
+            #[cfg(feature = "s3")]
             cmd_import(input, bucket, prefix, endpoint, region, pages_per_group, compression_level)?;
 
-            #[cfg(not(feature = "cloud"))]
+            #[cfg(not(feature = "s3"))]
             return Err(anyhow!("import requires the 'cloud' feature. Rebuild with: cargo build --features cloud,zstd"));
         }
     }

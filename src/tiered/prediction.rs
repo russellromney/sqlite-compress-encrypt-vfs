@@ -1,11 +1,11 @@
 #![allow(dead_code)]
-//! Phase Verdun: Predictive cross-tree prefetch + access history.
+//! Predictive cross-tree prefetch + access history.
 //!
 //! Learns which B-trees appear together in lock sessions (transactions/queries)
 //! and prefetches the full set in parallel when a partial match is detected.
 //! Also tracks B-tree access frequency for prediction confidence and decay.
 //!
-//! Phase Verdun-i: keys are table/index names (Strings), not root page IDs.
+//! Keys are table/index names (Strings), not root page IDs.
 //! This survives VACUUM (root pages renumber, names stay the same).
 
 use std::collections::{BTreeSet, HashMap, HashSet};

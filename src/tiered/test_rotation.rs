@@ -683,7 +683,7 @@ fn test_both_keys_none_error() {
     assert!(old_key.is_none() && new_key.is_none());
 }
 
-// -- Phase Midway regression tests --
+// Regression tests
 
 #[test]
 fn test_assign_new_pages_to_groups_basic() {
@@ -826,7 +826,7 @@ fn test_build_page_index_roundtrip() {
     }
 }
 
-// -- Phase Midway: B-tree-aware page groups tests --
+// B-tree-aware page groups tests
 
 #[test]
 fn test_total_groups_btree_vs_positional() {
@@ -1099,7 +1099,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert_eq!(m2.btree_groups.get(&1).unwrap(), &vec![1u64]);
     // group 2 has no btree entry, so no btree_groups mapping
     assert!(m2.btree_groups.get(&2).is_none());
-    // Phase Verdun-i: page_to_tree_name reverse index rebuilt from btrees
+    // Page_to_tree_name reverse index rebuilt from btrees
     // B-tree root=0 ("users") owns group 0 with pages [0, 5, 10, 15]
     assert_eq!(m2.page_to_tree_name.get(&0).map(|s| s.as_str()), Some("users"));
     assert_eq!(m2.page_to_tree_name.get(&5).map(|s| s.as_str()), Some("users"));

@@ -200,7 +200,7 @@ SEARCH users USING INDEX idx_users_email (email=?)";
     assert_eq!(result[1].access_type, AccessType::Search);
 }
 
-// ── End-query signal tests (Phase Stalingrad) ──
+// ── End-query signal tests ──
 
 #[test]
 fn test_end_query_signal_default_false() {
