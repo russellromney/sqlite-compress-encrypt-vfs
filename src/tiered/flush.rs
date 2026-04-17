@@ -1,27 +1,40 @@
-//! Non-blocking S3 flush for two-phase checkpoint.
+//! Non-blocking backend flush for the two-phase checkpoint path.
 //!
-//! After a local-only checkpoint (SyncMode::LocalThenFlush), dirty pages are
-//! captured in staging log files on disk. This module reads from staging logs
-//! (not the live disk cache), encodes page groups, and uploads to S3 without
-//! holding any SQLite lock.
-//!
-//! Staging logs guarantee correctness: even if a subsequent checkpoint overwrites
-//! pages in the disk cache, the staging log has the exact contents from the
-//! original checkpoint.
+//! After a local-only checkpoint (`SyncMode::LocalThenFlush`), dirty pages are
+//! captured in staging log files on disk. This module reads from those logs
+//! (not the live disk cache), encodes page groups, and uploads to the backend
+//! without holding any SQLite lock. The flush is backend-agnostic: an
+//! `Arc<dyn StorageBackend>` driven through a tokio runtime handle.
 
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::sync::Mutex;
+use std::sync::Arc;
 
-/// Upload locally-checkpointed dirty page groups to S3.
+use arc_swap::ArcSwap;
+use hadb_storage::StorageBackend;
+use tokio::runtime::Handle as TokioHandle;
+
+use super::storage as storage_helpers;
+use super::{
+    bundle_chunk_range, compact, decode_page_group, decode_page_group_seekable_full, encode_interior_bundle,
+    encode_override_frame, encode_page_group, encode_page_group_seekable, keys, manifest, read_change_counter_from_cache,
+    staging, DiskCache, FrameEntry, Manifest, SubChunkId, SubChunkTier,
+};
+
+/// Upload locally-checkpointed dirty page groups to the backend.
 ///
-/// Reads dirty pages from staging logs, non-dirty pages from
-/// cache or S3. Called outside any SQLite lock.
+/// Backend-agnostic: works for both local filesystem and remote storage.
+/// Reads dirty pages from staging logs, non-dirty pages from the cache, and
+/// merges with base page groups fetched from the backend when needed.
 ///
 /// # Safety contract
 /// - Must NOT be called concurrently with itself (caller holds flush_lock).
 /// - Staging log files must exist for all pending flushes.
-#[cfg(feature = "s3")]
-pub(crate) fn flush_dirty_groups_to_s3(
-    s3: &S3Client,
+pub(crate) fn flush_dirty_groups(
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
+    is_local: bool,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
@@ -33,7 +46,6 @@ pub(crate) fn flush_dirty_groups_to_s3(
     override_threshold: u32,
     compaction_threshold: u32,
 ) -> io::Result<()> {
-    // 1. Drain pending flushes (staging logs) + legacy dirty groups
     let flushes: Vec<staging::PendingFlush> = {
         let mut pf = pending_flushes.lock().unwrap();
         std::mem::take(&mut *pf)
@@ -43,30 +55,33 @@ pub(crate) fn flush_dirty_groups_to_s3(
         std::mem::take(&mut *pending)
     };
 
-    let has_staging = !flushes.is_empty();
-    let has_legacy = !legacy_dirty_groups.is_empty();
-
-    if !has_staging && !has_legacy {
+    if flushes.is_empty() && legacy_dirty_groups.is_empty() {
         turbolite_debug!("[flush] no pending groups to upload");
         return Ok(());
     }
 
-    // Run the actual flush, restoring drained state on error so nothing is lost.
     let result = flush_inner(
-        s3, cache, shared_manifest, compression_level,
-        #[cfg(feature = "zstd")] dictionary,
-        encryption_key, gc_enabled,
-        &flushes, &legacy_dirty_groups,
-        override_threshold, compaction_threshold,
+        backend,
+        runtime,
+        is_local,
+        cache,
+        shared_manifest,
+        compression_level,
+        #[cfg(feature = "zstd")]
+        dictionary,
+        encryption_key,
+        gc_enabled,
+        &flushes,
+        &legacy_dirty_groups,
+        override_threshold,
+        compaction_threshold,
     );
 
     if let Err(ref e) = result {
         eprintln!("[flush] ERROR: flush failed, restoring pending state: {}", e);
-        // Push staging logs back so next flush_to_storage() retries them
         if !flushes.is_empty() {
             pending_flushes.lock().unwrap().extend(flushes);
         }
-        // Push legacy dirty groups back
         if !legacy_dirty_groups.is_empty() {
             shared_dirty_groups.lock().unwrap().extend(legacy_dirty_groups);
         }
@@ -76,9 +91,10 @@ pub(crate) fn flush_dirty_groups_to_s3(
 }
 
 /// Inner flush logic. Separated so the outer function can restore state on error.
-#[cfg(feature = "s3")]
 fn flush_inner(
-    s3: &S3Client,
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
+    is_local: bool,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
@@ -90,15 +106,11 @@ fn flush_inner(
     override_threshold: u32,
     compaction_threshold: u32,
 ) -> io::Result<()> {
-    // 2. Read all staging logs and merge into a single page map.
-    // Later staging logs overwrite earlier ones (correct: later checkpoint wins).
+    // 1. Read all staging logs and merge into a single page map.
     let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
     for flush_entry in flushes {
-        let pages = staging::read_staging_log(
-            &flush_entry.staging_path,
-            flush_entry.page_size,
-        )?;
+        let pages = staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size)?;
         turbolite_debug!(
             "[flush] read staging log v{}: {} pages from {}",
             flush_entry.version, pages.len(), flush_entry.staging_path.display(),
@@ -112,7 +124,7 @@ fn flush_inner(
         staged_pages.len(), flushes.len(), legacy_dirty_groups.len(),
     );
 
-    // 3. Snapshot manifest
+    // 2. Snapshot manifest
     let manifest_snap = (**shared_manifest.load()).clone();
     let page_count = manifest_snap.page_count;
     let page_size = manifest_snap.page_size;
@@ -125,15 +137,13 @@ fn flush_inner(
         ));
     }
 
-    // 4. Build encoder/decoder dictionaries
     #[cfg(feature = "zstd")]
     let encoder_dict = dictionary
         .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
     #[cfg(feature = "zstd")]
-    let decoder_dict = dictionary
-        .map(zstd::dict::DecoderDictionary::copy);
+    let decoder_dict = dictionary.map(zstd::dict::DecoderDictionary::copy);
 
-    // 5. Determine all dirty groups: from staged pages + legacy dirty groups
+    // 3. Determine all dirty groups.
     let mut dirty_groups: HashSet<u64> = legacy_dirty_groups.clone();
     for &pnum in staged_pages.keys() {
         if let Some(loc) = manifest_snap.page_location(pnum) {
@@ -143,7 +153,6 @@ fn flush_inner(
 
     if dirty_groups.is_empty() {
         turbolite_debug!("[flush] no dirty groups after manifest lookup");
-        // Clean up staging logs even if no groups (edge case: empty checkpoint)
         for path in &staging_paths {
             staging::remove_staging_log(path);
         }
@@ -151,7 +160,7 @@ fn flush_inner(
     }
 
     turbolite_debug!(
-        "[flush] uploading {} dirty groups to S3...",
+        "[flush] uploading {} dirty groups...",
         dirty_groups.len(),
     );
 
@@ -161,53 +170,56 @@ fn flush_inner(
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();
 
-    // Carry forward seekable encoding from manifest
     let old_sub_ppf = manifest_snap.sub_pages_per_frame;
     let use_seekable = old_sub_ppf > 0;
     let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
 
-    // Carry forward subframe overrides, track which groups get full rewrite
     let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
     let effective_threshold = if override_threshold > 0 {
         override_threshold as usize
     } else if use_seekable && old_sub_ppf > 0 {
         let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
         std::cmp::max(1, frames_per_group / 4)
-    } else { 0 };
+    } else {
+        0
+    };
     let mut full_rewrite_groups: HashSet<u64> = HashSet::new();
-
-    // Track page numbers from dirty groups (for interior/index chunk dirtiness)
     let mut dirty_page_nums: HashSet<u64> = HashSet::new();
 
-    // 6. For each dirty group: read pages from staging/cache/S3, encode, prepare upload
+    // 4. For each dirty group: read pages from staging/cache/backend, encode.
     for &gid in &dirty_groups {
         let pages_in_group = manifest_snap.group_page_nums(gid);
         let group_size = pages_in_group.len();
 
-        // Track all pages in dirty groups for interior/index chunk dirtiness
         for &pnum in pages_in_group.iter() {
-            if pnum < page_count { dirty_page_nums.insert(pnum); }
+            if pnum < page_count {
+                dirty_page_nums.insert(pnum);
+            }
         }
 
-        // Determine if we can use override path
-        let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
+        let group_dirty_pnums: Vec<u64> = pages_in_group
+            .iter()
             .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
-            .copied().collect();
+            .copied()
+            .collect();
         let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
         let has_frame_table = use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
         let dirty_frames = if has_frame_table && effective_threshold > 0 {
             manifest::dirty_frames_for_group(
-                &group_dirty_pnums, &pages_in_group,
-                frame_table_ref.expect("checked above"), old_sub_ppf,
+                &group_dirty_pnums,
+                &pages_in_group,
+                frame_table_ref.expect("checked above"),
+                old_sub_ppf,
             )
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let use_override = has_frame_table
             && effective_threshold > 0
             && !dirty_frames.is_empty()
             && dirty_frames.len() < effective_threshold;
 
         if use_override {
-            // Override path -- encode only dirty frames
             while new_subframe_overrides.len() <= gid as usize {
                 new_subframe_overrides.push(HashMap::new());
             }
@@ -217,68 +229,100 @@ fn flush_inner(
                 let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
                 for pos in frame_start..frame_end {
                     let pnum = pages_in_group[pos];
-                    if pnum >= page_count { break; }
+                    if pnum >= page_count {
+                        break;
+                    }
                     let data = if let Some(staged) = staged_pages.get(&pnum) {
                         staged.clone()
                     } else if cache.is_present(pnum) {
                         let mut buf = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut buf).is_ok() { buf }
-                        else { vec![0u8; page_size as usize] }
-                    } else { vec![0u8; page_size as usize] };
+                        if cache.read_page(pnum, &mut buf).is_ok() {
+                            buf
+                        } else {
+                            vec![0u8; page_size as usize]
+                        }
+                    } else {
+                        vec![0u8; page_size as usize]
+                    };
                     frame_pages.push((pnum, data));
                 }
-                let override_key = s3.override_frame_key(gid, frame_idx, next_version);
+                let override_key = keys::override_frame_key(gid, frame_idx, next_version);
                 let encoded = encode_override_frame(
-                    &frame_pages, page_size, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    &frame_pages,
+                    page_size,
+                    compression_level,
+                    #[cfg(feature = "zstd")]
+                    encoder_dict.as_ref(),
                     encryption_key.as_ref(),
                 )?;
                 if let Some(old_ov) = new_subframe_overrides[gid as usize].get(&frame_idx) {
                     replaced_keys.push(old_ov.key.clone());
                 }
                 uploads.push((override_key.clone(), encoded.clone()));
-                new_subframe_overrides[gid as usize].insert(frame_idx, manifest::SubframeOverride {
-                    key: override_key,
-                    entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
-                });
+                new_subframe_overrides[gid as usize].insert(
+                    frame_idx,
+                    manifest::SubframeOverride {
+                        key: override_key,
+                        entry: FrameEntry {
+                            offset: 0,
+                            len: encoded.len() as u32,
+                        },
+                    },
+                );
             }
-            // Base group key stays the same -- no re-upload, no key replacement
         } else {
-            // Full rewrite path (existing behavior)
             full_rewrite_groups.insert(gid);
             let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
-            let mut need_s3_merge = false;
+            let mut need_merge = false;
 
             for (i, &pnum) in pages_in_group.iter().enumerate() {
-                if pnum >= page_count { break; }
+                if pnum >= page_count {
+                    break;
+                }
                 if let Some(staged_data) = staged_pages.get(&pnum) {
                     pages[i] = Some(staged_data.clone());
                 } else if cache.is_present(pnum) {
                     let mut page_buf = vec![0u8; page_size as usize];
                     if cache.read_page(pnum, &mut page_buf).is_ok() {
                         pages[i] = Some(page_buf);
-                    } else { need_s3_merge = true; }
-                } else { need_s3_merge = true; }
+                    } else {
+                        need_merge = true;
+                    }
+                } else {
+                    need_merge = true;
+                }
             }
 
-            if need_s3_merge {
+            // Backend merge: for remote mode, if we're missing pages, pull the
+            // existing page group down and use its pages for the holes. Local
+            // mode skips this (all pages should already be in the cache).
+            if need_merge && !is_local {
                 if let Some(existing_key) = new_keys.get(gid as usize) {
                     if !existing_key.is_empty() {
-                        if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                        if let Ok(Some(pg_data)) =
+                            storage_helpers::get_page_group(backend, runtime, existing_key)
+                        {
                             let existing_ft = manifest_snap.frame_tables.get(gid as usize);
                             let has_ft = use_seekable
                                 && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
                             if has_ft {
-                                let ft = existing_ft.unwrap();
+                                let ft = existing_ft.expect("checked above");
                                 if let Ok((_pc, _ps, bulk_data)) = decode_page_group_seekable_full(
-                                    &pg_data, ft, page_size, pages_in_group.len() as u32,
-                                    page_count, 0,
-                                    #[cfg(feature = "zstd")] decoder_dict.as_ref(),
+                                    &pg_data,
+                                    ft,
+                                    page_size,
+                                    pages_in_group.len() as u32,
+                                    page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    decoder_dict.as_ref(),
                                     encryption_key.as_ref(),
                                 ) {
                                     let ps = page_size as usize;
                                     for j in 0..pages_in_group.len() {
-                                        if pages_in_group[j] >= page_count { break; }
+                                        if pages_in_group[j] >= page_count {
+                                            break;
+                                        }
                                         if pages[j].is_none() {
                                             let start = j * ps;
                                             let end = start + ps;
@@ -290,13 +334,20 @@ fn flush_inner(
                                 }
                             } else if let Ok((_pc, _ps, existing_pages)) = decode_page_group(
                                 &pg_data,
-                                #[cfg(feature = "zstd")] decoder_dict.as_ref(),
+                                #[cfg(feature = "zstd")]
+                                decoder_dict.as_ref(),
                                 encryption_key.as_ref(),
                             ) {
                                 for (j, existing_page) in existing_pages.into_iter().enumerate() {
-                                    if j >= pages_in_group.len() { break; }
-                                    if pages_in_group[j] >= page_count { break; }
-                                    if pages[j].is_none() { pages[j] = Some(existing_page); }
+                                    if j >= pages_in_group.len() {
+                                        break;
+                                    }
+                                    if pages_in_group[j] >= page_count {
+                                        break;
+                                    }
+                                    if pages[j].is_none() {
+                                        pages[j] = Some(existing_page);
+                                    }
                                 }
                             }
                         }
@@ -304,11 +355,15 @@ fn flush_inner(
                 }
             }
 
-            let key = s3.page_group_key(gid, next_version);
+            let key = keys::page_group_key(gid, next_version);
             if use_seekable {
                 let (encoded, ft) = encode_page_group_seekable(
-                    &pages, page_size, old_sub_ppf, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    &pages,
+                    page_size,
+                    old_sub_ppf,
+                    compression_level,
+                    #[cfg(feature = "zstd")]
+                    encoder_dict.as_ref(),
                     encryption_key.as_ref(),
                 )?;
                 uploads.push((key.clone(), encoded));
@@ -318,8 +373,11 @@ fn flush_inner(
                 new_frame_tables[gid as usize] = ft;
             } else {
                 let encoded = encode_page_group(
-                    &pages, page_size, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
+                    &pages,
+                    page_size,
+                    compression_level,
+                    #[cfg(feature = "zstd")]
+                    encoder_dict.as_ref(),
                     encryption_key.as_ref(),
                 )?;
                 uploads.push((key.clone(), encoded));
@@ -329,244 +387,226 @@ fn flush_inner(
                 new_keys.push(String::new());
             }
             if let Some(old_key) = new_keys.get(gid as usize) {
-                if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
+                if !old_key.is_empty() {
+                    replaced_keys.push(old_key.clone());
+                }
             }
             new_keys[gid as usize] = key;
         }
     }
 
-    // 7-9. Build interior + index chunks BEFORE uploading anything,
-    // then upload page groups + interior + index in a single parallel batch.
-    turbolite_debug!("[flush] building interior + index chunks in parallel with page group encoding...");
+    // 5. Interior + index bundles. Only remote mode builds these into the
+    //    manifest; local mode leaves them empty (everything is on disk).
     let page_group_upload_count = uploads.len();
     let chunk_range = bundle_chunk_range(page_size);
-    let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
-    {
-        let known_interior = cache.interior_pages.lock().clone();
-        for &pnum in &known_interior {
-            if pnum >= page_count {
-                continue;
-            }
-            // Staging wins over cache for interior pages too
-            if let Some(staged_data) = staged_pages.get(&pnum) {
-                all_interior.insert(pnum, staged_data.clone());
-            } else {
-                let mut buf = vec![0u8; page_size as usize];
-                if cache.read_page(pnum, &mut buf).is_ok() {
-                    all_interior.insert(pnum, buf);
-                } else {
-                    eprintln!("[flush] WARN: cache.read_page({}) failed for interior page", pnum);
-                }
-            }
-        }
-        turbolite_debug!(
-            "[flush] interior collection: {} pages",
-            all_interior.len(),
-        );
-    }
 
-    // Group interior pages by chunk_id
-    let mut chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
-    for (pnum, data) in all_interior {
-        let chunk_id = (pnum / chunk_range) as u32;
-        chunks.entry(chunk_id).or_default().push((pnum, data));
-    }
-    for pages in chunks.values_mut() {
-        pages.sort_by_key(|(pnum, _)| *pnum);
-    }
+    let mut new_chunk_keys: HashMap<u32, String> = manifest_snap.interior_chunk_keys.clone();
+    let mut new_index_chunk_keys: HashMap<u32, String> = manifest_snap.index_chunk_keys.clone();
+    let interior_count;
+    let index_chunk_count;
 
-    // Dirty chunks: any chunk that contains a page from a dirty group
-    let dirty_chunk_ids: HashSet<u32> = dirty_page_nums
-        .iter()
-        .map(|&pnum| (pnum / chunk_range) as u32)
-        .collect();
-
-    let old_chunk_keys = manifest_snap.interior_chunk_keys.clone();
-    let mut new_chunk_keys: HashMap<u32, String> = HashMap::new();
-    let mut chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
-
-    for (&chunk_id, pages) in &chunks {
-        if dirty_chunk_ids.contains(&chunk_id) || !old_chunk_keys.contains_key(&chunk_id) {
-            let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-            let encoded = encode_interior_bundle(
-                &refs,
-                page_size,
-                compression_level,
-                #[cfg(feature = "zstd")]
-                encoder_dict.as_ref(),
-                encryption_key.as_ref(),
-            )?;
-            let key = s3.interior_chunk_key(chunk_id, next_version);
-            turbolite_debug!(
-                "[flush] interior chunk {}: {} pages, {:.1}KB compressed",
-                chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
-            );
-            chunk_uploads.push((key.clone(), encoded));
-            if let Some(old_key) = old_chunk_keys.get(&chunk_id) {
-                replaced_keys.push(old_key.clone());
-            }
-            new_chunk_keys.insert(chunk_id, key);
-        } else {
-            new_chunk_keys.insert(chunk_id, old_chunk_keys[&chunk_id].clone());
-        }
-    }
-
-    // GC orphaned interior chunks
-    for (old_chunk_id, old_key) in &old_chunk_keys {
-        if !chunks.contains_key(old_chunk_id) {
-            replaced_keys.push(old_key.clone());
-            turbolite_debug!("[flush] orphaned interior chunk {} scheduled for GC", old_chunk_id);
-        }
-    }
-
-    // Add interior chunks to the combined upload batch
-    uploads.extend(chunk_uploads);
-
-    // 9. Index leaf bundles (same pattern as interior)
-    // Two sources: (a) staged/cache dirty group pages that are index leaves,
-    // (b) previously-fetched index pages from the tracker's Index tier.
-    turbolite_debug!("[flush] building index leaf bundles...");
-    let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
-    {
-        // (a) Scan dirty group pages for index leaves (type 0x0A + valid header).
-        let mut dirty_index_count = 0usize;
-        for &gid in &dirty_groups {
-            let pages_in_group = manifest_snap.group_page_nums(gid);
-            for &pnum in pages_in_group.iter() {
-                if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
+    if !is_local {
+        let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new();
+        {
+            let known_interior = cache.interior_pages.lock().clone();
+            for &pnum in &known_interior {
+                if pnum >= page_count {
                     continue;
                 }
-                // Try staging first, then cache
-                let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
-                    Some(staged_data.clone())
-                } else if cache.is_present(pnum) {
-                    let mut b = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut b).is_ok() { Some(b) } else { None }
+                if let Some(staged_data) = staged_pages.get(&pnum) {
+                    all_interior.insert(pnum, staged_data.clone());
                 } else {
-                    None
-                };
-                if let Some(buf) = buf {
-                    let hdr_off = if pnum == 0 { 100 } else { 0 };
-                    let tb = buf.get(hdr_off).copied();
-                    if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
-                        all_index_leaves.insert(pnum, buf);
-                        dirty_index_count += 1;
+                    let mut buf = vec![0u8; page_size as usize];
+                    if cache.read_page(pnum, &mut buf).is_ok() {
+                        all_interior.insert(pnum, buf);
+                    } else {
+                        eprintln!("[flush] WARN: cache.read_page({}) failed for interior page", pnum);
                     }
                 }
             }
         }
 
-        // (b) Also include previously-fetched index pages from the tracker.
-        let tracker = cache.tracker.lock();
-        let index_sub_chunks: Vec<SubChunkId> = tracker
-            .present
+        let mut chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        for (pnum, data) in all_interior {
+            let chunk_id = (pnum / chunk_range) as u32;
+            chunks.entry(chunk_id).or_default().push((pnum, data));
+        }
+        for pages in chunks.values_mut() {
+            pages.sort_by_key(|(pnum, _)| *pnum);
+        }
+
+        let dirty_chunk_ids: HashSet<u32> = dirty_page_nums
             .iter()
-            .filter(|id| tracker.tiers.get(id).copied() == Some(SubChunkTier::Index))
-            .copied()
+            .map(|&pnum| (pnum / chunk_range) as u32)
             .collect();
-        drop(tracker);
 
-        let mut tracker_index_count = 0usize;
-        for sc in &index_sub_chunks {
-            let tracker = cache.tracker.lock();
-            let page_range = tracker.pages_for_sub_chunk(*sc, page_count);
-            drop(tracker);
-            for pnum in page_range {
-                if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
-                    continue;
+        let old_chunk_keys = manifest_snap.interior_chunk_keys.clone();
+        new_chunk_keys.clear();
+        let mut chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for (&chunk_id, pages) in &chunks {
+            if dirty_chunk_ids.contains(&chunk_id) || !old_chunk_keys.contains_key(&chunk_id) {
+                let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+                let encoded = encode_interior_bundle(
+                    &refs,
+                    page_size,
+                    compression_level,
+                    #[cfg(feature = "zstd")]
+                    encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                let key = keys::interior_chunk_key(chunk_id, next_version);
+                chunk_uploads.push((key.clone(), encoded));
+                if let Some(old_key) = old_chunk_keys.get(&chunk_id) {
+                    replaced_keys.push(old_key.clone());
                 }
-                // Staging wins for tracker pages too
-                let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
-                    Some(staged_data.clone())
-                } else {
-                    let mut b = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut b).is_ok() { Some(b) } else { None }
-                };
-                if let Some(buf) = buf {
-                    let hdr_off = if pnum == 0 { 100 } else { 0 };
-                    let tb = buf.get(hdr_off).copied();
-                    if tb == Some(0x0A) && is_valid_btree_page(&buf, hdr_off) {
-                        all_index_leaves.insert(pnum, buf);
-                        tracker_index_count += 1;
+                new_chunk_keys.insert(chunk_id, key);
+            } else {
+                new_chunk_keys.insert(chunk_id, old_chunk_keys[&chunk_id].clone());
+            }
+        }
+
+        for (old_chunk_id, old_key) in &old_chunk_keys {
+            if !chunks.contains_key(old_chunk_id) {
+                replaced_keys.push(old_key.clone());
+            }
+        }
+
+        uploads.extend(chunk_uploads);
+
+        // Index leaf bundles (same pattern as interior)
+        let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
+        {
+            for &gid in &dirty_groups {
+                let pages_in_group = manifest_snap.group_page_nums(gid);
+                for &pnum in pages_in_group.iter() {
+                    if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
+                        continue;
+                    }
+                    let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
+                        Some(staged_data.clone())
+                    } else if cache.is_present(pnum) {
+                        let mut b = vec![0u8; page_size as usize];
+                        if cache.read_page(pnum, &mut b).is_ok() {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(buf) = buf {
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let tb = buf.get(hdr_off).copied();
+                        if tb == Some(0x0A) && super::is_valid_btree_page(&buf, hdr_off) {
+                            all_index_leaves.insert(pnum, buf);
+                        }
+                    }
+                }
+            }
+
+            let tracker = cache.tracker.lock();
+            let index_sub_chunks: Vec<SubChunkId> = tracker
+                .present
+                .iter()
+                .filter(|id| tracker.tiers.get(id).copied() == Some(SubChunkTier::Index))
+                .copied()
+                .collect();
+            drop(tracker);
+
+            for sc in &index_sub_chunks {
+                let tracker = cache.tracker.lock();
+                let page_range = tracker.pages_for_sub_chunk(*sc, page_count);
+                drop(tracker);
+                for pnum in page_range {
+                    if pnum >= page_count || all_index_leaves.contains_key(&pnum) {
+                        continue;
+                    }
+                    let buf = if let Some(staged_data) = staged_pages.get(&pnum) {
+                        Some(staged_data.clone())
+                    } else {
+                        let mut b = vec![0u8; page_size as usize];
+                        if cache.read_page(pnum, &mut b).is_ok() {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(buf) = buf {
+                        let hdr_off = if pnum == 0 { 100 } else { 0 };
+                        let tb = buf.get(hdr_off).copied();
+                        if tb == Some(0x0A) && super::is_valid_btree_page(&buf, hdr_off) {
+                            all_index_leaves.insert(pnum, buf);
+                        }
                     }
                 }
             }
         }
-        turbolite_debug!(
-            "[flush] index leaf collection: dirty_groups={}, tracker={}, total={}",
-            dirty_index_count, tracker_index_count, all_index_leaves.len(),
-        );
-    }
 
-    // Group index leaf pages by chunk_id
-    let mut index_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
-    for (pnum, data) in all_index_leaves {
-        let chunk_id = (pnum / chunk_range) as u32;
-        index_chunks.entry(chunk_id).or_default().push((pnum, data));
-    }
-    for pages in index_chunks.values_mut() {
-        pages.sort_by_key(|(pnum, _)| *pnum);
-    }
+        let mut index_chunks: HashMap<u32, Vec<(u64, Vec<u8>)>> = HashMap::new();
+        for (pnum, data) in all_index_leaves {
+            let chunk_id = (pnum / chunk_range) as u32;
+            index_chunks.entry(chunk_id).or_default().push((pnum, data));
+        }
+        for pages in index_chunks.values_mut() {
+            pages.sort_by_key(|(pnum, _)| *pnum);
+        }
 
-    // Dirty index chunks: any chunk overlapping dirty group page ranges
-    let dirty_index_chunk_ids: HashSet<u32> = dirty_page_nums
-        .iter()
-        .map(|&pnum| (pnum / chunk_range) as u32)
-        .collect();
+        let dirty_index_chunk_ids: HashSet<u32> = dirty_page_nums
+            .iter()
+            .map(|&pnum| (pnum / chunk_range) as u32)
+            .collect();
 
-    let old_index_chunk_keys = manifest_snap.index_chunk_keys.clone();
-    let mut new_index_chunk_keys: HashMap<u32, String> = HashMap::new();
-    let mut index_chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
+        let old_index_chunk_keys = manifest_snap.index_chunk_keys.clone();
+        new_index_chunk_keys.clear();
+        let mut index_chunk_uploads: Vec<(String, Vec<u8>)> = Vec::new();
 
-    for (&chunk_id, pages) in &index_chunks {
-        if dirty_index_chunk_ids.contains(&chunk_id) || !old_index_chunk_keys.contains_key(&chunk_id) {
-            let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
-            let encoded = encode_interior_bundle(
-                &refs,
-                page_size,
-                compression_level,
-                #[cfg(feature = "zstd")]
-                encoder_dict.as_ref(),
-                encryption_key.as_ref(),
-            )?;
-            let key = s3.index_chunk_key(chunk_id, next_version);
-            turbolite_debug!(
-                "[flush] index chunk {}: {} pages, {:.1}KB compressed",
-                chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
-            );
-            index_chunk_uploads.push((key.clone(), encoded));
-            if let Some(old_key) = old_index_chunk_keys.get(&chunk_id) {
+        for (&chunk_id, pages) in &index_chunks {
+            if dirty_index_chunk_ids.contains(&chunk_id) || !old_index_chunk_keys.contains_key(&chunk_id) {
+                let refs: Vec<(u64, &[u8])> = pages.iter().map(|(p, d)| (*p, d.as_slice())).collect();
+                let encoded = encode_interior_bundle(
+                    &refs,
+                    page_size,
+                    compression_level,
+                    #[cfg(feature = "zstd")]
+                    encoder_dict.as_ref(),
+                    encryption_key.as_ref(),
+                )?;
+                let key = keys::index_chunk_key(chunk_id, next_version);
+                index_chunk_uploads.push((key.clone(), encoded));
+                if let Some(old_key) = old_index_chunk_keys.get(&chunk_id) {
+                    replaced_keys.push(old_key.clone());
+                }
+                new_index_chunk_keys.insert(chunk_id, key);
+            } else {
+                new_index_chunk_keys.insert(chunk_id, old_index_chunk_keys[&chunk_id].clone());
+            }
+        }
+
+        for (old_chunk_id, old_key) in &old_index_chunk_keys {
+            if !index_chunks.contains_key(old_chunk_id) {
                 replaced_keys.push(old_key.clone());
             }
-            new_index_chunk_keys.insert(chunk_id, key);
-        } else {
-            new_index_chunk_keys.insert(chunk_id, old_index_chunk_keys[&chunk_id].clone());
         }
+
+        index_chunk_count = index_chunk_uploads.len();
+        uploads.extend(index_chunk_uploads);
+        interior_count = uploads.len() - page_group_upload_count - index_chunk_count;
+    } else {
+        interior_count = 0;
+        index_chunk_count = 0;
     }
 
-    // GC orphaned index chunks
-    for (old_chunk_id, old_key) in &old_index_chunk_keys {
-        if !index_chunks.contains_key(old_chunk_id) {
-            replaced_keys.push(old_key.clone());
-            turbolite_debug!("[flush] orphaned index chunk {} scheduled for GC", old_chunk_id);
-        }
-    }
-
-    // Add index chunks to the combined upload batch
-    let index_chunk_count = index_chunk_uploads.len();
-    uploads.extend(index_chunk_uploads);
-
-    // 7-9 combined: single parallel upload of ALL objects (page groups + interior + index)
-    let interior_count = uploads.len() - page_group_upload_count - index_chunk_count;
     turbolite_debug!(
         "[flush] uploading {} objects ({} page groups + {} interior + {} index)...",
-        uploads.len(), page_group_upload_count, interior_count, index_chunk_count,
+        uploads.len(),
+        page_group_upload_count,
+        interior_count,
+        index_chunk_count,
     );
-    s3.put_page_groups(&uploads)?;
-    turbolite_debug!("[flush] all {} objects uploaded", uploads.len());
+    storage_helpers::put_page_groups(backend, runtime, &uploads)?;
 
-    // 10. Update manifest atomically
-    // GC overrides for fully-rewritten groups before manifest construction
+    // 6. Update manifest atomically
     while new_subframe_overrides.len() < new_keys.len() {
         new_subframe_overrides.push(HashMap::new());
     }
@@ -604,367 +644,56 @@ fn flush_inner(
         m.build_page_index();
         m
     };
-    s3.put_manifest(&new_manifest)?;
-    turbolite_debug!(
-        "[flush] manifest v{} uploaded (page_count={}, {} groups)",
-        new_manifest.version, new_manifest.page_count, new_manifest.page_group_keys.len(),
-    );
+    storage_helpers::put_manifest(backend, runtime, &new_manifest)?;
 
-    // 11. Commit to shared manifest
-    {
-        cache.set_group_pages(new_manifest.group_pages.clone());
-        shared_manifest.store(Arc::new(new_manifest));
+    // 7. Commit to shared state
+    cache.set_group_pages(new_manifest.group_pages.clone());
+    shared_manifest.store(Arc::new(new_manifest.clone()));
+
+    // 8. Persist local manifest + clear dirty_groups file (flush complete)
+    if let Err(e) = manifest::persist_manifest_local(&cache.cache_dir, &new_manifest) {
+        eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
+    }
+    if let Err(e) = manifest::persist_dirty_groups(&cache.cache_dir, &[]) {
+        eprintln!("[flush] ERROR: failed to clear dirty_groups: {}", e);
     }
 
-    // Persist bitmap
     let _ = cache.persist_bitmap();
 
-    // 12. Post-flush GC: delete old page group/interior chunk versions.
+    // 9. Post-flush GC
     if gc_enabled && !replaced_keys.is_empty() {
-        turbolite_debug!("[gc] deleting {} replaced S3 objects...", replaced_keys.len());
-        if let Err(e) = s3.delete_objects(&replaced_keys) {
+        turbolite_debug!("[gc] deleting {} replaced objects...", replaced_keys.len());
+        if let Err(e) = storage_helpers::delete_objects(backend, runtime, &replaced_keys) {
             eprintln!("[gc] ERROR: failed to delete old objects: {}", e);
         } else {
             turbolite_debug!("[gc] deleted {} old versions", replaced_keys.len());
         }
     }
 
-    // 13. Clean up staging logs (all successfully uploaded)
+    // 10. Clean up staging logs. For local mode we already replayed + cleaned
+    //     at VFS open time; this just covers any leftover entries.
     for path in &staging_paths {
         staging::remove_staging_log(path);
     }
 
-    // Persist local manifest with empty dirty_groups (flush complete)
-    {
-        let m = (**shared_manifest.load()).clone();
-        let local = super::manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
-        if let Err(e) = local.persist(&cache.cache_dir) {
-            eprintln!("[flush] ERROR: failed to persist local manifest: {}", e);
-        }
-    }
-
-    // TODO: S3 compaction requires a StorageClient wrapper around
-    // S3Client, or an S3-specific compaction path. For now, compaction only runs
-    // on the local flush path. S3 mode is the cloud path where compaction latency
-    // matters less (overrides are merged on read).
-    let _ = (override_threshold, compaction_threshold);
-
-    turbolite_debug!("[flush] complete");
-    Ok(())
-}
-
-/// Flush dirty page groups to local disk (for StorageBackend::Local).
-///
-/// Reads dirty pages from the cache, encodes page groups (seekable format),
-/// and writes to `{cache_dir}/pg/{gid}_v{version}`. Updates the local manifest
-/// with new page_group_keys. Deletes old versions after manifest update.
-///
-/// Unlike flush_dirty_groups_to_s3, this is simple: all pages are in the cache
-/// (no S3 merge needed). Called at the end of sync() in local mode.
-pub(crate) fn flush_local_groups(
-    storage: &StorageClient,
-    cache: &DiskCache,
-    shared_manifest: &ArcSwap<Manifest>,
-    shared_dirty_groups: &Mutex<HashSet<u64>>,
-    pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
-    compression_level: i32,
-    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
-    encryption_key: Option<[u8; 32]>,
-    gc_enabled: bool,
-    override_threshold: u32,
-    compaction_threshold: u32,
-) -> io::Result<()> {
-    // 1. Drain pending state
-    let flushes: Vec<staging::PendingFlush> = {
-        let mut pf = pending_flushes.lock().unwrap();
-        std::mem::take(&mut *pf)
-    };
-    let legacy_dirty: HashSet<u64> = {
-        let mut pending = shared_dirty_groups.lock().unwrap();
-        std::mem::take(&mut *pending)
-    };
-
-    if flushes.is_empty() && legacy_dirty.is_empty() {
-        return Ok(());
-    }
-
-    // Run inner flush, restoring drained state on error (same pattern as flush_dirty_groups_to_s3)
-    let result = flush_local_inner(
-        storage, cache, shared_manifest, compression_level,
-        #[cfg(feature = "zstd")] dictionary,
-        encryption_key,
-        gc_enabled,
-        &flushes, &legacy_dirty,
-        override_threshold, compaction_threshold,
-    );
-
-    if let Err(ref e) = result {
-        eprintln!("[flush-local] ERROR: flush failed, restoring pending state: {}", e);
-        if !flushes.is_empty() {
-            pending_flushes.lock().unwrap().extend(flushes);
-        }
-        if !legacy_dirty.is_empty() {
-            shared_dirty_groups.lock().unwrap().extend(legacy_dirty);
-        }
-    }
-
-    result
-}
-
-fn flush_local_inner(
-    storage: &StorageClient,
-    cache: &DiskCache,
-    shared_manifest: &ArcSwap<Manifest>,
-    compression_level: i32,
-    #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
-    encryption_key: Option<[u8; 32]>,
-    gc_enabled: bool,
-    flushes: &[staging::PendingFlush],
-    legacy_dirty: &HashSet<u64>,
-    override_threshold: u32,
-    compaction_threshold: u32,
-) -> io::Result<()> {
-    // 2. Read staged pages
-    let mut staged_pages: HashMap<u64, Vec<u8>> = HashMap::new();
-    let mut staging_paths: Vec<std::path::PathBuf> = Vec::new();
-    for flush_entry in flushes {
-        let pages = staging::read_staging_log(
-            &flush_entry.staging_path,
-            flush_entry.page_size,
-        )?;
-        staging_paths.push(flush_entry.staging_path.clone());
-        staged_pages.extend(pages);
-    }
-
-    // 3. Snapshot manifest
-    let manifest_snap = (**shared_manifest.load()).clone();
-    let page_count = manifest_snap.page_count;
-    let page_size = manifest_snap.page_size;
-
-    if page_size == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "flush_local: manifest has page_size=0",
-        ));
-    }
-
-    // 4. Dictionaries
-    #[cfg(feature = "zstd")]
-    let encoder_dict = dictionary
-        .map(|d| zstd::dict::EncoderDictionary::copy(d, compression_level));
-
-    // 5. Determine dirty groups
-    let mut dirty_groups: HashSet<u64> = legacy_dirty.clone();
-    for &pnum in staged_pages.keys() {
-        if let Some(loc) = manifest_snap.page_location(pnum) {
-            dirty_groups.insert(loc.group_id);
-        }
-    }
-
-    if dirty_groups.is_empty() {
-        if !storage.is_local() {
-            for path in &staging_paths {
-                staging::remove_staging_log(path);
-            }
-        }
-        return Ok(());
-    }
-
-    let next_version = manifest_snap.version + 1;
-    let change_counter = read_change_counter_from_cache(cache, page_size);
-    let old_sub_ppf = manifest_snap.sub_pages_per_frame;
-    let use_seekable = old_sub_ppf > 0;
-
-    let ppg = manifest_snap.pages_per_group;
-    let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut new_keys = manifest_snap.page_group_keys.clone();
-    let mut replaced_keys: Vec<String> = Vec::new();
-    let mut new_frame_tables: Vec<Vec<FrameEntry>> = manifest_snap.frame_tables.clone();
-
-    // Carry forward overrides, track full rewrites
-    let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
-    let effective_threshold = if override_threshold > 0 {
-        override_threshold as usize
-    } else if use_seekable && old_sub_ppf > 0 {
-        let frames_per_group = (ppg as usize + old_sub_ppf as usize - 1) / old_sub_ppf as usize;
-        std::cmp::max(1, frames_per_group / 4)
-    } else { 0 };
-    let mut full_rewrite_groups: HashSet<u64> = HashSet::new();
-
-    // 6. For each dirty group: read pages from staging/cache, encode
-    for &gid in &dirty_groups {
-        let pages_in_group = manifest_snap.group_page_nums(gid);
-        let group_size = pages_in_group.len();
-
-        // Determine if we can use override path
-        let group_dirty_pnums: Vec<u64> = pages_in_group.iter()
-            .filter(|&&pnum| pnum < page_count && staged_pages.contains_key(&pnum))
-            .copied().collect();
-        let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
-        let has_frame_table = use_seekable && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
-        let dirty_frames = if has_frame_table && effective_threshold > 0 {
-            manifest::dirty_frames_for_group(
-                &group_dirty_pnums, &pages_in_group,
-                frame_table_ref.expect("checked above"), old_sub_ppf,
-            )
-        } else { Vec::new() };
-        let use_override = has_frame_table
-            && effective_threshold > 0
-            && !dirty_frames.is_empty()
-            && dirty_frames.len() < effective_threshold;
-
-        if use_override {
-            while new_subframe_overrides.len() <= gid as usize {
-                new_subframe_overrides.push(HashMap::new());
-            }
-            for &frame_idx in &dirty_frames {
-                let frame_start = frame_idx * old_sub_ppf as usize;
-                let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
-                let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
-                for pos in frame_start..frame_end {
-                    let pnum = pages_in_group[pos];
-                    if pnum >= page_count { break; }
-                    let data = if let Some(staged) = staged_pages.get(&pnum) {
-                        staged.clone()
-                    } else if cache.is_present(pnum) {
-                        let mut buf = vec![0u8; page_size as usize];
-                        if cache.read_page(pnum, &mut buf).is_ok() { buf }
-                        else { vec![0u8; page_size as usize] }
-                    } else { vec![0u8; page_size as usize] };
-                    frame_pages.push((pnum, data));
-                }
-                let override_key = StorageClient::override_frame_key(gid, frame_idx, next_version);
-                let encoded = encode_override_frame(
-                    &frame_pages, page_size, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
-                    encryption_key.as_ref(),
-                )?;
-                if let Some(old_ov) = new_subframe_overrides[gid as usize].get(&frame_idx) {
-                    replaced_keys.push(old_ov.key.clone());
-                }
-                uploads.push((override_key.clone(), encoded.clone()));
-                new_subframe_overrides[gid as usize].insert(frame_idx, manifest::SubframeOverride {
-                    key: override_key,
-                    entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
-                });
-            }
-        } else {
-            full_rewrite_groups.insert(gid);
-            let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
-
-            for (i, &pnum) in pages_in_group.iter().enumerate() {
-                if pnum >= page_count { break; }
-                if let Some(staged_data) = staged_pages.get(&pnum) {
-                    pages[i] = Some(staged_data.clone());
-                } else if cache.is_present(pnum) {
-                    let mut page_buf = vec![0u8; page_size as usize];
-                    if cache.read_page(pnum, &mut page_buf).is_ok() {
-                        pages[i] = Some(page_buf);
-                    }
-                }
-            }
-
-            let key = StorageClient::page_group_key(gid, next_version);
-            if use_seekable {
-                let (encoded, ft) = encode_page_group_seekable(
-                    &pages, page_size, old_sub_ppf, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
-                    encryption_key.as_ref(),
-                )?;
-                uploads.push((key.clone(), encoded));
-                while new_frame_tables.len() <= gid as usize {
-                    new_frame_tables.push(Vec::new());
-                }
-                new_frame_tables[gid as usize] = ft;
-            } else {
-                let encoded = encode_page_group(
-                    &pages, page_size, compression_level,
-                    #[cfg(feature = "zstd")] encoder_dict.as_ref(),
-                    encryption_key.as_ref(),
-                )?;
-                uploads.push((key.clone(), encoded));
-            }
-
-            while new_keys.len() <= gid as usize {
-                new_keys.push(String::new());
-            }
-            if let Some(old_key) = new_keys.get(gid as usize) {
-                if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
-            }
-            new_keys[gid as usize] = key;
-        }
-    }
-
-    // 7. Write page groups to local storage
-    storage.put_page_groups(&uploads)?;
-
-    // 8. Build and persist new manifest
-    // GC overrides only for fully-rewritten groups
-    while new_subframe_overrides.len() < new_keys.len() {
-        new_subframe_overrides.push(HashMap::new());
-    }
-    for &gid in &full_rewrite_groups {
-        if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
-            for (_, ov) in group_ovs.drain() {
-                replaced_keys.push(ov.key);
-            }
-        }
-    }
-    let new_manifest = Manifest {
-        version: next_version,
-        change_counter,
-        page_count,
-        page_size,
-        pages_per_group: ppg,
-        page_group_keys: new_keys,
-        interior_chunk_keys: manifest_snap.interior_chunk_keys.clone(),
-        index_chunk_keys: manifest_snap.index_chunk_keys.clone(),
-        frame_tables: new_frame_tables,
-        sub_pages_per_frame: old_sub_ppf,
-        subframe_overrides: new_subframe_overrides,
-        strategy: manifest_snap.strategy,
-        group_pages: manifest_snap.group_pages.clone(),
-        btrees: manifest_snap.btrees.clone(),
-        ..Manifest::empty()
-    };
-
-    storage.put_manifest(&new_manifest, &[])?;
-
-    // 9. Commit to shared manifest
-    {
-        cache.set_group_pages(new_manifest.group_pages.clone());
-        shared_manifest.store(Arc::new(new_manifest));
-    }
-
-    // 10. Delete old page group versions (only if GC is enabled).
-    // When disabled, old versions accumulate until explicit gc() runs.
-    // This protects snapshot-referenced page groups from deletion.
-    if gc_enabled && !replaced_keys.is_empty() {
-        let _ = storage.delete_page_groups(&replaced_keys);
-    }
-
-    // 11. Clean up staging logs.
-    // For local-only mode, staging log cleanup is deferred to VFS open
-    // (after staging log replay populates the cache). This prevents a race
-    // where the background flush deletes staging logs before a cold-reopen
-    // VFS has a chance to replay them.
-    if !storage.is_local() {
-        for path in &staging_paths {
-            staging::remove_staging_log(path);
-        }
-    }
-
-    // Auto-compact overrides if threshold reached
+    // 11. Auto-compact overrides if threshold reached
     if compaction_threshold > 0 {
         if let Err(e) = compact::auto_compact_overrides(
-            storage, shared_manifest, compaction_threshold, compression_level,
-            #[cfg(feature = "zstd")] dictionary,
+            backend,
+            runtime,
+            shared_manifest,
+            compaction_threshold,
+            compression_level,
+            #[cfg(feature = "zstd")]
+            dictionary,
             encryption_key,
         ) {
-            eprintln!("[flush-local] compaction error (non-fatal): {}", e);
+            eprintln!("[flush] compaction error (non-fatal): {}", e);
         }
     }
 
+    let _ = override_threshold;
+    turbolite_debug!("[flush] complete");
     Ok(())
 }
 

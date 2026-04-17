@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use super::*;
 
-/// S3 manifest — updated atomically after all page group uploads.
+/// Remote manifest, updated atomically after all page group uploads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
@@ -121,47 +121,82 @@ pub(crate) fn default_pages_per_group() -> u32 {
     DEFAULT_PAGES_PER_GROUP
 }
 
-// Local manifest persistence
+// Local manifest cache + dirty-group recovery state
+//
+// Two files, two concerns.
+//
+//   {cache_dir}/manifest.msgpack        msgpack(Manifest)     -- warm cache of the
+//                                                                remote manifest
+//   {cache_dir}/dirty_groups.msgpack    msgpack(Vec<u64>)     -- groups staged for
+//                                                                upload, survives
+//                                                                process crash
+//
+// Splitting them means the backend's own `manifest.msgpack` object is a raw
+// Manifest (not a turbolite-specific wrapper), and dirty_groups stops leaking
+// into what the backend sees.
 
-/// Wrapper for local manifest persistence. Contains the full manifest
-/// plus dirty_groups that haven't been flushed to S3 yet.
-/// Persisted to cache_dir/manifest.msgpack on every checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LocalManifest {
-    /// The full manifest (same data as S3, or ahead of S3 if dirty_groups exist).
-    pub manifest: Manifest,
-    /// Group IDs with dirty pages not yet uploaded to S3.
-    /// Non-empty only in LocalThenFlush mode between checkpoint and flush.
-    #[serde(default)]
-    pub dirty_groups: Vec<u64>,
+/// Persist a `Manifest` to the local cache directory as a warm cache for cold
+/// reopens. Atomic write (tmp + rename). Used by local mode as the
+/// authoritative source and by remote mode as a hint for warm reconnect.
+pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> io::Result<()> {
+    let path = cache_dir.join("manifest.msgpack");
+    let tmp = cache_dir.join("manifest.msgpack.tmp");
+    let data = rmp_serde::to_vec(manifest).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("serialize manifest: {e}"))
+    })?;
+    fs::write(&tmp, &data)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
-impl LocalManifest {
-    /// Persist to cache_dir/manifest.msgpack (atomic write via tmp + rename).
-    pub fn persist(&self, cache_dir: &Path) -> io::Result<()> {
-        let path = cache_dir.join("manifest.msgpack");
-        let tmp = cache_dir.join("manifest.msgpack.tmp");
-        let data = rmp_serde::to_vec(self).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serialize local manifest: {}", e))
-        })?;
-        fs::write(&tmp, &data)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
+/// Load a locally-cached `Manifest`. `Ok(None)` if absent. Callers that need
+/// crash-recovery dirty groups read them from [`load_dirty_groups`] separately.
+pub(crate) fn load_manifest_local(cache_dir: &Path) -> io::Result<Option<Manifest>> {
+    let path = cache_dir.join("manifest.msgpack");
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let manifest: Manifest = rmp_serde::from_slice(&data).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("deserialize manifest: {e}"))
+    })?;
+    Ok(Some(manifest))
+}
 
-    /// Load from cache_dir/manifest.msgpack. Returns None if file doesn't exist.
-    pub fn load(cache_dir: &Path) -> io::Result<Option<Self>> {
-        let path = cache_dir.join("manifest.msgpack");
-        let data = match fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+/// Persist the set of page-group ids that have been checkpointed locally but
+/// not yet flushed to the remote backend. Empty list means "no pending work";
+/// file is removed in that case to keep the cache dir tidy.
+pub(crate) fn persist_dirty_groups(cache_dir: &Path, dirty: &[u64]) -> io::Result<()> {
+    let path = cache_dir.join("dirty_groups.msgpack");
+    if dirty.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
-        };
-        let local: LocalManifest = rmp_serde::from_slice(&data).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("deserialize local manifest: {}", e))
-        })?;
-        Ok(Some(local))
+        }
     }
+    let tmp = cache_dir.join("dirty_groups.msgpack.tmp");
+    let data = rmp_serde::to_vec(&dirty.to_vec()).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("serialize dirty_groups: {e}"))
+    })?;
+    fs::write(&tmp, &data)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Load dirty-group recovery state. `Ok(Vec::new())` if no file exists.
+pub(crate) fn load_dirty_groups(cache_dir: &Path) -> io::Result<Vec<u64>> {
+    let path = cache_dir.join("dirty_groups.msgpack");
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let dirty: Vec<u64> = rmp_serde::from_slice(&data).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("deserialize dirty_groups: {e}"))
+    })?;
+    Ok(dirty)
 }
 
 impl Manifest {

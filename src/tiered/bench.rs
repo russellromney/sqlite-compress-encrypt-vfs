@@ -1,45 +1,58 @@
-//! Lightweight benchmark handle for cache-level testing.
+//! Lightweight benchmark / embedder handle for cache-level and manifest-level ops.
 
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::*;
+use arc_swap::ArcSwap;
+use hadb_storage::StorageBackend;
 
-/// Lightweight handle for benchmarking -- shares the same S3 client, cache,
-/// manifest, and dirty groups as the VFS.
-/// Obtained via [`TurboliteVfs::shared_state`] before registering the VFS.
+use super::storage as storage_helpers;
+use super::{
+    cache_tracking, compact, decode_page_group, decode_page_group_seekable_full, encode_page_group,
+    encode_page_group_seekable, flush, keys, query_plan, read_change_counter_from_cache, staging,
+    DiskCache, FrameEntry, GroupState, Manifest, PrefetchPool, SubChunkId,
+};
+
+/// Lightweight handle for benchmarking / embedder flush + cache ops. Shares
+/// the same backend, cache, manifest, and dirty-group state as the owning
+/// VFS.
+///
+/// Backend-agnostic: works for any `StorageBackend`. If the concrete impl
+/// exposes I/O counters (`hadb_storage_s3::S3Storage` does), the embedder
+/// keeps that handle separately; turbolite itself doesn't surface them.
 pub struct TurboliteSharedState {
-    pub(super) s3: Arc<S3Client>,
-    pub(super) cache: Arc<DiskCache>,
-    pub(super) prefetch_pool: Arc<PrefetchPool>,
-    // Shared state for flush_to_storage()
-    pub(super) shared_manifest: Arc<ArcSwap<Manifest>>,
-    pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
-    pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
-    pub(super) flush_lock: Arc<Mutex<()>>,
-    pub(super) compression_level: i32,
+    pub(crate) storage: Arc<dyn StorageBackend>,
+    pub(crate) runtime: tokio::runtime::Handle,
+    pub(crate) is_local: bool,
+    pub(crate) cache: Arc<DiskCache>,
+    pub(crate) prefetch_pool: Option<Arc<PrefetchPool>>,
+    pub(crate) shared_manifest: Arc<ArcSwap<Manifest>>,
+    pub(crate) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
+    pub(crate) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
+    pub(crate) flush_lock: Arc<Mutex<()>>,
+    pub(crate) compression_level: i32,
     #[cfg(feature = "zstd")]
-    pub(super) dictionary: Option<Vec<u8>>,
-    pub(super) encryption_key: Option<[u8; 32]>,
-    pub(super) gc_enabled: bool,
-    pub(super) override_threshold: u32,
-    pub(super) compaction_threshold: u32,
+    pub(crate) dictionary: Option<Vec<u8>>,
+    pub(crate) encryption_key: Option<[u8; 32]>,
+    pub(crate) gc_enabled: bool,
+    pub(crate) override_threshold: u32,
+    pub(crate) compaction_threshold: u32,
 }
 
 impl TurboliteSharedState {
-    /// Evict data pages only -- interior B-tree pages and group 0 stay warm.
-    /// Simulates production where structural pages are always hot.
-    ///
-    /// Safe to call with pending flush: groups awaiting S3 upload are protected
-    /// (their pages remain in the disk cache bitmap).
+    /// Evict data pages only; interior B-tree pages and group 0 stay warm.
     pub fn clear_cache_data_only(&self) {
-        self.prefetch_pool.wait_idle();
+        if let Some(ref pool) = self.prefetch_pool {
+            pool.wait_idle();
+        }
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
         let index_pages = self.cache.index_pages.lock().clone();
         let pending_groups = self.pending_group_pages();
 
-        // Reset group states to None, except group 0 and pending groups stay Present
         let states = self.cache.group_states.lock();
         for (i, s) in states.iter().enumerate() {
             if i == 0 || pending_groups.contains_key(&(i as u64)) {
@@ -52,7 +65,6 @@ impl TurboliteSharedState {
 
         self.cache.group_access.lock().clear();
 
-        // Clear bitmap except for interior pages, index pages, group 0, and pending groups
         {
             let gp = self.cache.group_pages.read();
             let bitmap = self.cache.bitmap.read();
@@ -65,7 +77,6 @@ impl TurboliteSharedState {
             for &page in &index_pages {
                 bitmap.mark_present(page);
             }
-            // Protect pending flush pages
             for pages in pending_groups.values() {
                 for &p in pages {
                     bitmap.mark_present(p);
@@ -84,7 +95,6 @@ impl TurboliteSharedState {
             let _ = bitmap.persist();
         }
 
-        // Prune compressed cache index
         {
             let mut keep = pinned_pages.clone();
             keep.extend(&index_pages);
@@ -96,30 +106,28 @@ impl TurboliteSharedState {
                 keep.extend(g0_pages);
             } else {
                 let ppg = self.cache.pages_per_group as u64;
-                for p in 0..ppg { keep.insert(p); }
+                for p in 0..ppg {
+                    keep.insert(p);
+                }
             }
             self.cache.prune_cache_index(&keep);
         }
 
-        // Clear sub-chunk tracker: evict Data tier only, keep Pinned + Index
         {
             let mut tracker = self.cache.tracker.lock();
             tracker.clear_data_only();
         }
     }
 
-    /// Evict index + data pages -- interior B-tree pages and group 0 stay warm.
-    /// Simulates first query after connection open (interior loaded eagerly,
-    /// index prefetch hasn't finished yet).
-    ///
-    /// Safe to call with pending flush: groups awaiting S3 upload are protected.
+    /// Evict index + data pages; interior B-tree pages and group 0 stay warm.
     pub fn clear_cache_interior_only(&self) {
-        self.prefetch_pool.wait_idle();
+        if let Some(ref pool) = self.prefetch_pool {
+            pool.wait_idle();
+        }
 
         let pinned_pages = self.cache.interior_pages.lock().clone();
         let pending_groups = self.pending_group_pages();
 
-        // Reset group states to None, except group 0 and pending groups stay Present
         let states = self.cache.group_states.lock();
         for (i, s) in states.iter().enumerate() {
             if i == 0 || pending_groups.contains_key(&(i as u64)) {
@@ -133,7 +141,6 @@ impl TurboliteSharedState {
         self.cache.group_access.lock().clear();
         self.cache.index_pages.lock().clear();
 
-        // Clear bitmap except for interior pages, group 0, and pending groups
         {
             let gp = self.cache.group_pages.read();
             let bitmap = self.cache.bitmap.read();
@@ -143,7 +150,6 @@ impl TurboliteSharedState {
             for &page in &pinned_pages {
                 bitmap.mark_present(page);
             }
-            // Protect pending flush pages
             for pages in pending_groups.values() {
                 for &p in pages {
                     bitmap.mark_present(p);
@@ -162,7 +168,6 @@ impl TurboliteSharedState {
             let _ = bitmap.persist();
         }
 
-        // Prune compressed cache index
         {
             let mut keep = pinned_pages.clone();
             for pages in pending_groups.values() {
@@ -173,31 +178,29 @@ impl TurboliteSharedState {
                 keep.extend(g0_pages);
             } else {
                 let ppg = self.cache.pages_per_group as u64;
-                for p in 0..ppg { keep.insert(p); }
+                for p in 0..ppg {
+                    keep.insert(p);
+                }
             }
             self.cache.prune_cache_index(&keep);
         }
 
-        // Clear sub-chunk tracker: evict Index + Data tiers, keep Pinned only
         {
             let mut tracker = self.cache.tracker.lock();
             tracker.clear_index_and_data();
         }
     }
 
-    /// Evict everything -- interior pages, group 0, all data. Nothing cached.
-    /// Next connection open must re-fetch interior chunks from S3.
-    ///
-    /// DANGER: If there are groups pending S3 upload (from local-only checkpoint),
-    /// this will lose unflushed data. Call flush_to_storage() first if durability matters.
+    /// Evict everything; interior pages, group 0, all data. Nothing cached.
     pub fn clear_cache_all(&self) {
-        self.prefetch_pool.wait_idle();
+        if let Some(ref pool) = self.prefetch_pool {
+            pool.wait_idle();
+        }
 
-        // Warn if there are pending groups
         let pending_count = self.shared_dirty_groups.lock().unwrap().len();
         if pending_count > 0 {
             eprintln!(
-                "[bench] WARNING: clear_cache_all with {} groups pending S3 upload! Data may be lost.",
+                "[bench] WARNING: clear_cache_all with {} groups pending upload! Data may be lost.",
                 pending_count,
             );
         }
@@ -221,22 +224,21 @@ impl TurboliteSharedState {
             let _ = bitmap.persist();
         }
 
-        // Clear compressed cache index entirely
         self.cache.clear_cache_index();
 
-        // Clear ALL sub-chunk tracker entries including Pinned and Index
         {
             let mut tracker = self.cache.tracker.lock();
             tracker.clear_all();
         }
     }
 
-    /// Upload locally-checkpointed dirty pages to S3 without holding any SQLite lock.
-    /// See [`TurboliteVfs::flush_to_storage`] for full documentation.
+    /// Upload locally-checkpointed dirty pages without holding any SQLite lock.
     pub fn flush_to_storage(&self) -> io::Result<()> {
         let _guard = self.flush_lock.lock().unwrap();
-        flush::flush_dirty_groups_to_s3(
-            &self.s3,
+        flush::flush_dirty_groups(
+            self.storage.as_ref(),
+            &self.runtime,
+            self.is_local,
             &self.cache,
             &self.shared_manifest,
             &self.shared_dirty_groups,
@@ -251,42 +253,13 @@ impl TurboliteSharedState {
         )
     }
 
-    /// Returns true if there are dirty groups or staging logs pending S3 upload.
+    /// Returns true if there are dirty groups or staging logs pending upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
             || !self.pending_flushes.lock().unwrap().is_empty()
     }
 
-    /// Reset S3 I/O counters. Returns (fetch_count, fetch_bytes) before reset.
-    pub fn reset_s3_counters(&self) -> (u64, u64) {
-        let count = self.s3.fetch_count.swap(0, Ordering::Relaxed);
-        let bytes = self.s3.fetch_bytes.swap(0, Ordering::Relaxed);
-        self.s3.put_count.swap(0, Ordering::Relaxed);
-        self.s3.put_bytes.swap(0, Ordering::Relaxed);
-        (count, bytes)
-    }
-
-    /// Read current S3 GET counters without resetting.
-    pub fn s3_counters(&self) -> (u64, u64) {
-        (
-            self.s3.fetch_count.load(Ordering::Relaxed),
-            self.s3.fetch_bytes.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Read current S3 PUT counters without resetting.
-    pub fn s3_put_counters(&self) -> (u64, u64) {
-        (
-            self.s3.put_count.load(Ordering::Relaxed),
-            self.s3.put_bytes.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Evict all cached data for the named trees. Accepts comma-separated tree
-    /// names (e.g., "audit_log, idx_audit_date"). Looks up each name in the
-    /// manifest's tree_name_to_groups, evicts those groups from DiskCache.
-    /// Skips groups that are pending S3 upload (dirty page safety) or pinned.
-    /// Returns the number of groups evicted.
+    /// Evict all cached data for the named trees.
     pub fn evict_tree(&self, tree_names_csv: &str) -> u32 {
         let pending = self.shared_dirty_groups.lock().unwrap().clone();
         let manifest = self.shared_manifest.load();
@@ -314,9 +287,7 @@ impl TurboliteSharedState {
         evicted
     }
 
-    /// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
-    /// Returns number of sub-chunks evicted. Skips pending flush groups.
-    /// "data" = evict Data tier only. "index" = evict Index + Data. "all" = everything except Pinned.
+    /// Evict cached sub-chunks by tier.
     pub fn evict_tier(&self, tier: &str) -> u32 {
         let pending = self.shared_dirty_groups.lock().unwrap().clone();
         let mut evicted = 0u32;
@@ -349,16 +320,16 @@ impl TurboliteSharedState {
         evicted
     }
 
-    /// Evict cached data for trees referenced by a query. Runs EQP to extract
-    /// tree names, then evicts those trees' groups. Returns number of groups evicted.
+    /// Evict cached data for trees referenced by a query.
     pub fn evict_query(&self, accesses: &[query_plan::PlannedAccess]) -> u32 {
         let tree_names: Vec<&str> = accesses.iter().map(|a| a.tree_name.as_str()).collect();
         let csv = tree_names.join(",");
         self.evict_tree(&csv)
     }
 
-    /// Return cache info as a JSON string. Includes size, tier breakdown,
-    /// cached/total group counts, and S3 stats.
+    /// Return cache info as a JSON string. Backend counters are not
+    /// tracked at the VFS layer anymore; embedders that want those can
+    /// keep a reference to their concrete backend impl.
     pub fn cache_info(&self) -> String {
         let manifest = self.shared_manifest.load();
         let page_size = manifest.page_size as u64;
@@ -370,9 +341,7 @@ impl TurboliteSharedState {
         let mut pinned_chunks = 0u64;
         let mut index_chunks = 0u64;
         let mut data_chunks = 0u64;
-
         let mut groups_with_data: HashSet<u32> = HashSet::new();
-
         for id in &tracker.present {
             groups_with_data.insert(id.group_id);
             match tracker.tiers.get(id) {
@@ -388,7 +357,6 @@ impl TurboliteSharedState {
         let data_bytes = data_chunks * sub_chunk_bytes;
         let total_bytes = pinned_bytes + index_bytes + data_bytes;
 
-        let s3_gets = self.s3.fetch_count.load(Ordering::Relaxed);
         let hits = self.cache.stat_hits.load(Ordering::Relaxed);
         let misses = self.cache.stat_misses.load(Ordering::Relaxed);
         let evictions = self.cache.stat_evictions.load(Ordering::Relaxed);
@@ -407,8 +375,7 @@ impl TurboliteSharedState {
             \"index\":{{\"chunks\":{},\"bytes\":{}}},\
             \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
             \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
-            \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{},\
-            \"s3_gets_total\":{}}}",
+            \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{}}}",
             total_bytes, peak_bytes,
             groups_with_data.len(),
             total_groups,
@@ -417,20 +384,20 @@ impl TurboliteSharedState {
             data_chunks, data_bytes,
             hits, misses, hit_rate,
             evictions, bytes_evicted, last_eviction,
-            s3_gets,
         )
     }
 
-    /// Warm cache for a planned query. Parses EQP output to extract trees,
-    /// submits their groups to the prefetch pool. Non-blocking: returns immediately
-    /// after submitting. Returns JSON with trees warmed and groups submitted.
-    ///
-    /// Note: requires a valid sqlite3 db handle to run EQP. The FFI entry point
-    /// in ext_entry.c passes the db handle from the SQL function context.
+    /// Warm cache for a planned query.
     pub fn warm_from_plan(&self, accesses: &[query_plan::PlannedAccess]) -> String {
         let manifest = self.shared_manifest.load();
         let mut trees_warmed: Vec<String> = Vec::new();
         let mut groups_submitted = 0u32;
+
+        let Some(ref pool) = self.prefetch_pool else {
+            return format!(
+                "{{\"trees_warmed\":[],\"groups_submitted\":0,\"note\":\"no prefetch pool (local mode)\"}}",
+            );
+        };
 
         for access in accesses {
             if let Some(group_ids) = manifest.tree_name_to_groups.get(&access.tree_name) {
@@ -440,15 +407,18 @@ impl TurboliteSharedState {
                         if key.is_empty() {
                             continue;
                         }
-                        let ft = manifest.frame_tables.get(gid as usize)
-                            .cloned().unwrap_or_default();
-                        let gp = manifest.group_pages.get(gid as usize)
-                            .cloned().unwrap_or_default();
+                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
+                        let gp = manifest.group_pages.get(gid as usize).cloned().unwrap_or_default();
                         let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
-                        self.prefetch_pool.submit(
-                            gid, key.clone(), ft,
-                            manifest.page_size, manifest.sub_pages_per_frame,
-                            gp, ovrs, manifest.version,
+                        pool.submit(
+                            gid,
+                            key.clone(),
+                            ft,
+                            manifest.page_size,
+                            manifest.sub_pages_per_frame,
+                            gp,
+                            ovrs,
+                            manifest.version,
                         );
                         groups_submitted += 1;
                     }
@@ -463,8 +433,6 @@ impl TurboliteSharedState {
         )
     }
 
-    /// Get page numbers for all groups pending S3 upload.
-    /// Used by clear_cache methods to protect unflushed pages from eviction.
     fn pending_group_pages(&self) -> HashMap<u64, Vec<u64>> {
         let pending = self.shared_dirty_groups.lock().unwrap();
         if pending.is_empty() {
@@ -479,16 +447,12 @@ impl TurboliteSharedState {
         result
     }
 
-    /// Compact B-tree groups: re-walk B-trees, identify dead pages, repack.
-    /// `threshold` is the dead-page ratio (0.0-1.0) above which a B-tree is repacked.
-    /// All pages must be in the local cache before calling (run a query or warm first).
-    /// Returns JSON report with compaction results.
+    /// Compact B-tree groups.
     pub fn compact(&self, threshold: f64) -> io::Result<String> {
         let manifest = (**self.shared_manifest.load()).clone();
         let page_size = manifest.page_size;
         let ppg = manifest.pages_per_group;
 
-        // Analyze dead space (reads pages from local cache only)
         let report = compact::analyze_dead_space(
             &manifest,
             page_size,
@@ -507,12 +471,10 @@ impl TurboliteSharedState {
             ));
         }
 
-        // Compact each candidate B-tree
         let mut compacted = 0u32;
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
         let mut manifest = (**self.shared_manifest.load()).clone();
-        // Use file change counter from cache for version
         let next_version = read_change_counter_from_cache(&self.cache, page_size);
 
         for btree_info in &report.btrees {
@@ -552,13 +514,11 @@ impl TurboliteSharedState {
                 compact_result.new_groups.len(),
             );
 
-            // Allocate new group IDs, encode and upload
             let mut new_group_ids: Vec<u64> = Vec::new();
             let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
             let mut new_frame_tables_patch: Vec<(usize, Vec<FrameEntry>)> = Vec::new();
 
             for new_pages in &compact_result.new_groups {
-                // Reuse an old group ID if available, otherwise allocate new
                 let gid = if new_group_ids.len() < compact_result.old_group_ids.len() {
                     compact_result.old_group_ids[new_group_ids.len()]
                 } else {
@@ -567,7 +527,6 @@ impl TurboliteSharedState {
                 };
                 new_group_ids.push(gid);
 
-                // Read pages from cache
                 let mut pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(new_pages.len());
                 for &pnum in new_pages {
                     let mut buf = vec![0u8; page_size as usize];
@@ -578,7 +537,7 @@ impl TurboliteSharedState {
                     }
                 }
 
-                let key = self.s3.page_group_key(gid, next_version);
+                let key = keys::page_group_key(gid, next_version);
                 let use_seekable = manifest.sub_pages_per_frame > 0;
 
                 if use_seekable {
@@ -588,7 +547,7 @@ impl TurboliteSharedState {
                         manifest.sub_pages_per_frame,
                         self.compression_level,
                         #[cfg(feature = "zstd")]
-                        None, // dictionaries not used in compaction (same as import)
+                        None,
                         self.encryption_key.as_ref(),
                     )?;
                     uploads.push((key.clone(), encoded));
@@ -605,14 +564,12 @@ impl TurboliteSharedState {
                     uploads.push((key.clone(), encoded));
                 }
 
-                // Update manifest
                 while manifest.page_group_keys.len() <= gid as usize {
                     manifest.page_group_keys.push(String::new());
                 }
                 while manifest.group_pages.len() <= gid as usize {
                     manifest.group_pages.push(Vec::new());
                 }
-                // Track old key for GC
                 let old_key = manifest.page_group_keys.get(gid as usize).cloned().unwrap_or_default();
                 if !old_key.is_empty() {
                     replaced_keys.push(old_key);
@@ -621,7 +578,6 @@ impl TurboliteSharedState {
                 manifest.group_pages[gid as usize] = new_pages.clone();
             }
 
-            // Clear old group IDs that are no longer used
             for &old_gid in &compact_result.old_group_ids {
                 if !new_group_ids.contains(&old_gid) {
                     if let Some(old_key) = manifest.page_group_keys.get(old_gid as usize) {
@@ -638,17 +594,14 @@ impl TurboliteSharedState {
                 }
             }
 
-            // Update B-tree manifest entry with new group IDs
             if let Some(entry) = manifest.btrees.get_mut(&root) {
                 entry.group_ids = new_group_ids;
             }
 
-            // Upload new groups
             if !uploads.is_empty() {
-                self.s3.put_page_groups(&uploads)?;
+                storage_helpers::put_page_groups(self.storage.as_ref(), &self.runtime, &uploads)?;
             }
 
-            // Patch frame tables
             for (gid_idx, ft) in new_frame_tables_patch {
                 while manifest.frame_tables.len() <= gid_idx {
                     manifest.frame_tables.push(Vec::new());
@@ -660,24 +613,21 @@ impl TurboliteSharedState {
             compacted += 1;
         }
 
-        // Update manifest version and rebuild indexes
         manifest.version = next_version;
         manifest.build_page_index();
 
-        // Upload new manifest
-        self.s3.put_manifest(&manifest)?;
+        storage_helpers::put_manifest(self.storage.as_ref(), &self.runtime, &manifest)?;
         self.shared_manifest.store(Arc::new(manifest));
 
-        // GC old groups
         if !replaced_keys.is_empty() && self.gc_enabled {
-            let keys = replaced_keys.clone();
-            let s3 = self.s3.clone();
-            eprintln!("[compact] GC: deleting {} replaced S3 objects", keys.len());
-            std::thread::spawn(move || {
-                if let Err(e) = s3.delete_objects(&keys) {
-                    eprintln!("[compact] GC ERROR: {}", e);
-                }
-            });
+            eprintln!("[compact] GC: deleting {} replaced objects", replaced_keys.len());
+            if let Err(e) = storage_helpers::delete_objects(
+                self.storage.as_ref(),
+                &self.runtime,
+                &replaced_keys,
+            ) {
+                eprintln!("[compact] GC ERROR: {}", e);
+            }
         }
 
         Ok(format!(
@@ -686,16 +636,9 @@ impl TurboliteSharedState {
         ))
     }
 
-    /// Materialize the full database from S3 page groups into a local SQLite file.
-    ///
-    /// Downloads ALL page groups, decodes them, and writes pages in order to produce
-    /// a standard SQLite database file. Returns the manifest version (checkpoint version).
-    ///
-    /// This is the "snapshot source" for walrust integration: turbolite page groups
-    /// serve as the snapshot, walrust applies WAL increments on top.
+    /// Materialize the full database from backend page groups into a local
+    /// SQLite file. Returns the manifest's change_counter for walrust replay.
     pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
-        use std::os::unix::fs::FileExt;
-
         let manifest = (**self.shared_manifest.load()).clone();
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
@@ -709,45 +652,43 @@ impl TurboliteSharedState {
             page_count, page_size, manifest.page_group_keys.len(), manifest.version,
         );
 
-        // Create output file
         let file = std::fs::File::create(output)?;
-        // Pre-allocate the file to the correct size
         let total_size = page_count * page_size as u64;
         file.set_len(total_size)?;
 
-        // Collect non-empty page group keys
         let keys_with_gids: Vec<(u64, String)> = manifest.page_group_keys.iter()
             .enumerate()
             .filter(|(_, k)| !k.is_empty())
             .map(|(gid, k)| (gid as u64, k.clone()))
             .collect();
 
-        // Download in batches of 50 (parallel within each batch)
         let batch_size = 50;
         let total = keys_with_gids.len();
         let use_seekable = manifest.sub_pages_per_frame > 0;
 
         for (batch_idx, batch) in keys_with_gids.chunks(batch_size).enumerate() {
-            let keys: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
-            let data_map = self.s3.get_page_groups_by_key(&keys)?;
+            let key_strs: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
+            let data_map = storage_helpers::get_page_groups_by_key(
+                self.storage.as_ref(),
+                &self.runtime,
+                &key_strs,
+            )?;
 
             for &(gid, ref key) in batch {
                 let pg_data = match data_map.get(key) {
                     Some(d) => d,
                     None => {
-                        eprintln!("[materialize] WARNING: missing S3 object for group {} key {}", gid, key);
+                        eprintln!("[materialize] WARNING: missing object for group {} key {}", gid, key);
                         continue;
                     }
                 };
 
                 let page_nums = manifest.group_page_nums(gid);
-
-                // Decode the page group
                 let ft = manifest.frame_tables.get(gid as usize);
                 let has_ft = use_seekable && ft.map(|f| !f.is_empty()).unwrap_or(false);
 
                 let decoded_pages: Vec<u8> = if has_ft {
-                    let ft = ft.unwrap();
+                    let ft = ft.expect("checked above");
                     let (_pc, _ps, bulk) = decode_page_group_seekable_full(
                         pg_data,
                         ft,
@@ -770,10 +711,11 @@ impl TurboliteSharedState {
                     pages.into_iter().flatten().collect()
                 };
 
-                // Write each page to the correct offset in the output file
                 let ps = page_size as usize;
                 for (i, &pnum) in page_nums.iter().enumerate() {
-                    if pnum >= page_count { break; }
+                    if pnum >= page_count {
+                        break;
+                    }
                     let start = i * ps;
                     let end = start + ps;
                     if end <= decoded_pages.len() {
@@ -794,18 +736,18 @@ impl TurboliteSharedState {
             manifest.change_counter,
         );
 
-        // Return change_counter for walrust WAL replay (txid > change_counter)
         Ok(manifest.change_counter)
     }
 
-    /// Full GC: list all S3 objects, diff against manifest, delete orphans.
-    /// Returns count of objects deleted.
+    /// Full GC: list all backend objects, diff against manifest, delete orphans.
     pub fn gc(&self) -> io::Result<usize> {
-        let manifest = self.s3.get_manifest()?.unwrap_or_else(Manifest::empty);
-        let all_keys = self.s3.list_all_keys()?;
+        let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
+            .unwrap_or_else(Manifest::empty);
+        let all_keys =
+            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
 
         let mut live_keys: HashSet<String> = HashSet::new();
-        live_keys.insert(self.s3.manifest_key_msgpack());
+        live_keys.insert(keys::MANIFEST_KEY.to_string());
         for key in &manifest.page_group_keys {
             if !key.is_empty() {
                 live_keys.insert(key.clone());
@@ -817,6 +759,11 @@ impl TurboliteSharedState {
         for key in manifest.index_chunk_keys.values() {
             live_keys.insert(key.clone());
         }
+        for overrides in &manifest.subframe_overrides {
+            for ovr in overrides.values() {
+                live_keys.insert(ovr.key.clone());
+            }
+        }
 
         let orphans: Vec<String> = all_keys
             .into_iter()
@@ -825,8 +772,8 @@ impl TurboliteSharedState {
 
         let count = orphans.len();
         if count > 0 {
-            eprintln!("[gc] deleting {} orphaned S3 objects...", count);
-            self.s3.delete_objects(&orphans)?;
+            eprintln!("[gc] deleting {} orphaned objects...", count);
+            storage_helpers::delete_objects(self.storage.as_ref(), &self.runtime, &orphans)?;
             eprintln!("[gc] deleted {} orphaned objects", count);
         }
         Ok(count)

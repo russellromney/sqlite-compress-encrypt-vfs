@@ -1,22 +1,17 @@
 //! Turbolite VFS: compressed + encrypted SQLite storage.
 //!
-//! Two storage modes, same on-disk format:
-//!
-//! - **Local** (default): page groups stored at `{cache_dir}/pg/`, manifest at
-//!   `{cache_dir}/manifest.msgpack`. No S3, no tokio, no async deps.
-//!   Enable with `StorageBackend::Local` (the default).
-//!
-//! - **Cloud** (S3-backed): S3 is the source of truth, local NVMe disk is a
-//!   page-level cache. Requires the `cloud` feature for AWS SDK + tokio.
-//!   Enable with `StorageBackend::S3 { bucket, prefix, .. }`.
+//! Backend-agnostic: all bytes flow through an
+//! `Arc<dyn hadb_storage::StorageBackend>` that the embedder picks. The VFS
+//! ships with `TurboliteVfs::new` (wires up `hadb_storage_local::LocalStorage`
+//! rooted at `config.cache_dir`) and `TurboliteVfs::new_with_storage` (you
+//! bring the backend + tokio handle).
 //!
 //! # Quick start (local mode)
 //!
 //! ```ignore
-//! use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+//! use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 //!
 //! let config = TurboliteConfig {
-//!     storage_backend: StorageBackend::Local,
 //!     cache_dir: "/data/mydb".into(),
 //!     ..Default::default()
 //! };
@@ -58,7 +53,6 @@ use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenKind, OpenOptions, Vfs};
-use tokio::runtime::Handle as TokioHandle;
 
 use crate::compress;
 
@@ -66,7 +60,7 @@ use crate::compress;
 use crate::FileWalIndex;
 
 // --- Extracted submodules ---
-#[cfg(feature = "s3")]
+mod async_rt;
 mod bench;
 mod cache_tracking;
 mod compact;
@@ -75,36 +69,31 @@ mod disk_cache;
 mod encoding;
 mod flush;
 mod handle;
-#[cfg(feature = "s3")]
 mod import;
+mod keys;
 mod manifest;
 mod prediction;
 mod prefetch;
 mod query_plan;
 mod rotation;
-mod page_storage;
-mod s3_client;
 mod settings;
 mod staging;
-mod storage_client;
+mod storage;
 mod vfs;
 #[cfg(feature = "wal")]
 mod wal_replication;
 
 // Public API (visible outside the crate)
-#[cfg(feature = "s3")]
 pub use bench::TurboliteSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, StorageBackend, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
+pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
 pub use handle::TurboliteHandle;
-#[cfg(feature = "s3")]
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
-pub use page_storage::PageStorage;
 pub use vfs::TurboliteVfs;
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{AccessType, PlannedAccess, parse_eqp_output, push_planned_accesses, signal_end_query, check_and_clear_end_query, run_eqp_and_parse};
 pub use settings::{turbolite_config_set, push_setting};
-#[cfg(all(feature = "encryption", feature = "s3"))]
+#[cfg(feature = "encryption")]
 pub use rotation::rotate_encryption_key;
 
 /// Result of a database validation run (manifest + data integrity).
@@ -143,7 +132,6 @@ pub type TieredVfs = TurboliteVfs;
 pub type TieredHandle = TurboliteHandle;
 #[deprecated(note = "renamed to TurboliteConfig")]
 pub type TieredConfig = TurboliteConfig;
-#[cfg(feature = "s3")]
 #[deprecated(note = "renamed to TurboliteSharedState")]
 pub type TieredSharedState = TurboliteSharedState;
 
@@ -152,24 +140,22 @@ pub(crate) use cache_tracking::*;
 pub(crate) use disk_cache::*;
 pub(crate) use encoding::*;
 pub(crate) use prefetch::*;
-pub(crate) use s3_client::*;
-pub(crate) use storage_client::*;
 
 
 // ===== Constants =====
 
-/// Default pages per page group (256 × 64KB = 16MB uncompressed, ~8MB compressed).
-/// At 4KB page size this is 1MB per group — increase if using small pages.
+/// Default pages per page group (256 x 64KB = 16MB uncompressed, ~8MB compressed).
+/// At 4KB page size this is 1MB per group; increase if using small pages.
 const DEFAULT_PAGES_PER_GROUP: u32 = 256;
 
 /// Default pages per sub-chunk frame for seekable encoding.
-/// At 64KB page size: 4 × 64KB = 256KB per frame, ~128KB compressed per range GET.
+/// At 64KB page size: 4 x 64KB = 256KB per frame, ~128KB compressed per range GET.
 const DEFAULT_SUB_PAGES_PER_FRAME: u32 = 4;
 
 /// Target ~32MB uncompressed per bundle chunk.
 /// Chunk range = how many page numbers each chunk covers.
-/// At 64KB pages: 512 page range → worst case 32MB per chunk.
-/// At  4KB pages: 8192 page range → worst case 32MB per chunk.
+/// At 64KB pages: 512 page range, worst case 32MB per chunk.
+/// At  4KB pages: 8192 page range, worst case 32MB per chunk.
 fn bundle_chunk_range(page_size: impl Into<u64>) -> u64 {
     const TARGET_BYTES: u64 = 32 * 1024 * 1024;
     TARGET_BYTES / page_size.into()
@@ -193,24 +179,23 @@ pub fn is_local_checkpoint_only() -> bool {
     LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire)
 }
 
-/// Check if a manifest exists at the given S3 prefix. Returns the manifest if found.
-/// Useful for checking whether data has already been imported before re-importing.
-/// Requires the `cloud` feature (creates S3Client + tokio runtime).
-#[cfg(feature = "s3")]
-pub fn get_manifest(config: &TurboliteConfig) -> std::io::Result<Option<Manifest>> {
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let handle = runtime.handle().clone();
-    let s3_cfg = TurboliteConfig {
-        bucket: config.bucket.clone(),
-        prefix: config.prefix.clone(),
-        endpoint_url: config.endpoint_url.clone(),
-        region: config.region.clone(),
-        runtime_handle: Some(handle.clone()),
-        ..Default::default()
-    };
-    let s3 = s3_client::S3Client::block_on(&handle, s3_client::S3Client::new_async(&s3_cfg))?;
-    s3.get_manifest()
+/// Fetch the manifest from a backend. Thin helper; consumers can also call
+/// `backend.get(keys::MANIFEST_KEY)` themselves and decode.
+pub fn get_manifest(
+    backend: &dyn hadb_storage::StorageBackend,
+    runtime: &tokio::runtime::Handle,
+) -> std::io::Result<Option<Manifest>> {
+    let bytes = async_rt::block_on(runtime, backend.get(keys::MANIFEST_KEY))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("fetch manifest: {e}")))?;
+    match bytes {
+        None => Ok(None),
+        Some(bytes) => {
+            let mut m: Manifest = rmp_serde::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("decode manifest: {e}")))?;
+            m.build_page_index();
+            Ok(Some(m))
+        }
+    }
 }
 
 // ===== SQLite file change counter =====

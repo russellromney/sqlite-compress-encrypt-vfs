@@ -1,14 +1,23 @@
 //! Page group compaction: repack B-tree groups to eliminate dead pages.
 //!
 //! Dead pages accumulate when SQLite deletes rows (pages go on freelist) or
-//! when VACUUM reorganizes page numbers. These pages stay in S3 page groups
+//! when VACUUM reorganizes page numbers. These pages stay in page groups
 //! as wasted space. Compaction re-walks the B-trees, identifies groups with
 //! high dead-page ratios, and repacks live pages into dense new groups.
 
 use std::collections::HashSet;
 use std::io;
+use std::sync::Arc;
 
-use super::*;
+use arc_swap::ArcSwap;
+use hadb_storage::StorageBackend;
+use tokio::runtime::Handle as TokioHandle;
+
+use super::storage as storage_helpers;
+use super::{
+    decode_page_group, decode_page_group_seekable_full, decode_seekable_subchunk,
+    encode_page_group, encode_page_group_seekable, keys, FrameEntry, Manifest,
+};
 
 /// Per-B-tree dead space analysis.
 #[derive(Debug, Clone)]
@@ -37,9 +46,6 @@ pub struct DeadSpaceReport {
 }
 
 /// Analyze dead space by re-walking B-trees and comparing against manifest groups.
-///
-/// `read_page` reads a page from the local cache (or S3 if not cached).
-/// Returns a report of dead space per B-tree.
 pub fn analyze_dead_space(
     manifest: &Manifest,
     page_size: u32,
@@ -57,10 +63,9 @@ pub fn analyze_dead_space(
     for (&root_page, walk_entry) in &walk.btrees {
         let live_pages_set: HashSet<u64> = walk_entry.pages.iter().copied().collect();
 
-        // Find this B-tree's groups from manifest
         let manifest_entry = match manifest.btrees.get(&root_page) {
             Some(e) => e,
-            None => continue, // New B-tree not yet in manifest
+            None => continue,
         };
 
         let mut pages_in_groups = 0usize;
@@ -108,9 +113,6 @@ pub fn analyze_dead_space(
         });
     }
 
-    // Also count unowned pages as dead if they're in B-tree groups
-    // (pages moved to freelist but still assigned to a B-tree's group)
-
     DeadSpaceReport {
         btrees,
         total_live,
@@ -121,9 +123,6 @@ pub fn analyze_dead_space(
 }
 
 /// Compact a B-tree's page groups: read all live pages, dense-pack into new groups.
-///
-/// Returns the new group_pages assignments, new S3 keys, and old keys to GC.
-/// The caller is responsible for updating the manifest and uploading.
 pub fn compact_btree(
     manifest: &Manifest,
     btree_root: u64,
@@ -143,14 +142,12 @@ pub fn compact_btree(
 
     let live_pages: HashSet<u64> = walk_entry.pages.iter().copied().collect();
 
-    // Collect old group IDs and their S3 keys for GC
     let old_group_ids: Vec<u64> = manifest_entry.group_ids.clone();
     let old_keys: Vec<String> = old_group_ids.iter()
         .filter_map(|&gid| manifest.page_group_keys.get(gid as usize).cloned())
         .filter(|k| !k.is_empty())
         .collect();
 
-    // Gather all live pages from this B-tree's groups, sorted
     let mut sorted_live: Vec<u64> = Vec::new();
     for &gid in &old_group_ids {
         let group_pages = manifest.group_page_nums(gid);
@@ -163,7 +160,6 @@ pub fn compact_btree(
     sorted_live.sort_unstable();
     sorted_live.dedup();
 
-    // Dense-pack into new groups
     let new_groups: Vec<Vec<u64>> = sorted_live.chunks(ppg as usize)
         .map(|chunk| chunk.to_vec())
         .collect();
@@ -187,7 +183,6 @@ pub struct CompactResult {
     pub old_group_ids: Vec<u64>,
     #[allow(dead_code)]
     pub old_keys: Vec<String>,
-    /// New dense-packed page lists (one per new group).
     pub new_groups: Vec<Vec<u64>>,
     pub pages_before: usize,
     pub pages_after: usize,
@@ -203,7 +198,6 @@ impl CompactResult {
 // Override compaction
 // =========================================================================
 
-/// Result of compacting overrides for a single group.
 #[derive(Debug)]
 pub struct OverrideCompactResult {
     pub gid: u64,
@@ -215,32 +209,51 @@ pub struct OverrideCompactResult {
 
 /// Auto-compact groups exceeding threshold.
 pub(crate) fn auto_compact_overrides(
-    storage: &StorageClient,
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
     shared_manifest: &ArcSwap<Manifest>,
     compaction_threshold: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
-    compact_overrides_inner(storage, shared_manifest, Some(compaction_threshold), compression_level,
-        #[cfg(feature = "zstd")] dictionary, encryption_key)
+    compact_overrides_inner(
+        backend,
+        runtime,
+        shared_manifest,
+        Some(compaction_threshold),
+        compression_level,
+        #[cfg(feature = "zstd")]
+        dictionary,
+        encryption_key,
+    )
 }
 
 /// Compact ALL groups with any overrides (manual trigger).
 #[allow(dead_code)]
 pub(crate) fn compact_all_overrides(
-    storage: &StorageClient,
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
     shared_manifest: &ArcSwap<Manifest>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
-    compact_overrides_inner(storage, shared_manifest, None, compression_level,
-        #[cfg(feature = "zstd")] dictionary, encryption_key)
+    compact_overrides_inner(
+        backend,
+        runtime,
+        shared_manifest,
+        None,
+        compression_level,
+        #[cfg(feature = "zstd")]
+        dictionary,
+        encryption_key,
+    )
 }
 
 fn compact_overrides_inner(
-    storage: &StorageClient,
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
     shared_manifest: &ArcSwap<Manifest>,
     threshold: Option<u32>,
     compression_level: i32,
@@ -274,7 +287,12 @@ fn compact_overrides_inner(
 
     for &gid in &groups_to_compact {
         match compact_override_group(
-            gid, &manifest_snap, storage, next_version, compression_level,
+            gid,
+            &manifest_snap,
+            backend,
+            runtime,
+            next_version,
+            compression_level,
             #[cfg(feature = "zstd")] encoder_dict.as_ref(),
             #[cfg(feature = "zstd")] decoder_dict.as_ref(),
             encryption_key.as_ref(),
@@ -290,7 +308,7 @@ fn compact_overrides_inner(
 
     if compaction_results.is_empty() { return Ok(0); }
 
-    storage.put_page_groups(&uploads)?;
+    storage_helpers::put_page_groups(backend, runtime, &uploads)?;
 
     {
         let mut m = (**shared_manifest.load()).clone();
@@ -306,10 +324,10 @@ fn compact_overrides_inner(
     }
 
     let manifest_for_persist = (**shared_manifest.load()).clone();
-    storage.put_manifest(&manifest_for_persist, &[])?;
+    storage_helpers::put_manifest(backend, runtime, &manifest_for_persist)?;
 
     if !all_replaced_keys.is_empty() {
-        let _ = storage.delete_page_groups(&all_replaced_keys);
+        let _ = storage_helpers::delete_objects(backend, runtime, &all_replaced_keys);
     }
 
     Ok(compaction_results.len())
@@ -319,7 +337,8 @@ fn compact_overrides_inner(
 pub(crate) fn compact_override_group(
     gid: u64,
     manifest: &Manifest,
-    storage: &StorageClient,
+    backend: &dyn StorageBackend,
+    runtime: &TokioHandle,
     next_version: u64,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
@@ -339,7 +358,7 @@ pub(crate) fn compact_override_group(
 
     let base_key = manifest.page_group_keys.get(gid as usize)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no key for gid={}", gid)))?;
-    let base_data = storage.get_page_group(base_key)?
+    let base_data = storage_helpers::get_page_group(backend, runtime, base_key)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("base group not found: {}", base_key)))?;
 
     let ft = manifest.frame_tables.get(gid as usize);
@@ -373,7 +392,7 @@ pub(crate) fn compact_override_group(
 
     for (&frame_idx, ovr) in overrides {
         replaced_keys.push(ovr.key.clone());
-        let ovr_data = storage.get_page_group(&ovr.key)?
+        let ovr_data = storage_helpers::get_page_group(backend, runtime, &ovr.key)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("override not found: {}", ovr.key)))?;
         let decompressed = decode_seekable_subchunk(
             &ovr_data,
@@ -389,7 +408,7 @@ pub(crate) fn compact_override_group(
         }
     }
 
-    let new_key = StorageClient::page_group_key(gid, next_version);
+    let new_key = keys::page_group_key(gid, next_version);
 
     if sub_ppf > 0 {
         let (encoded, new_ft) = encode_page_group_seekable(

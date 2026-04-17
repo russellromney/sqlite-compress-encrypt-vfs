@@ -1,40 +1,36 @@
-//! Bulk import: read a local SQLite file and upload to S3 as tiered page groups.
+//! Bulk import: read a local SQLite file and upload to a turbolite backend
+//! as tiered page groups.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
+use hadb_storage::StorageBackend;
+
+use super::storage as storage_helpers;
 use super::*;
 
-/// Import a local SQLite database file directly to S3 as tiered page groups.
+/// Import a local SQLite database file directly into a turbolite backend as
+/// tiered page groups.
 ///
-/// Reads the file page-by-page, encodes page groups, detects interior B-tree pages,
-/// and uploads everything to S3 with a manifest. This is much faster than writing
-/// through the VFS because it avoids WAL overhead and checkpoint cycles.
+/// Reads the file page-by-page, encodes page groups, detects interior B-tree
+/// pages, and uploads everything to `backend` with a manifest. Much faster
+/// than writing through the VFS because it avoids WAL overhead and
+/// checkpoint cycles.
 ///
-/// Returns the manifest that was uploaded.
+/// The caller owns the backend + tokio runtime handle; the function never
+/// constructs its own runtime.
 pub fn import_sqlite_file(
     config: &TurboliteConfig,
+    backend: Arc<dyn StorageBackend>,
+    runtime: tokio::runtime::Handle,
     file_path: &Path,
 ) -> io::Result<Manifest> {
     use std::os::unix::fs::FileExt;
-
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let handle = runtime.handle().clone();
-
-    // Build a minimal config for S3Client
-    let s3_cfg = TurboliteConfig {
-        bucket: config.bucket.clone(),
-        prefix: config.prefix.clone(),
-        endpoint_url: config.endpoint_url.clone(),
-        region: config.region.clone(),
-        runtime_handle: Some(handle.clone()),
-        ..Default::default()
-    };
-
-    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
+    let backend_ref = backend.as_ref();
+    let runtime_ref = &runtime;
 
     // Open the file and read SQLite header to get page size and page count
     let file = File::open(file_path)?;
@@ -180,7 +176,7 @@ pub fn import_sqlite_file(
             pages[idx] = Some(buf);
         }
 
-        let key = s3.page_group_key(gid as u64, version);
+        let key = keys::page_group_key(gid as u64, version);
         if use_seekable {
             let (encoded, ft) = encode_page_group_seekable(
                 &pages,
@@ -253,7 +249,7 @@ pub fn import_sqlite_file(
     let batch_size = 50;
     let total_uploads = uploads.len();
     for (batch_idx, batch) in uploads.chunks(batch_size).enumerate() {
-        s3.put_page_groups(batch)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, batch)?;
         let done = std::cmp::min((batch_idx + 1) * batch_size, total_uploads);
         eprintln!("[import] uploaded {}/{} page groups", done, total_uploads);
     }
@@ -280,7 +276,7 @@ pub fn import_sqlite_file(
             None,
             config.encryption_key.as_ref(),
         )?;
-        let key = s3.interior_chunk_key(chunk_id, version);
+        let key = keys::interior_chunk_key(chunk_id, version);
         eprintln!(
             "[import] interior chunk {}: {} pages, {:.1}KB",
             chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -290,7 +286,7 @@ pub fn import_sqlite_file(
     }
 
     if !chunk_uploads.is_empty() {
-        s3.put_page_groups(&chunk_uploads)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, &chunk_uploads)?;
         eprintln!("[import] uploaded {} interior chunks", chunk_uploads.len());
     }
 
@@ -316,7 +312,7 @@ pub fn import_sqlite_file(
             None,
             config.encryption_key.as_ref(),
         )?;
-        let key = s3.index_chunk_key(chunk_id, version);
+        let key = keys::index_chunk_key(chunk_id, version);
         eprintln!(
             "[import] index chunk {}: {} pages, {:.1}KB",
             chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -326,7 +322,7 @@ pub fn import_sqlite_file(
     }
 
     if !ix_chunk_uploads.is_empty() {
-        s3.put_page_groups(&ix_chunk_uploads)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, &ix_chunk_uploads)?;
         eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
     }
 
@@ -354,7 +350,7 @@ pub fn import_sqlite_file(
         db_header: None, // import doesn't need db_header (fresh import)
     };
     manifest.build_page_index();
-    s3.put_manifest(&manifest)?;
+    storage_helpers::put_manifest(backend_ref, runtime_ref, &manifest)?;
     eprintln!(
         "[import] manifest uploaded: version={} pages={} groups={} interior_chunks={} seekable={}",
         manifest.version, manifest.page_count, manifest.page_group_keys.len(),

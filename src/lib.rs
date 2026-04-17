@@ -58,7 +58,8 @@ pub mod ffi;
 pub mod ext;
 pub mod tiered;
 pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
-pub use tiered::{StorageBackend, ManifestSource, SyncMode};
+pub use tiered::{ManifestSource, SyncMode};
+pub use hadb_storage::StorageBackend;
 pub mod btree_walker;
 
 /// Open a turbolite-backed SQLite connection.

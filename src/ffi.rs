@@ -114,7 +114,6 @@ pub extern "C" fn turbolite_register_local(
     };
 
     let config = crate::tiered::TurboliteConfig {
-        storage_backend: crate::tiered::StorageBackend::Local,
         cache_dir: std::path::PathBuf::from(cache_dir),
         compression_level,
         ..Default::default()
@@ -213,7 +212,7 @@ pub extern "C" fn turbolite_register(name: *const c_char, config_json: *const c_
 ///
 /// # Returns
 /// 0 on success, -1 on error.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_register_cloud(
     name: *const c_char,
@@ -244,23 +243,41 @@ pub extern "C" fn turbolite_register_cloud(
     let region = nullable_cstr_to_option(region);
 
     let config = crate::tiered::TurboliteConfig {
-        storage_backend: crate::tiered::StorageBackend::S3 {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            endpoint_url: endpoint_url.map(|s| s.to_string()),
-            region: region.map(|s| s.to_string()),
-        },
         cache_dir: std::path::PathBuf::from(cache_dir),
         ..Default::default()
     };
 
-    let vfs = match crate::tiered::TurboliteVfs::new(config) {
+    // Wire hadb-storage-s3 via env vars + an owned tokio runtime (the
+    // FFI boundary can't inherit one from the caller).
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            set_last_error(&format!("tokio runtime: {}", e));
+            return -1;
+        }
+    };
+    let handle = runtime.handle().clone();
+    let _ = (prefix, region); // reserved for Phase Turbogenesis CLI wiring
+    let backend = match handle.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint_url).await
+    }) {
+        Ok(b) => std::sync::Arc::new(b) as std::sync::Arc<dyn hadb_storage::StorageBackend>,
+        Err(e) => {
+            set_last_error(&format!("S3Storage::from_env: {}", e));
+            return -1;
+        }
+    };
+
+    let vfs = match crate::tiered::TurboliteVfs::new_with_storage(config, backend, handle) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(&format!("cloud vfs creation failed: {}", e));
             return -1;
         }
     };
+    // Leak the runtime for the process lifetime; the VFS captures a handle
+    // into it. The FFI boundary owns no cleanup hook.
+    std::mem::forget(runtime);
     match crate::tiered::register(name, vfs) {
         Ok(()) => 0,
         Err(e) => {
@@ -271,7 +288,7 @@ pub extern "C" fn turbolite_register_cloud(
 }
 
 /// Backward-compatible alias for `turbolite_register_cloud`.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_register_tiered(
     name: *const c_char,

@@ -33,7 +33,7 @@ static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Global bench handle for the tiered VFS (set during extension load).
 /// Exposed to C via FFI functions for SQL-callable cache control and S3 counters.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 static BENCH_HANDLE: std::sync::OnceLock<crate::tiered::TurboliteSharedState> = std::sync::OnceLock::new();
 
 /// Called from C entry point (`sqlite3_turbolite_init` in ext_entry.c).
@@ -69,7 +69,7 @@ pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
 
 fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
-    use crate::tiered::{TurboliteConfig, TurboliteVfs, StorageBackend};
+    use crate::tiered::{TurboliteConfig, TurboliteVfs};
 
     let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
         .ok()
@@ -80,7 +80,6 @@ fn register_local() -> Result<(), std::io::Error> {
         .unwrap_or_else(|_| PathBuf::from("."));
 
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir,
         compression_level: level,
         ..Default::default()
@@ -89,60 +88,24 @@ fn register_local() -> Result<(), std::io::Error> {
     crate::tiered::register("turbolite", vfs)
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 fn register_tiered() -> Result<(), std::io::Error> {
-    use std::path::PathBuf;
-    use crate::tiered::{TurboliteConfig, TurboliteVfs};
-
-    let bucket = std::env::var("TURBOLITE_BUCKET")
-        .expect("TURBOLITE_BUCKET must be set for tiered mode");
-    let prefix = std::env::var("TURBOLITE_PREFIX")
-        .unwrap_or_else(|_| "turbolite".into());
-    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/turbolite"));
-    let endpoint_url = std::env::var("TURBOLITE_ENDPOINT_URL")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-        .ok();
-    let region = std::env::var("TURBOLITE_REGION")
-        .or_else(|_| std::env::var("AWS_REGION"))
-        .ok();
-    let prefetch_threads = std::env::var("TURBOLITE_PREFETCH_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let compression_level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let read_only = std::env::var("TURBOLITE_READ_ONLY")
-        .map(|s| s == "1" || s == "true")
-        .unwrap_or(false);
-
-    let mut config = TurboliteConfig {
-        bucket,
-        prefix,
-        cache_dir,
-        endpoint_url,
-        region,
-        compression_level,
-        read_only,
-        ..Default::default()
-    };
-    if prefetch_threads > 0 {
-        config.prefetch_threads = prefetch_threads;
-    }
-
-    let vfs = TurboliteVfs::new(config)?;
-    let _ = BENCH_HANDLE.set(vfs.shared_state());
-    crate::tiered::register("turbolite-s3", vfs)
+    // The loadable-extension's S3 wiring used the old bucket / prefix /
+    // endpoint_url fields on TurboliteConfig. With the backend-agnostic
+    // refactor those fields live on the hadb_storage_s3 construction path
+    // (the Rust API exposes new_with_storage). Rewiring the extension
+    // entrypoint is tracked under Phase Turbogenesis c5.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "turbolite loadable-extension S3 mode is being rewired in Phase Turbogenesis c5",
+    ))
 }
 
 // ── Bench SQL functions (FFI, called from ext_entry.c) ──────────────────
 
 /// Clear cache. mode: 0 = all, 1 = data only, 2 = interior only (keeps interior + group 0).
 /// Returns 0 on success, 1 if no tiered VFS.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
     match BENCH_HANDLE.get() {
@@ -159,35 +122,35 @@ pub extern "C" fn turbolite_bench_clear_cache(mode: i32) -> i32 {
     }
 }
 
-/// Reset S3 counters. Returns 0 on success.
-#[cfg(feature = "s3")]
+/// Reset S3 counters. Always returns 0; counters are now backend-impl
+/// specific and not exposed through the generic trait.
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_reset_s3() -> i32 {
-    match BENCH_HANDLE.get() {
-        Some(h) => { h.reset_s3_counters(); 0 }
-        None => 1,
-    }
+    0
 }
 
-/// Get S3 GET count since last reset.
-#[cfg(feature = "s3")]
+/// Get S3 GET count. Returns 0: not surfaced through the generic
+/// `StorageBackend` trait. Embedders that need per-backend metrics
+/// hold a concrete `hadb_storage_s3::S3Storage` directly.
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_gets() -> i64 {
-    BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().0 as i64)
+    0
 }
 
-/// Get S3 GET bytes since last reset.
-#[cfg(feature = "s3")]
+/// Get S3 GET bytes. Always 0; see above.
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_bench_s3_bytes() -> i64 {
-    BENCH_HANDLE.get().map_or(0, |h| h.s3_counters().1 as i64)
+    0
 }
 
 // Cache eviction + observability
 
 /// Evict cached data for named trees. tree_names is a comma-separated C string.
 /// Returns number of groups evicted, or -1 if no tiered VFS.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c_char) -> i32 {
     if tree_names.is_null() {
@@ -203,7 +166,7 @@ pub unsafe extern "C" fn turbolite_evict_tree(tree_names: *const std::os::raw::c
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::c_char) -> i32 {
     -1
@@ -213,7 +176,7 @@ pub unsafe extern "C" fn turbolite_evict_tree(_tree_names: *const std::os::raw::
 /// Returns null if no tiered VFS.
 ///
 /// Uses a thread-local buffer to avoid allocation lifetime issues across FFI.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     thread_local! {
@@ -240,7 +203,7 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 /// Warm cache for a planned query. Runs EQP to extract trees, submits groups to prefetch.
 /// Returns JSON C string with trees warmed and groups submitted. Null if no tiered VFS.
 /// db must be a valid sqlite3 handle, sql must be a valid C string.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_warm(
     db: *mut std::ffi::c_void,
@@ -275,7 +238,7 @@ pub unsafe extern "C" fn turbolite_warm(
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_warm(
     _db: *mut std::ffi::c_void,
@@ -286,7 +249,7 @@ pub unsafe extern "C" fn turbolite_warm(
 
 /// Evict cached data for trees referenced by a SQL query. Runs EQP, extracts
 /// tree names, evicts their groups. Returns groups evicted, or -1 if no VFS.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_query(
     db: *mut std::ffi::c_void,
@@ -308,7 +271,7 @@ pub unsafe extern "C" fn turbolite_evict_query(
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict_query(
     _db: *mut std::ffi::c_void,
@@ -319,7 +282,7 @@ pub unsafe extern "C" fn turbolite_evict_query(
 
 /// Evict cached sub-chunks by tier. Accepts "data", "index", or "all".
 /// Returns number of sub-chunks evicted, or -1 if no tiered VFS.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i32 {
     if tier.is_null() {
@@ -335,13 +298,13 @@ pub unsafe extern "C" fn turbolite_evict(tier: *const std::os::raw::c_char) -> i
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub unsafe extern "C" fn turbolite_evict(_tier: *const std::os::raw::c_char) -> i32 {
     -1
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
     std::ptr::null()
@@ -349,7 +312,7 @@ pub extern "C" fn turbolite_cache_info() -> *const std::os::raw::c_char {
 
 /// Full GC: list all S3 objects under prefix, delete orphans not in manifest.
 /// Returns number of objects deleted, or -1 if no tiered VFS.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
     match BENCH_HANDLE.get() {
@@ -366,7 +329,7 @@ pub extern "C" fn turbolite_gc() -> i32 {
 
 /// Compact B-tree groups: re-walk B-trees, repack groups with >30% dead space.
 /// Returns JSON report string (caller must free), or null on error.
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 #[no_mangle]
 pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     match BENCH_HANDLE.get() {
@@ -384,13 +347,13 @@ pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub extern "C" fn turbolite_compact() -> *const std::os::raw::c_char {
     std::ptr::null()
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 #[no_mangle]
 pub extern "C" fn turbolite_gc() -> i32 {
     -1
@@ -429,7 +392,6 @@ pub extern "C" fn turbolite_ext_register_named_vfs(
         .unwrap_or(64 * 1024 * 1024);
 
     let config = crate::tiered::TurboliteConfig {
-        storage_backend: crate::tiered::StorageBackend::Local,
         cache_dir,
         compression_level: level,
         mem_cache_budget,
@@ -465,7 +427,7 @@ fn parse_mem_cache_budget(s: &str) -> Option<u64> {
     num.trim().parse::<u64>().ok().map(|n| n * mult)
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(feature = "cli-s3"))]
 fn register_tiered() -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

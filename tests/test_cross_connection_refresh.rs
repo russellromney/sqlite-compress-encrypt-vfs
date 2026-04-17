@@ -1,12 +1,11 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 
 /// Test refresh when one connection writes and another reads the new data
 #[test]
 fn test_cross_connection_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };

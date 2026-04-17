@@ -1,35 +1,35 @@
-//! Encryption key rotation: re-encrypt all S3 data with a new key.
+//! Encryption key rotation: re-encrypt all backend data with a new key.
 
 
 
-/// Re-encrypt, encrypt, or decrypt all S3 data.
+/// Re-encrypt, encrypt, or decrypt all backend data.
 ///
 /// Three modes based on `config.encryption_key` (old) and `new_key`:
 /// - `Some(old), Some(new)`: key rotation (decrypt with old, re-encrypt with new)
 /// - `Some(old), None`: remove encryption (decrypt, store plaintext compressed data)
 /// - `None, Some(new)`: add encryption (encrypt previously plaintext data)
 ///
-/// Downloads each S3 object, transforms it, and uploads as a new versioned object.
-/// The manifest upload is the atomic commit point. Old objects are GC'd after.
-/// Local cache is cleared (ephemeral, repopulates on next open).
+/// Downloads each backend object, transforms it, and uploads as a new
+/// versioned object. The manifest upload is the atomic commit point. Old
+/// objects are GC'd after. Local cache is cleared (ephemeral, repopulates
+/// on next open).
 ///
-/// This does NOT decompress/recompress, only changes the encryption layer.
+/// This does NOT decompress/recompress; only the encryption layer changes.
 /// Frame table offsets are recalculated (GCM adds/removes 28 bytes/frame).
 ///
 /// **Offline operation**: close all connections before rotating. Open connections
-/// hold an in-memory manifest pointing to old S3 keys; after GC deletes those
+/// hold an in-memory manifest pointing to old keys; after GC deletes those
 /// keys, uncached reads from stale connections will fail with NotFound.
-#[cfg(all(feature = "encryption", feature = "s3"))]
+#[cfg(feature = "encryption")]
 pub fn rotate_encryption_key(
     config: &TurboliteConfig,
+    backend: std::sync::Arc<dyn hadb_storage::StorageBackend>,
+    runtime: tokio::runtime::Handle,
     new_key: Option<[u8; 32]>,
 ) -> io::Result<()> {
-    if config.is_local() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "key rotation requires S3 backend (re-encrypts S3 objects in place)",
-        ));
-    }
+    use super::storage as storage_helpers;
+    let backend_ref = backend.as_ref();
+    let runtime_ref = &runtime;
     let old_key = config.encryption_key;
 
     if old_key.is_none() && new_key.is_none() {
@@ -61,24 +61,9 @@ pub fn rotate_encryption_key(
         }
     };
 
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let handle = runtime.handle().clone();
-
-    let s3_cfg = TurboliteConfig {
-        bucket: config.bucket.clone(),
-        prefix: config.prefix.clone(),
-        endpoint_url: config.endpoint_url.clone(),
-        region: config.region.clone(),
-        runtime_handle: Some(handle.clone()),
-        ..Default::default()
-    };
-    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
-
     // Fetch manifest
-    let manifest = s3.get_manifest()?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "No manifest found in S3")
-    })?;
+    let manifest = storage_helpers::get_manifest(backend_ref, runtime_ref)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No manifest found in backend"))?;
 
     let mut new_manifest = manifest.clone();
     new_manifest.version += 1;
@@ -111,7 +96,7 @@ pub fn rotate_encryption_key(
             continue;
         }
 
-        let blob = s3.get_page_group(old_s3_key)?.ok_or_else(|| {
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Page group {} not found", old_s3_key),
@@ -160,8 +145,8 @@ pub fn rotate_encryption_key(
                 new_blob.extend_from_slice(&output);
             }
 
-            let new_s3_key = s3.page_group_key(gid as u64, new_version);
-            s3.put_page_groups(&[(new_s3_key.clone(), new_blob)])?;
+            let new_s3_key = keys::page_group_key(gid as u64, new_version);
+            storage_helpers::put_page_groups(backend_ref, runtime_ref, &[(new_s3_key.clone(), new_blob)])?;
 
             replaced_keys.push(old_s3_key.clone());
             new_manifest.page_group_keys[gid] = new_s3_key;
@@ -171,8 +156,8 @@ pub fn rotate_encryption_key(
             let compressed = maybe_decrypt(&blob)?;
             let output = maybe_encrypt(&compressed)?;
 
-            let new_s3_key = s3.page_group_key(gid as u64, new_version);
-            s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
+            let new_s3_key = keys::page_group_key(gid as u64, new_version);
+            storage_helpers::put_page_groups(backend_ref, runtime_ref, &[(new_s3_key.clone(), output)])?;
 
             replaced_keys.push(old_s3_key.clone());
             new_manifest.page_group_keys[gid] = new_s3_key;
@@ -195,7 +180,7 @@ pub fn rotate_encryption_key(
         .map(|(&id, k)| (id, k.clone()))
         .collect();
     for (chunk_id, old_s3_key) in &interior_keys {
-        let blob = s3.get_page_group(old_s3_key)?.ok_or_else(|| {
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Interior chunk {} not found", old_s3_key),
@@ -204,7 +189,7 @@ pub fn rotate_encryption_key(
         let compressed = maybe_decrypt(&blob)?;
         let output = maybe_encrypt(&compressed)?;
 
-        let new_s3_key = s3.interior_chunk_key(*chunk_id, new_version);
+        let new_s3_key = keys::interior_chunk_key(*chunk_id, new_version);
         s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
         replaced_keys.push(old_s3_key.clone());
@@ -222,7 +207,7 @@ pub fn rotate_encryption_key(
         .map(|(&id, k)| (id, k.clone()))
         .collect();
     for (chunk_id, old_s3_key) in &index_keys {
-        let blob = s3.get_page_group(old_s3_key)?.ok_or_else(|| {
+        let blob = storage_helpers::get_page_group(backend_ref, runtime_ref, old_s3_key)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Index chunk {} not found", old_s3_key),
@@ -231,7 +216,7 @@ pub fn rotate_encryption_key(
         let compressed = maybe_decrypt(&blob)?;
         let output = maybe_encrypt(&compressed)?;
 
-        let new_s3_key = s3.index_chunk_key(*chunk_id, new_version);
+        let new_s3_key = keys::index_chunk_key(*chunk_id, new_version);
         s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
 
         replaced_keys.push(old_s3_key.clone());
@@ -245,7 +230,7 @@ pub fn rotate_encryption_key(
     // VERIFY: re-download and decode one new page group before committing.
     // Guards against silent S3 corruption or encode bugs.
     if let Some(verify_key) = new_manifest.page_group_keys.iter().find(|k| !k.is_empty()) {
-        let verify_blob = s3.get_page_group(verify_key)?.ok_or_else(|| {
+        let verify_blob = storage_helpers::get_page_group(backend_ref, runtime_ref, verify_key)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Other,
                 "verification failed: newly uploaded page group not found in S3",
@@ -305,13 +290,13 @@ pub fn rotate_encryption_key(
     }
 
     // COMMIT POINT: upload new manifest
-    s3.put_manifest(&new_manifest)?;
+    storage_helpers::put_manifest(backend_ref, runtime_ref, &new_manifest)?;
     turbolite_debug!("[rotate] manifest uploaded (version {})", new_version);
 
     // GC old objects
     if !replaced_keys.is_empty() {
-        s3.delete_objects(&replaced_keys)?;
-        turbolite_debug!("[rotate] deleted {} old S3 objects", replaced_keys.len());
+        storage_helpers::delete_objects(backend_ref, runtime_ref, &replaced_keys)?;
+        turbolite_debug!("[rotate] deleted {} old backend objects", replaced_keys.len());
     }
 
     // Clear local cache (simpler than re-encrypting, cache repopulates on next open)

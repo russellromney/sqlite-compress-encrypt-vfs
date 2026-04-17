@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 fn test_concurrent_read_write() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };
@@ -116,7 +115,6 @@ fn test_concurrent_read_write() {
 fn test_concurrent_no_wal() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };
@@ -245,7 +243,6 @@ fn test_concurrent_no_wal() {
 fn test_concurrent_high_throughput() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };

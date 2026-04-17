@@ -7,7 +7,6 @@ use tempfile::TempDir;
 fn test_local_vfs_construction() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -15,7 +14,7 @@ fn test_local_vfs_construction() {
     let vfs = TurboliteVfs::new(config).expect("local VFS construction should succeed");
 
     // Verify it's local
-    assert!(vfs.storage.is_local());
+    assert!(vfs.is_local);
 }
 
 /// RED TEST: Local VFS exists() returns false for new empty dir.
@@ -23,12 +22,13 @@ fn test_local_vfs_construction() {
 fn test_local_vfs_exists_empty() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
     let vfs = TurboliteVfs::new(config).expect("local VFS");
-    assert!(!vfs.storage.exists().unwrap());
+    // Empty dir: no manifest in the backend.
+    use sqlite_vfs::Vfs;
+    assert!(!vfs.exists("main.db").unwrap());
 }
 
 /// RED TEST: Local VFS can register with SQLite, open a db, and do CRUD.
@@ -36,7 +36,6 @@ fn test_local_vfs_exists_empty() {
 fn test_local_vfs_sqlite_roundtrip() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -65,7 +64,6 @@ fn test_local_vfs_with_compression() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
             cache_compression_level: 3,
@@ -86,7 +84,6 @@ fn test_local_vfs_with_compression() {
     // Cold reopen with compression
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
             cache_compression_level: 3,
@@ -108,7 +105,6 @@ fn test_local_vfs_with_compression() {
 fn test_local_vfs_schema_changes() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -155,7 +151,6 @@ fn test_local_vfs_schema_changes() {
 fn test_local_vfs_cloud_methods_error() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -173,19 +168,17 @@ fn test_local_vfs_cloud_methods_error() {
     assert!(destroy_err.is_err());
 }
 
-/// Local VFS s3_counters return zeros.
+/// Local VFS can be constructed; I/O counters (previously exposed via
+/// `s3_counters` / `reset_s3_counters`) now live on concrete backend
+/// impls, not the generic VFS.
 #[test]
-fn test_local_vfs_s3_counters_zero() {
+fn test_local_vfs_smoke_construct() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("local VFS");
-
-    assert_eq!(vfs.s3_counters(), (0, 0));
-    assert_eq!(vfs.reset_s3_counters(), (0, 0));
+    let _vfs = TurboliteVfs::new(config).expect("local VFS");
 }
 
 /// RED TEST: Delete cache file after checkpoint, reopen, verify data recovered from local page groups.
@@ -196,7 +189,6 @@ fn test_local_vfs_recover_from_page_groups() {
     // Phase 1: write data and checkpoint
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -233,7 +225,6 @@ fn test_local_vfs_recover_from_page_groups() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -262,7 +253,6 @@ fn test_local_vfs_multi_checkpoint() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -303,7 +293,6 @@ fn test_local_vfs_multi_checkpoint() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -336,7 +325,6 @@ fn test_local_vfs_checkpoint_reopen() {
     // Write + checkpoint
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -355,7 +343,6 @@ fn test_local_vfs_checkpoint_reopen() {
     // Cold reopen
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -390,7 +377,6 @@ fn test_local_vfs_override_write_cold_read() {
     // Write phase
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100, // high threshold: everything goes to override path
             compaction_threshold: 0, // disable auto-compact
@@ -411,7 +397,6 @@ fn test_local_vfs_override_write_cold_read() {
     // Cold reopen
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -442,7 +427,6 @@ fn test_local_vfs_override_then_full_rewrite() {
     // Write phase 1: create table and initial data
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -463,7 +447,6 @@ fn test_local_vfs_override_then_full_rewrite() {
     // Write phase 2: update to different value (full rewrite, threshold=0)
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 0, // back to default, full rewrite
             compaction_threshold: 0,
@@ -482,7 +465,6 @@ fn test_local_vfs_override_then_full_rewrite() {
     // Cold reopen: verify final value
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -511,7 +493,6 @@ fn test_local_vfs_override_compaction() {
     // Initial write
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 2, // compact after 2 overrides
@@ -540,7 +521,6 @@ fn test_local_vfs_override_compaction() {
     // Cold reopen: data should be consistent after compaction
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -575,7 +555,6 @@ fn test_cache_validation_warm_reopen_same_version() {
     // Write data
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -594,7 +573,6 @@ fn test_cache_validation_warm_reopen_same_version() {
     // Reopen: same manifest version, cache should be warm
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -617,7 +595,6 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
     // Session 1: write data + checkpoint
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -638,7 +615,6 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
     // Session 2: update some rows (simulates another node writing)
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -658,7 +634,6 @@ fn test_cache_validation_external_write_invalidates_stale_groups() {
     // Cache validation should invalidate changed groups.
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -686,7 +661,6 @@ fn test_cache_validation_cold_start_after_cache_delete() {
     // Write data
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -711,7 +685,6 @@ fn test_cache_validation_cold_start_after_cache_delete() {
     // Reopen: cache empty, manifest still on disk, data from page groups
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -733,7 +706,6 @@ fn test_cache_validation_cold_start_after_cache_delete() {
 fn test_constraint_violation_does_not_corrupt_reads() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -771,7 +743,6 @@ fn test_constraint_violation_does_not_corrupt_reads() {
 fn test_explicit_transaction_rollback() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -803,7 +774,6 @@ fn test_explicit_transaction_rollback() {
 fn test_repeated_constraint_violations() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -845,7 +815,6 @@ fn test_repeated_constraint_violations() {
 fn test_migrate_to_s3_primary_from_wal() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -886,7 +855,6 @@ fn test_migrate_to_s3_primary_from_wal() {
 fn test_migrate_from_delete_to_off() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -916,7 +884,6 @@ fn test_migrate_from_delete_to_off() {
 fn test_migrate_already_off() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -946,7 +913,6 @@ fn test_migrate_already_off() {
 fn test_migrate_preserves_large_dataset() {
     let dir = TempDir::new().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
@@ -1002,7 +968,6 @@ fn test_stress_large_database_10k_rows() {
     // Write phase
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group: 4, // small groups to exercise many page groups
             ..Default::default()
@@ -1042,7 +1007,6 @@ fn test_stress_large_database_10k_rows() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group: 4,
             ..Default::default()
@@ -1095,7 +1059,6 @@ fn test_stress_many_overrides_compaction() {
     // Write phase: initial data + 10 sequential small updates with checkpoints
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 5, // compact after 5 overrides
@@ -1141,7 +1104,6 @@ fn test_stress_many_overrides_compaction() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 5,
@@ -1187,7 +1149,6 @@ fn test_override_with_compression_roundtrip() {
     // Write phase: create base groups with compression + overrides
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
             cache_compression_level: 3,
@@ -1235,7 +1196,6 @@ fn test_override_with_compression_roundtrip() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             cache_compression: true,
             cache_compression_level: 3,
@@ -1279,7 +1239,6 @@ fn test_stress_rapid_checkpoint_cycles() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 10,
@@ -1318,7 +1277,6 @@ fn test_stress_rapid_checkpoint_cycles() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -1356,7 +1314,6 @@ fn test_edge_empty_database_reopen() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -1380,7 +1337,6 @@ fn test_edge_empty_database_reopen() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -1411,7 +1367,6 @@ fn test_edge_single_row_database() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -1436,7 +1391,6 @@ fn test_edge_single_row_database() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
@@ -1466,7 +1420,6 @@ fn test_edge_group_boundary_pages() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group,
             ..Default::default()
@@ -1511,7 +1464,6 @@ fn test_edge_group_boundary_pages() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group,
             ..Default::default()
@@ -1556,7 +1508,6 @@ fn test_edge_override_at_frame_boundary() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group: 8, // 8 pages per group
             sub_pages_per_frame: 4, // 2 frames per group
@@ -1608,7 +1559,6 @@ fn test_edge_override_at_frame_boundary() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             pages_per_group: 8,
             sub_pages_per_frame: 4,
@@ -1649,7 +1599,6 @@ fn test_rollback_multi_group_dirty_pages() {
     let dir = TempDir::new().unwrap();
 
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().to_path_buf(),
         pages_per_group: 4,
         ..Default::default()
@@ -1722,7 +1671,6 @@ fn test_override_then_delete_rows() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -1762,7 +1710,6 @@ fn test_override_then_delete_rows() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -1808,7 +1755,6 @@ fn test_compaction_threshold_one() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 1, // compact after every single override
@@ -1852,7 +1798,6 @@ fn test_compaction_threshold_one() {
 
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 1,
@@ -1900,7 +1845,6 @@ fn test_cache_validation_override_changes_between_sessions() {
     // Session 1: write base data + checkpoint
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -1928,7 +1872,6 @@ fn test_cache_validation_override_changes_between_sessions() {
     // Session 2: update with overrides + checkpoint
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
@@ -1948,7 +1891,6 @@ fn test_cache_validation_override_changes_between_sessions() {
     // Session 3: reopen (cache validation should detect override changes)
     {
         let config = TurboliteConfig {
-            storage_backend: StorageBackend::Local,
             cache_dir: dir.path().to_path_buf(),
             override_threshold: 100,
             compaction_threshold: 0,
