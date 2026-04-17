@@ -149,6 +149,47 @@ pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> i
     Ok(())
 }
 
+/// Pre-Anvil-g wrapper: the old on-disk / on-S3 layout bundled the manifest
+/// with the uploaded-but-unflushed dirty_groups into a single msgpack
+/// object under `manifest.msgpack`. We split them in Anvil g so the
+/// backend sees only the Manifest bytes and dirty_groups stays local, but
+/// upgrades from an older stack may still encounter wrapper-format files.
+/// `decode_manifest_bytes` handles both formats transparently.
+#[derive(serde::Deserialize)]
+struct LegacyLocalManifestWrapper {
+    manifest: Manifest,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dirty_groups: Vec<u64>,
+}
+
+/// Decode a raw manifest.msgpack byte blob. Tries the Anvil-g raw
+/// `Manifest` layout first; on failure, falls back to the pre-Anvil-g
+/// `LocalManifest { manifest, dirty_groups }` wrapper and extracts the
+/// inner manifest. Returns Err only if neither format decodes.
+///
+/// This is the single choke point for manifest deserialisation; every
+/// caller (local cache load, backend get, staging-log trailer) routes
+/// through here so the compat path exists exactly once.
+pub(crate) fn decode_manifest_bytes(data: &[u8]) -> io::Result<Manifest> {
+    if let Ok(m) = rmp_serde::from_slice::<Manifest>(data) {
+        return Ok(m);
+    }
+    match rmp_serde::from_slice::<LegacyLocalManifestWrapper>(data) {
+        Ok(wrapper) => {
+            eprintln!(
+                "[turbolite] manifest.msgpack is in pre-Anvil-g LocalManifest wrapper format; \
+                 decoded and will be rewritten in the new format on next persist"
+            );
+            Ok(wrapper.manifest)
+        }
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("deserialize manifest (neither Anvil-g nor legacy format): {e}"),
+        )),
+    }
+}
+
 /// Load a locally-cached `Manifest`. `Ok(None)` if absent. Callers that need
 /// crash-recovery dirty groups read them from [`load_dirty_groups`] separately.
 pub(crate) fn load_manifest_local(cache_dir: &Path) -> io::Result<Option<Manifest>> {
@@ -158,10 +199,7 @@ pub(crate) fn load_manifest_local(cache_dir: &Path) -> io::Result<Option<Manifes
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let manifest: Manifest = rmp_serde::from_slice(&data).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("deserialize manifest: {e}"))
-    })?;
-    Ok(Some(manifest))
+    Ok(Some(decode_manifest_bytes(&data)?))
 }
 
 /// Persist the set of page-group ids that have been checkpointed locally but

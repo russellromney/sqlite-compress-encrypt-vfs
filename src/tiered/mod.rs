@@ -190,8 +190,7 @@ pub fn get_manifest(
     match bytes {
         None => Ok(None),
         Some(bytes) => {
-            let mut m: Manifest = rmp_serde::from_slice(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("decode manifest: {e}")))?;
+            let mut m = manifest::decode_manifest_bytes(&bytes)?;
             m.build_page_index();
             Ok(Some(m))
         }

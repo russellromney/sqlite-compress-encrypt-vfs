@@ -18,7 +18,7 @@ use tokio::runtime::Handle as TokioHandle;
 
 use super::async_rt::block_on;
 use super::keys;
-use super::manifest::Manifest;
+use super::manifest::{self, Manifest};
 
 /// Fetch a page group / chunk / override object by key.
 ///
@@ -131,7 +131,9 @@ pub(crate) fn list_all_keys_with_prefix(
     })
 }
 
-/// Fetch and deserialise the canonical turbolite manifest.
+/// Fetch and deserialise the canonical turbolite manifest. Transparently
+/// handles pre-Anvil-g LocalManifest-wrapper bytes via
+/// [`manifest::decode_manifest_bytes`].
 pub(crate) fn get_manifest(
     backend: &dyn StorageBackend,
     runtime: &TokioHandle,
@@ -139,9 +141,7 @@ pub(crate) fn get_manifest(
     match get_page_group(backend, runtime, keys::MANIFEST_KEY)? {
         None => Ok(None),
         Some(bytes) => {
-            let mut m: Manifest = rmp_serde::from_slice(&bytes).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("decode manifest: {e}"))
-            })?;
+            let mut m = manifest::decode_manifest_bytes(&bytes)?;
             m.detect_and_normalize_strategy();
             Ok(Some(m))
         }
@@ -158,8 +158,11 @@ pub(crate) fn get_manifest_at_key(
     match get_page_group(backend, runtime, key)? {
         None => Ok(None),
         Some(bytes) => {
-            let mut m: Manifest = rmp_serde::from_slice(&bytes).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("decode manifest {key}: {e}"))
+            let mut m = manifest::decode_manifest_bytes(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("decode manifest {key}: {e}"),
+                )
             })?;
             m.detect_and_normalize_strategy();
             Ok(Some(m))

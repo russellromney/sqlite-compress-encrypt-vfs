@@ -194,7 +194,7 @@ impl TurboliteVfs {
                     &flush_entry.staging_path,
                     flush_entry.page_size,
                 ) {
-                    if let Ok(m) = rmp_serde::from_slice::<Manifest>(&manifest_bytes) {
+                    if let Ok(m) = manifest::decode_manifest_bytes(&manifest_bytes) {
                         if m.version > manifest.version {
                             turbolite_debug!(
                                 "[tiered] staging log v{} has newer manifest (v{}, {} pages)",
