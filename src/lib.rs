@@ -83,7 +83,52 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
     // built-in cache so all reads go through turbolite's VFS.
     conn.execute_batch("PRAGMA cache_size=0;")?;
 
+    // Register the per-connection `turbolite_config_set` SQL function.
+    // Routes to this connection's handle via the thread-local stack set up
+    // in xOpen, so `SELECT turbolite_config_set(...)` from this connection
+    // always lands on this connection's handle.
+    install_config_functions(&conn)?;
+
     Ok(conn)
+}
+
+/// Register the `turbolite_config_set(key, value)` SQL function on a
+/// rusqlite [`Connection`]. The function routes per-connection via the
+/// thread-local active-handle stack maintained by [`tiered::settings`]:
+///
+/// ```sql
+/// -- Tune prefetch for an aggressive scan batch, then run the queries.
+/// SELECT turbolite_config_set('prefetch_search', '0.5,0.5');
+/// SELECT * FROM logs WHERE day = '2026-04-20';
+/// ```
+///
+/// [`connect`] calls this automatically. Callers that open a turbolite
+/// connection via `rusqlite::Connection::open_with_flags_and_vfs` (rather
+/// than [`connect`]) should call this once on the connection to get the
+/// SQL function surface.
+///
+/// Return value of the SQL function:
+/// - `0` — update queued successfully; the handle applies it on the next
+///    slow-path read.
+/// - `NULL` with SQL error — validation failed (unknown key or bad value),
+///    or no active turbolite handle on this thread (no turbolite VFS file
+///    is open from this thread).
+#[cfg(feature = "bundled-sqlite")]
+pub fn install_config_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "turbolite_config_set",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        |ctx| {
+            let key: String = ctx.get(0)?;
+            let value: String = ctx.get(1)?;
+            match tiered::settings::set(&key, &value) {
+                Ok(()) => Ok(0i64),
+                Err(msg) => Err(rusqlite::Error::UserFunctionError(msg.into())),
+            }
+        },
+    )
 }
 
 use parking_lot::Mutex;

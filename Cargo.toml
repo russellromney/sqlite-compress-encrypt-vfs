@@ -13,7 +13,7 @@ crate-type = ["lib", "cdylib"]
 
 [features]
 default = ["zstd", "bundled-sqlite"]
-bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "dep:libsqlite3-sys"]
+bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "rusqlite/functions", "dep:libsqlite3-sys"]
 loadable-extension = []
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]

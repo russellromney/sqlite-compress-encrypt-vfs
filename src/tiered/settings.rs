@@ -93,6 +93,23 @@ pub fn push_to_current(update: SettingUpdate) -> bool {
     })
 }
 
+/// Inspect the latest pending value for `key` on the current thread's
+/// top-of-stack queue. Primarily for tests and diagnostics; does not
+/// drain. Returns `None` if no handle is active on this thread or no
+/// update for `key` is pending.
+///
+/// "Last write wins" matches the drain semantics: if multiple pushes for
+/// the same key are queued, the most recent one is the one `xRead` will
+/// eventually apply, so that's what `peek` surfaces.
+pub fn peek_top_for_key(key: &str) -> Option<String> {
+    QUEUE_STACK.with(|s| {
+        let stack = s.borrow();
+        let q = stack.last()?;
+        let queue = q.lock().expect("settings queue poisoned");
+        queue.iter().rev().find(|u| u.key == key).map(|u| u.value.clone())
+    })
+}
+
 /// Drain all pending updates from a specific handle's queue. Called from
 /// the handle's xRead path; safe to call concurrently with `push_to_current`
 /// (Mutex serializes), but in practice one handle's queue is only touched
