@@ -20,17 +20,24 @@ import tempfile
 # ── Load the shared library ──────────────────────────────────────────
 
 def find_lib():
-    """Find the turbolite shared library."""
+    """Find the turbolite-ffi shared library."""
     ext = "dylib" if platform.system() == "Darwin" else "so"
-    name = f"libturbolite.{ext}"
-    # Check release and debug build dirs.
-    for profile in ("release", "debug"):
-        path = os.path.join(
-            os.path.dirname(__file__), "..", "target", profile, name
-        )
-        if os.path.exists(path):
-            return os.path.abspath(path)
-    print(f"ERROR: {name} not found. Run `make lib-bundled` first.", file=sys.stderr)
+    name = f"libturbolite_ffi.{ext}"
+    # cinch-target is the shared target dir for all sibling repos.
+    # Check cinch-target first, then local fallbacks.
+    search_dirs = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "cinch-target"),
+        os.path.join(os.path.dirname(__file__), "..", "target"),
+    ]
+    for base in search_dirs:
+        for profile in ("release", "debug"):
+            path = os.path.join(base, profile, name)
+            if os.path.exists(path):
+                return os.path.abspath(path)
+    print(
+        f"ERROR: {name} not found. Run `make -C ../turbolite-ffi lib` first.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 
@@ -128,12 +135,12 @@ def _():
     assert b"name" in err
 
 
-@test("null base_dir returns error")
+@test("null cache_dir returns error")
 def _():
     rc = lib.turbolite_register_local(b"null-test", None, 3)
     assert rc == -1
     err = lib.turbolite_last_error()
-    assert b"base_dir" in err
+    assert b"cache_dir" in err
 
 
 @test("register compressed VFS")

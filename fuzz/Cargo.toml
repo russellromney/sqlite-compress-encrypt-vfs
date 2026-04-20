@@ -13,6 +13,9 @@ libfuzzer-sys = "0.4"
 [dependencies.turbolite]
 path = ".."
 
+[dependencies.turbolite-ffi]
+path = "../../turbolite-ffi"
+
 [dependencies.rmp-serde]
 version = "1"
 

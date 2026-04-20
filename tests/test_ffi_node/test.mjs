@@ -19,10 +19,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ── Load library ────────────────────────────────────────────────────
 
 const ext = process.platform === "darwin" ? "dylib" : "so";
-const libPath = resolve(
-  __dirname,
-  `../../target/release/libturbolite.${ext}`
-);
+// The shared sibling target-dir is ../../../cinch-target.
+const libPath = [
+  resolve(__dirname, `../../../cinch-target/release/libturbolite_ffi.${ext}`),
+  resolve(__dirname, `../../target/release/libturbolite_ffi.${ext}`),
+].find(() => true);
 
 const lib = koffi.load(libPath);
 

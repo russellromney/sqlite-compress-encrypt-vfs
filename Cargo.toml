@@ -8,13 +8,9 @@ repository = "https://github.com/russellromney/turbolite"
 keywords = ["sqlite", "compression", "encryption", "vfs", "zstd"]
 categories = ["database", "compression"]
 
-[lib]
-crate-type = ["lib", "cdylib"]
-
 [features]
 default = ["zstd", "bundled-sqlite"]
 bundled-sqlite = ["dep:rusqlite", "rusqlite/bundled", "rusqlite/functions", "dep:libsqlite3-sys"]
-loadable-extension = []
 zstd = ["dep:zstd"]
 lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
@@ -94,9 +90,6 @@ walrust-core = { path = "../walrust/crates/walrust-core", version = "0.3", optio
 
 rmp-serde = "1.3.1"
 
-[build-dependencies]
-cbindgen = "0.27"
-cc = "1"
 
 [dev-dependencies]
 rayon = "1.10"

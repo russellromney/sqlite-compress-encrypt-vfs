@@ -7,7 +7,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../target/release -lturbolite
+#cgo LDFLAGS: -L${SRCDIR}/../../../cinch-target/release -lturbolite_ffi
 #include <stdlib.h>
 
 // turbolite FFI declarations

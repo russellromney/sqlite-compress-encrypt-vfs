@@ -226,13 +226,9 @@ fn test_end_query_signal_multiple_signals_collapse() {
     assert!(!check_and_clear_end_query());
 }
 
-#[test]
-fn test_end_query_ffi_entry_point() {
-    check_and_clear_end_query();
-    turbolite_trace_end_query();
-    assert!(check_and_clear_end_query());
-    assert!(!check_and_clear_end_query());
-}
+// The FFI entry-point smoke test (`turbolite_trace_end_query`) lives in
+// turbolite-ffi; the Rust-level `signal_end_query` path is covered by
+// `test_end_query_signal_*` above.
 
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {

@@ -219,43 +219,9 @@ pub fn validate(key: &str, value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// FFI entry point: `turbolite_config_set(key, value)` SQL function.
-///
-/// Returns:
-///   0 — pushed successfully
-///   1 — validation failed (unknown key or bad value)
-///   2 — no active turbolite handle on this thread
-///
-/// # Safety
-/// `key` and `value` must be valid C strings.
-#[no_mangle]
-pub unsafe extern "C" fn turbolite_config_set(
-    key: *const std::ffi::c_char,
-    value: *const std::ffi::c_char,
-) -> i32 {
-    if key.is_null() || value.is_null() {
-        return 1;
-    }
-    let key_str = match std::ffi::CStr::from_ptr(key).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
-    let value_str = match std::ffi::CStr::from_ptr(value).to_str() {
-        Ok(s) => s,
-        Err(_) => return 1,
-    };
-
-    if validate(key_str, value_str).is_err() {
-        return 1;
-    }
-    if !push_to_current(SettingUpdate {
-        key: key_str.to_string(),
-        value: value_str.to_string(),
-    }) {
-        return 2;
-    }
-    0
-}
+// The `turbolite_config_set(key, value)` FFI / SQL entry point lives in
+// turbolite-ffi. This crate only exposes the Rust-level `set` /
+// `push_to_current` / `top_queue` primitives it wraps.
 
 #[cfg(test)]
 mod tests {
@@ -370,37 +336,9 @@ mod tests {
         assert!(drained_again.is_empty());
     }
 
-    #[test]
-    fn ffi_turbolite_config_set_validation() {
-        use std::ffi::CString;
-
-        let q = new_queue();
-        enter_handle(q.clone());
-
-        // Valid: prefetch_search
-        let key = CString::new("prefetch_search").unwrap();
-        let value = CString::new("0.3,0.3,0.4").unwrap();
-        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), value.as_ptr()) }, 0);
-        assert_eq!(q.lock().unwrap().len(), 1);
-
-        // Invalid: unknown key
-        let bad_key = CString::new("unknown").unwrap();
-        let val = CString::new("0.3").unwrap();
-        assert_eq!(unsafe { turbolite_config_set(bad_key.as_ptr(), val.as_ptr()) }, 1);
-        assert_eq!(q.lock().unwrap().len(), 1);
-
-        // Invalid: bad value
-        let key = CString::new("prefetch_search").unwrap();
-        let bad_value = CString::new("not,numbers").unwrap();
-        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), bad_value.as_ptr()) }, 1);
-
-        leave_handle(&q);
-
-        // No active handle → 2
-        let key = CString::new("prefetch_search").unwrap();
-        let value = CString::new("0.1,0.1,0.1").unwrap();
-        assert_eq!(unsafe { turbolite_config_set(key.as_ptr(), value.as_ptr()) }, 2);
-    }
+    // FFI validation coverage (the `turbolite_config_set` C entry point)
+    // now lives in turbolite-ffi's test suite. The Rust-level equivalents
+    // below exercise `set`, `push_to_current`, and `validate` directly.
 
     // =============================================================
     // Existing parse_byte_size tests (unchanged)

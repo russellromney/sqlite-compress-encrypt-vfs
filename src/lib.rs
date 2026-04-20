@@ -35,10 +35,6 @@ macro_rules! turbolite_debug {
 
 pub mod compress;
 pub mod dict;
-#[cfg(not(feature = "loadable-extension"))]
-pub mod ffi;
-#[cfg(feature = "loadable-extension")]
-pub mod ext;
 pub mod tiered;
 pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
 pub use tiered::ManifestSource;

@@ -8,7 +8,7 @@
  *   make test-ffi-c
  */
 
-#include "../turbolite.h"
+#include "../../turbolite-ffi/turbolite.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,7 +74,7 @@ static void test_null_args(void) {
     rc = turbolite_register_local("test", NULL, 3);
     ASSERT(rc == -1);
     err = turbolite_last_error();
-    ASSERT(strstr(err, "base_dir") != NULL);
+    ASSERT(strstr(err, "cache_dir") != NULL);
     PASS();
 cleanup:;
 }

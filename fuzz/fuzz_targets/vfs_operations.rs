@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let vfs_name_c = CString::new(vfs_name.as_str()).unwrap();
     let cache_dir_c = CString::new(cache_dir.as_str()).unwrap();
 
-    let rc = turbolite::ffi::turbolite_register_local(vfs_name_c.as_ptr(), cache_dir_c.as_ptr(), 3);
+    let rc = turbolite_ffi::ffi::turbolite_register_local(vfs_name_c.as_ptr(), cache_dir_c.as_ptr(), 3);
     if rc != 0 {
         std::hint::black_box(rc);
         return;
@@ -26,23 +26,23 @@ fuzz_target!(|data: &[u8]| {
 
     let db_path_c = CString::new(db_path.as_str()).unwrap();
     let vfs_name_c = CString::new(vfs_name.as_str()).unwrap();
-    let db = turbolite::ffi::turbolite_open(db_path_c.as_ptr(), vfs_name_c.as_ptr());
+    let db = turbolite_ffi::ffi::turbolite_open(db_path_c.as_ptr(), vfs_name_c.as_ptr());
 
     if !db.is_null() {
         if !sql.is_empty() {
             let sql_c = CString::new(sql.as_str()).unwrap();
-            let _ = turbolite::ffi::turbolite_exec(db, sql_c.as_ptr());
+            let _ = turbolite_ffi::ffi::turbolite_exec(db, sql_c.as_ptr());
         }
 
         if !sql.is_empty() && sql.to_lowercase().starts_with("select") {
             let sql_c = CString::new(sql.as_str()).unwrap();
-            let ptr = turbolite::ffi::turbolite_query_json(db, sql_c.as_ptr());
+            let ptr = turbolite_ffi::ffi::turbolite_query_json(db, sql_c.as_ptr());
             if !ptr.is_null() {
-                turbolite::ffi::turbolite_free_string(ptr);
+                turbolite_ffi::ffi::turbolite_free_string(ptr);
             }
         }
 
-        turbolite::ffi::turbolite_close(db);
+        turbolite_ffi::ffi::turbolite_close(db);
     }
 
     std::fs::remove_dir_all(&cache_dir).ok();

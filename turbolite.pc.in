@@ -1,9 +1,0 @@
-prefix=@PREFIX@
-libdir=${prefix}/lib
-includedir=${prefix}/include
-
-Name: turbolite
-Description: Compressed SQLite VFS with S3 tiered storage
-Version: @VERSION@
-Libs: -L${libdir} -lturbolite
-Cflags: -I${includedir}

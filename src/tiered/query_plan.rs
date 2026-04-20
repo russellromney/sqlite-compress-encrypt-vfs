@@ -302,34 +302,10 @@ extern "C" {
     fn sqlite3_finalize(stmt: *mut std::ffi::c_void) -> i32;
 }
 
-/// FFI entry point called from C trace callback.
-/// Runs EQP, parses, and pushes to global queue.
-///
-/// # Safety
-/// `db` must be a valid sqlite3 handle. `sql` must be a valid C string.
-#[no_mangle]
-pub unsafe extern "C" fn turbolite_trace_push_plan(
-    db: *mut std::ffi::c_void,
-    sql: *const std::ffi::c_char,
-) {
-    if sql.is_null() {
-        return;
-    }
-    let sql_str = match std::ffi::CStr::from_ptr(sql).to_str() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let accesses = run_eqp_and_parse(db, sql_str);
-    push_planned_accesses(accesses);
-}
-
-/// FFI entry point called from C trace profile callback.
-/// Signals query completion for between-query eviction.
-#[no_mangle]
-pub extern "C" fn turbolite_trace_end_query() {
-    signal_end_query();
-}
+// C trace callback FFI wrappers (`turbolite_trace_push_plan` /
+// `turbolite_trace_end_query`) live in the `turbolite-ffi` crate. They
+// forward to `run_eqp_and_parse` / `push_planned_accesses` /
+// `signal_end_query` above.
 
 #[cfg(test)]
 #[path = "test_query_plan.rs"]

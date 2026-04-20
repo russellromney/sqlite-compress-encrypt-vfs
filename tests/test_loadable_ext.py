@@ -14,9 +14,17 @@ import sqlite3
 import sys
 import tempfile
 
-EXT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "target", "release", "turbolite",
+# `make -C ../turbolite-ffi ext` copies the cdylib to <target>/release/turbolite.<ext>
+# so SQLite's `.load turbolite` resolves without the platform prefix.
+# The shared target-dir is ~/Documents/Github/cinch-target.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_candidates = [
+    os.path.join(_this_dir, "..", "..", "cinch-target", "release", "turbolite"),
+    os.path.join(_this_dir, "..", "target", "release", "turbolite"),
+]
+EXT_PATH = next(
+    (p for p in _candidates if os.path.exists(p + ".so") or os.path.exists(p + ".dylib")),
+    _candidates[0],
 )
 
 passed = 0
