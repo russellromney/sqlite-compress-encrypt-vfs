@@ -89,7 +89,7 @@ impl PrefetchPool {
                             continue;
                         }
                     } else if current != GroupState::Fetching {
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
+                        if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
                         let _ = done_tx.send(gid);
@@ -256,7 +256,7 @@ impl PrefetchPool {
 
                     cache.mark_group_present(gid);
                     cache.touch_group(gid);
-                    if std::env::var("BENCH_VERBOSE").is_ok() {
+                    if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                         turbolite_debug!(
                             "  [prefetch-done] gid={} ({:.1}KB) fetch={}ms decompress={}ms write={}ms total={}ms",
                             gid,

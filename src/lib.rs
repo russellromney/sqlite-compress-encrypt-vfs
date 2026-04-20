@@ -22,32 +22,15 @@
 //! turbolite::tiered::register("mydb", vfs)?;
 //! ```
 
-/// Debug logging macro, gated behind TURBOLITE_DEBUG=1 env var.
-/// Silent by default. Set TURBOLITE_DEBUG=1 to enable debug output to stderr.
-/// Error-level messages use eprintln! directly and are always visible.
+/// Debug logging macro. Emits a `tracing::debug!` event under the
+/// `turbolite` target. Users filter via `RUST_LOG=turbolite=debug` like any
+/// other tracing-instrumented library. Silent by default — no subscriber
+/// means no output, regardless of verbosity.
 #[macro_export]
 macro_rules! turbolite_debug {
     ($($arg:tt)*) => {
-        if $crate::debug_enabled() {
-            eprintln!($($arg)*);
-        }
+        ::tracing::debug!(target: "turbolite", $($arg)*);
     };
-}
-
-/// Check if debug logging is enabled (cached after first check).
-pub fn debug_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0 = unchecked, 1 = disabled, 2 = enabled
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let enabled = std::env::var("TURBOLITE_DEBUG").map_or(false, |v| v == "1" || v == "true");
-            STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-            enabled
-        }
-    }
 }
 
 pub mod compress;
@@ -215,16 +198,8 @@ pub fn release_locks_for(path: &Path) {
 // Locks are at bytes 120-127 in the WAL-index header
 const WAL_LOCK_OFFSET: u64 = 120;
 
-/// Debug lock tracing, enabled via TURBOLITE_DEBUG_LOCKS=1
-static DEBUG_LOCKS: AtomicBool = AtomicBool::new(false);
-
-/// Initialize debug lock tracing from environment
-pub fn init_debug_locks() {
-    if std::env::var("TURBOLITE_DEBUG_LOCKS").map(|v| v == "1").unwrap_or(false) {
-        DEBUG_LOCKS.store(true, Ordering::Relaxed);
-        turbolite_debug!("[LOCK DEBUG] Lock tracing enabled");
-    }
-}
+/// Lock tracing events are emitted under the `turbolite::locks` tracing
+/// target. Filter with `RUST_LOG=turbolite::locks=trace`.
 
 // ── FileWalIndex (shared by TurboliteVfs) ─────────────────────────────
 
@@ -392,15 +367,14 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                             let prev_offset = WAL_LOCK_OFFSET + prev_slot as u64;
                             unlock_inprocess(&self.path, prev_offset as usize, 1, conn_id);
                         }
-                        if DEBUG_LOCKS.load(Ordering::Relaxed) {
-                            turbolite_debug!(
-                                "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY (in-process)",
-                                std::thread::current().id(),
-                                self.path.display(),
-                                slot,
-                                lock
-                            );
-                        }
+                        ::tracing::trace!(
+                            target: "turbolite::locks",
+                            thread = ?std::thread::current().id(),
+                            path = %self.path.display(),
+                            slot = slot,
+                            lock = ?lock,
+                            "WAL_INDEX lock contested (in-process)"
+                        );
                         return Ok(false);
                     }
                 }
@@ -450,16 +424,15 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
             }
         }
 
-        if DEBUG_LOCKS.load(Ordering::Relaxed) {
-            turbolite_debug!(
-                "[LOCK DEBUG] {:?} WAL_INDEX {} locks {:?}..{:?} {:?} => OK",
-                std::thread::current().id(),
-                self.path.display(),
-                locks.start,
-                locks.end,
-                lock
-            );
-        }
+        ::tracing::trace!(
+            target: "turbolite::locks",
+            thread = ?std::thread::current().id(),
+            path = %self.path.display(),
+            start = locks.start,
+            end = locks.end,
+            lock = ?lock,
+            "WAL_INDEX lock acquired"
+        );
         Ok(true)
     }
 

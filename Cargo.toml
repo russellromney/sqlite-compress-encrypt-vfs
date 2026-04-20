@@ -66,6 +66,7 @@ hadb-storage = { path = "../hadb/hadb-storage", version = "0.4" }
 hadb-storage-local = { path = "../hadb/hadb-storage-local", version = "0.4" }
 async-trait = { version = "0.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
 libc = "0.2"
 
 # Concrete storage backend for binaries that talk to S3 (CLI, benchmarks).

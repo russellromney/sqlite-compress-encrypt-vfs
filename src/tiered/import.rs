@@ -203,40 +203,6 @@ pub fn import_sqlite_file(
         }
         page_group_keys.push(key);
 
-        // DEBUG: verify encode/decode roundtrip for every group
-        if std::env::var("IMPORT_VERIFY").is_ok() {
-            let encoded_data = &uploads.last().unwrap().1;
-            let ft = frame_tables.last().unwrap();
-            if use_seekable && !ft.is_empty() {
-                let (dec_count, _dec_size, decoded) = decode_page_group_seekable_full(
-                    encoded_data,
-                    ft,
-                    page_size,
-                    page_nums.len() as u32,
-                    page_count,
-                    0,
-                    #[cfg(feature = "zstd")]
-                    None,
-                    config.encryption.key.as_ref(),
-                ).expect("decode roundtrip failed");
-                assert_eq!(dec_count as usize, page_nums.len(), "gid={} page count mismatch", gid);
-                for (idx, &pnum) in page_nums.iter().enumerate() {
-                    let start = idx * page_size as usize;
-                    let end = start + page_size as usize;
-                    let decoded_page = &decoded[start..end];
-                    let original = pages[idx].as_ref().unwrap();
-                    assert_eq!(decoded_page, original.as_slice(),
-                        "gid={} page {} (idx={}) roundtrip mismatch: first differing byte at {}",
-                        gid, pnum, idx,
-                        decoded_page.iter().zip(original.iter()).position(|(a, b)| a != b).unwrap_or(0),
-                    );
-                }
-            }
-            if gid == 0 {
-                eprintln!("[import] IMPORT_VERIFY: roundtrip checks enabled");
-            }
-        }
-
         if (gid + 1) % 50 == 0 || gid + 1 == actual_groups {
             eprintln!(
                 "[import] encoded {}/{} groups ({} interior pages so far)",

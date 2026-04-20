@@ -845,7 +845,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
 
-                if std::env::var("BENCH_VERBOSE").is_ok() {
+                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     let manifest_snap = self.manifest.load();
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> = planned.iter().map(|a| a.tree_name.as_str()).collect();
@@ -1180,7 +1180,7 @@ impl DatabaseHandle for TurboliteHandle {
                         cache.touch_group(gid);
                         self.reset_misses(current_tree_name.as_ref());
 
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
+                        if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!(
                                 "  [range-get] page={} gid={} frame={}/{} s3={}ms decode={}ms total={}ms ({:.1}KB)",
                                 page_num, gid, frame_idx, ft.len(), s3_ms, decode_ms,
@@ -1192,7 +1192,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                     Ok(None) | Err(_) => {
                         // Fall through to legacy path
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
+                        if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             eprintln!(
                                 "  [range-get] page={} gid={} frame={} failed, falling through to legacy path",
                                 page_num, gid, frame_idx,
@@ -1209,7 +1209,7 @@ impl DatabaseHandle for TurboliteHandle {
         if state == GroupState::Fetching {
             let wait_start = Instant::now();
             cache.wait_for_group(gid);
-            if std::env::var("BENCH_VERBOSE").is_ok() {
+            if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                 turbolite_debug!(
                     "  [inline] page={} gid={} WAITED for prefetch worker {}ms",
                     page_num, gid, wait_start.elapsed().as_millis(),
@@ -1278,7 +1278,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 }
                                 cache.mark_group_present(gid);
                                 cache.touch_group(gid);
-                                if std::env::var("BENCH_VERBOSE").is_ok() {
+                                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                                     turbolite_debug!(
                                         "  [inline] page={} gid={} s3={}ms decode={}ms write={}ms total={}ms ({:.1}KB)",
                                         page_num, gid, s3_ms, decode_ms, write_ms,
@@ -1311,7 +1311,7 @@ impl DatabaseHandle for TurboliteHandle {
             } else {
                 let wait_start = Instant::now();
                 cache.wait_for_group(gid);
-                if std::env::var("BENCH_VERBOSE").is_ok() {
+                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     turbolite_debug!(
                         "  [inline] page={} gid={} WAITED (race) {}ms",
                         page_num, gid, wait_start.elapsed().as_millis(),
