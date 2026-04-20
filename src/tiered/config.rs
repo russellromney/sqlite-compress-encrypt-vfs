@@ -83,6 +83,182 @@ pub enum GroupState {
     Present = 2,
 }
 
+// ===== Nested configuration groups =====
+//
+// Phase Cirrus b1: these grouped structs are added alongside the flat
+// `TurboliteConfig` fields. `Default::default()` populates both in lockstep
+// so the nested view is always consistent with the flat view. b2 will
+// remove the flat fields and switch internal reads to the nested form.
+
+/// Cache and durability-eviction knobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// TTL for cached page groups in seconds (0 = no automatic eviction).
+    pub ttl_secs: u64,
+    /// Maximum cache size in bytes (sub-chunk granularity). None = unlimited.
+    pub max_bytes: Option<u64>,
+    /// In-memory page cache budget in bytes. 0 disables the mem cache.
+    pub mem_budget: u64,
+    /// Evict data tier after successful checkpoint upload.
+    pub evict_on_checkpoint: bool,
+    /// Compress pages in the local disk cache using zstd.
+    pub compression: bool,
+    /// Zstd compression level for local cache pages (1-22).
+    pub compression_level: i32,
+    /// Pages per page group. Each backend object contains this many compressed pages.
+    pub pages_per_group: u32,
+    /// Pages per sub-chunk frame for seekable page groups. 0 disables seekable encoding.
+    pub sub_pages_per_frame: u32,
+    /// Automatic garbage collection after each checkpoint.
+    pub gc_enabled: bool,
+    /// Override threshold. 0 = auto (frames_per_group / 4).
+    pub override_threshold: u32,
+    /// Compaction threshold.
+    pub compaction_threshold: u32,
+}
+
+/// Compression settings for remote page groups (distinct from cache compression).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompressionConfig {
+    /// Zstd compression level (1-22).
+    pub level: i32,
+    /// Zstd compression dictionary (2-5x better on structured data).
+    #[cfg(feature = "zstd")]
+    pub dictionary: Option<Vec<u8>>,
+}
+
+/// At-rest encryption settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EncryptionConfig {
+    /// AES-256-GCM key. When set, all page data is encrypted at rest.
+    /// Requires the `encryption` feature.
+    pub key: Option<[u8; 32]>,
+}
+
+/// Prefetch and query-plan-driven warmup knobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefetchConfig {
+    /// Prefetch schedule for SEARCH queries.
+    pub search: Vec<f32>,
+    /// Prefetch schedule for index lookups / point queries.
+    pub lookup: Vec<f32>,
+    /// Number of prefetch worker threads.
+    pub threads: u32,
+    /// Enable query-plan-aware prefetch.
+    pub query_plan: bool,
+    /// Enable predictive cross-tree prefetch.
+    pub prediction: bool,
+    /// Load all index leaf bundles on VFS open.
+    pub eager_index_load: bool,
+    /// Manifest source — Auto (local fallback) vs Remote (always backend).
+    pub manifest_source: ManifestSource,
+}
+
+/// WAL replication settings (walrust-backed durability between checkpoints).
+#[cfg(feature = "wal")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalConfig {
+    /// Ship WAL frames to the backend for transaction-level durability.
+    pub replication: bool,
+    /// How often walrust ships WAL frames (milliseconds).
+    pub sync_interval_ms: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: 0,
+            max_bytes: std::env::var("TURBOLITE_CACHE_LIMIT")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .and_then(|n| if n == 0 { None } else { Some(n) }),
+            mem_budget: std::env::var("TURBOLITE_MEM_CACHE_BUDGET")
+                .ok()
+                .and_then(|v| crate::tiered::settings::parse_byte_size(&v))
+                .unwrap_or(64 * 1024 * 1024),
+            evict_on_checkpoint: std::env::var("TURBOLITE_EVICT_ON_CHECKPOINT")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            compression: std::env::var("TURBOLITE_CACHE_COMPRESSION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            compression_level: std::env::var("TURBOLITE_CACHE_COMPRESSION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            pages_per_group: DEFAULT_PAGES_PER_GROUP,
+            sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
+            gc_enabled: true,
+            override_threshold: std::env::var("TURBOLITE_OVERRIDE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            compaction_threshold: std::env::var("TURBOLITE_COMPACTION_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+        }
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            level: 3,
+            #[cfg(feature = "zstd")]
+            dictionary: None,
+        }
+    }
+}
+
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        Self {
+            search: vec![0.3, 0.3, 0.4],
+            lookup: vec![0.0, 0.0, 0.0],
+            threads: std::env::var("TURBOLITE_PREFETCH_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    let cpus = std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(2);
+                    cpus + 1
+                }),
+            query_plan: true,
+            prediction: false,
+            eager_index_load: true,
+            manifest_source: std::env::var("TURBOLITE_MANIFEST_SOURCE")
+                .ok()
+                .map(|v| match v.to_lowercase().as_str() {
+                    "remote" | "s3" => ManifestSource::Remote,
+                    _ => ManifestSource::Auto,
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(feature = "wal")]
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            replication: std::env::var("TURBOLITE_WAL_REPLICATION")
+                .map(|v| matches!(v.as_str(), "true" | "1"))
+                .unwrap_or(false),
+            sync_interval_ms: std::env::var("TURBOLITE_WAL_SYNC_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+        }
+    }
+}
+
 // ===== Configuration =====
 
 /// Configuration for turbolite storage.
@@ -186,6 +362,16 @@ pub struct TurboliteConfig {
     /// WAL sync interval (how often walrust ships WAL frames). Default: 1 second.
     #[cfg(feature = "wal")]
     pub wal_sync_interval_ms: u64,
+
+    // ===== Nested groupings (Phase Cirrus b1) =====
+    // Populated by `Default` in lockstep with the flat fields above. b2 will
+    // delete the flat fields and switch internal reads to these.
+    pub cache: CacheConfig,
+    pub compression: CompressionConfig,
+    pub encryption: EncryptionConfig,
+    pub prefetch: PrefetchConfig,
+    #[cfg(feature = "wal")]
+    pub wal: Option<WalConfig>,
 }
 
 impl Default for TurboliteConfig {
@@ -258,6 +444,14 @@ impl Default for TurboliteConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000),
+
+            // Nested mirrors. Cirrus b2 removes the flat fields above.
+            cache: CacheConfig::default(),
+            compression: CompressionConfig::default(),
+            encryption: EncryptionConfig::default(),
+            prefetch: PrefetchConfig::default(),
+            #[cfg(feature = "wal")]
+            wal: Some(WalConfig::default()),
         }
     }
 }

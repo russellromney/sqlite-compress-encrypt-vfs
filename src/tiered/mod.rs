@@ -86,6 +86,9 @@ mod wal_replication;
 // Public API (visible outside the crate)
 pub use bench::TurboliteSharedState;
 pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
+pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
+#[cfg(feature = "wal")]
+pub use config::WalConfig;
 pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
