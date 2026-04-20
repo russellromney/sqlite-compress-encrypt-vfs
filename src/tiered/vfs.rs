@@ -360,7 +360,15 @@ impl TurboliteVfs {
         }
     }
 
-    /// Get a shared state handle for cache control, flush_to_storage, and SQL functions.
+    /// Get a shared-state handle for cache control, `flush_to_storage`, and
+    /// SQL functions.
+    ///
+    /// Total: every `TurboliteVfs` is constructed with a concrete backend
+    /// (local mode wraps `LocalStorage`; remote mode takes an
+    /// `Arc<dyn StorageBackend>` from the caller), so a
+    /// [`TurboliteSharedState`] is always returnable. Phase Cirrus e removed
+    /// the old panic path from pre-Anvil-g callers; the type system now
+    /// carries the invariant — no `Option`, no `expect`.
     pub fn shared_state(&self) -> bench::TurboliteSharedState {
         TurboliteSharedState {
             storage: Arc::clone(&self.storage),

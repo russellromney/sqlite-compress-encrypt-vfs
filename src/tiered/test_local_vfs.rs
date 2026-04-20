@@ -17,6 +17,21 @@ fn test_local_vfs_construction() {
     assert!(vfs.is_local);
 }
 
+/// Phase Cirrus e: shared_state() is total for local VFSes. The old
+/// "expect(shared_state)" panic for non-S3 backends is gone; the field
+/// types carry the invariant.
+#[test]
+fn test_local_vfs_shared_state_is_total() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let vfs = TurboliteVfs::new(config).expect("local VFS");
+    let state = vfs.shared_state();
+    assert!(state.is_local);
+}
+
 /// RED TEST: Local VFS exists() returns false for new empty dir.
 #[test]
 fn test_local_vfs_exists_empty() {
