@@ -211,6 +211,77 @@ fn two_threads_isolated_via_sql_function() {
     assert_ne!(a_value, b_value, "threads must not share queue state");
 }
 
+/// **Known limitation** (documented here so it's visible in code, not
+/// just prose). Two connections open concurrently on the *same* thread:
+/// the thread-local active-handle stack has both queues, most-recently
+/// opened on top. `turbolite_config_set` called from either connection
+/// routes to whichever queue is on top of the stack — which is the
+/// most recently opened handle, not necessarily the connection whose
+/// statement is currently executing.
+///
+/// This test **asserts the current behavior**, not the desired one. In
+/// production this scenario does not arise (rusqlite `Connection` is
+/// `!Sync`, typical pool patterns are one connection per thread, and
+/// cinch's engines are one-tenant-per-process). If/when we do the
+/// proper fix (a `sqlite3_trace_v2` STMT/PROFILE hook that pushes the
+/// active connection's handle onto the stack at statement start and
+/// pops at completion), the assertion below flips: each connection's
+/// push lands on its *own* queue regardless of open order.
+///
+/// Until then, a multi-connection-per-thread caller should either:
+/// - Drop A before opening B (see `sequential_connections_dont_share_queue`)
+/// - Run each connection on its own thread (see `two_threads_isolated_via_sql_function`)
+#[test]
+fn multi_connection_same_thread_top_of_stack_wins() {
+    let tmp = TempDir::new().unwrap();
+    let vfs_name = unique_name("multi_same_thread");
+
+    let vfs = TurboliteVfs::new_local(TurboliteConfig {
+        cache_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    })
+    .expect("vfs");
+    tiered::register(&vfs_name, vfs).expect("register");
+
+    let conn_a = open_connection(&vfs_name, "multi_a.db");
+    let conn_b = open_connection(&vfs_name, "multi_b.db");
+    // Thread-local stack is now [queue_a, queue_b], B on top.
+
+    // A calls the SQL function. Current design: the push lands on B's
+    // queue (top of stack), not A's. If the proper fix lands, this
+    // push should land on A's queue and the peek comment below flips.
+    let _: i64 = conn_a
+        .query_row(
+            "SELECT turbolite_config_set('prefetch_search', '0.11,0.22')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("A set (routes to B's queue under current design)");
+
+    // peek_top_for_key returns the top-of-stack queue's pending value.
+    // Top-of-stack is conn_b's queue (opened most recently).
+    let peeked = settings::peek_top_for_key("prefetch_search")
+        .expect("some queue has the push");
+    assert_eq!(
+        peeked, "0.11,0.22",
+        "current design: A's push lands on B's queue (top of stack)"
+    );
+
+    // Drop B. Now A is on top. A pushing lands on its own queue.
+    drop(conn_b);
+
+    let _: i64 = conn_a
+        .query_row(
+            "SELECT turbolite_config_set('prefetch_search', '0.33,0.44')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("A set (now routes to A's own queue)");
+    let peeked = settings::peek_top_for_key("prefetch_search")
+        .expect("A queue has pending");
+    assert_eq!(peeked, "0.33,0.44");
+}
+
 /// Single thread, two sequential connections on the same VFS. After
 /// dropping connection A and opening B, B's queue is separate — A's
 /// pushes do not appear in B's queue. Exercises `leave_handle` on Drop
