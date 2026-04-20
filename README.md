@@ -142,7 +142,7 @@ Each consecutive miss advances through a **prefetch schedule** that controls wha
 - **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
 - **Lookup schedule** `[0.0, 0.0, 0.0]`: for point queries and index lookups that hit 1-2 pages per tree. Three free hops before any prefetch. Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
 
-You can tune the prefetch schedule at open time by setting `prefetch_search` / `prefetch_lookup` on `TurboliteConfig` - you know the expected workload shape, so the VFS doesn't have to guess. See [Configuring prefetch](#configuring-prefetch).
+You can tune the prefetch schedule at open time by setting `prefetch.search` / `prefetch.lookup` on `TurboliteConfig` - you know the expected workload shape, so the VFS doesn't have to guess. See [Configuring prefetch](#configuring-prefetch).
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
@@ -163,7 +163,7 @@ SQLite (PRAGMA cache_size=0)
 ```
 
 **Configuration:**
-- `mem_cache_budget` in `TurboliteConfig` (bytes). Default: 64MB.
+- `cache.mem_budget` on `TurboliteConfig` (bytes). Default: 64MB.
 - `TURBOLITE_MEM_CACHE_BUDGET` env var (e.g., `128MB`, `1GB`).
 - Set to `0` to disable the in-memory cache entirely.
 
@@ -212,9 +212,9 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 
 | Parameter | What it controls | Default |
 |-----------|-----------------|---------|
-| `prefetch_threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
-| `pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
-| `gc_enabled` | Delete old page group versions after checkpoint | true |
+| `prefetch.threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
+| `cache.pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
+| `cache.gc_enabled` | Delete old page group versions after checkpoint | true |
 | `sync_mode` | Checkpoint durability: `Durable` (S3 upload in checkpoint) or `LocalThenFlush` (defer upload) | Durable |
 
 ### Prefetch schedules
@@ -233,25 +233,42 @@ Each element is the fraction of sibling groups to prefetch on the Nth consecutiv
 
 ### Configuring prefetch
 
-Set `prefetch_search` and `prefetch_lookup` on `TurboliteConfig` at VFS construction:
+Set `prefetch.search` and `prefetch.lookup` on `TurboliteConfig` at VFS construction:
 
 ```rust
+use turbolite::tiered::{TurboliteConfig, PrefetchConfig};
+
 let config = TurboliteConfig {
-    prefetch_search: vec![0.4, 0.3, 0.3],
-    prefetch_lookup: vec![0.0, 0.0, 0.2],
-    query_plan_prefetch: true,
+    prefetch: PrefetchConfig {
+        search: vec![0.4, 0.3, 0.3],
+        lookup: vec![0.0, 0.0, 0.2],
+        query_plan: true,
+        ..Default::default()
+    },
     ..Default::default()
 };
 ```
+
+For per-query retuning without reopening the connection, use the
+`turbolite_config_set` SQL function (Phase Cirrus c). Each push is
+scoped to the calling connection's handle:
+
+```sql
+SELECT turbolite_config_set('prefetch_search', '0.5,0.5,0.0');
+SELECT turbolite_config_set('prefetch_lookup', '0.0,0.0,0.0');
+SELECT * FROM posts WHERE created_at > ?;   -- runs with the new schedule
+```
+
+Rust callers can invoke the same path via `turbolite::tiered::settings::set`.
 
 ### Recommended configs
 
 | Workload | Config | Why |
 |----------|--------|-----|
 | Mixed OLTP | Defaults | Plan-aware handles scans, search schedule warms indexes, lookup schedule stays conservative. |
-| Point-heavy (agent DBs) | `prefetch_lookup: vec![0.0, 0.0, 0.0]` | Lookups almost never need prefetch. |
-| Scan-heavy analytics | `prefetch_search: vec![0.5, 0.5]`, `query_plan_prefetch: true` | Aggressive search warmup plus plan-aware bulk prefetch. |
-| Conservative (bursty serverless) | `prefetch_search: vec![0.1, 0.2, 0.3]`, `prefetch_lookup: vec![0.0, 0.0, 0.1]` | Minimal prefetch noise. |
+| Point-heavy (agent DBs) | `prefetch.lookup: vec![0.0, 0.0, 0.0]` | Lookups almost never need prefetch. |
+| Scan-heavy analytics | `prefetch.search: vec![0.5, 0.5]`, `prefetch.query_plan: true` | Aggressive search warmup plus plan-aware bulk prefetch. |
+| Conservative (bursty serverless) | `prefetch.search: vec![0.1, 0.2, 0.3]`, `prefetch.lookup: vec![0.0, 0.0, 0.1]` | Minimal prefetch noise. |
 
 **Note**: prefetch is per-connection. Each new connection starts with cold per-tree miss counters. The cache is shared, so a second connection benefits from pages cached by the first.
 
