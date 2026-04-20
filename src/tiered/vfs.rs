@@ -150,23 +150,23 @@ impl TurboliteVfs {
         let ppg = if manifest.pages_per_group > 0 {
             manifest.pages_per_group
         } else {
-            config.pages_per_group
+            config.cache.pages_per_group
         };
 
         let cache = DiskCache::new_with_compression(
             &config.cache_dir,
-            config.cache_ttl_secs,
+            config.cache.ttl_secs,
             ppg,
-            config.sub_pages_per_frame,
+            config.cache.sub_pages_per_frame,
             page_size,
             manifest.page_count,
-            config.encryption_key,
+            config.encryption.key,
             manifest.group_pages.clone(),
-            config.cache_compression,
-            config.cache_compression_level,
+            config.cache.compression,
+            config.cache.compression_level,
             #[cfg(feature = "zstd")]
-            config.dictionary.clone(),
-            config.mem_cache_budget,
+            config.compression.dictionary.clone(),
+            config.cache.mem_budget,
         )?;
         let manifest_groups = manifest.total_groups() as usize;
         cache.ensure_group_capacity(manifest_groups);
@@ -282,15 +282,15 @@ impl TurboliteVfs {
             None
         } else {
             Some(Arc::new(PrefetchPool::new(
-                config.prefetch_threads,
+                config.prefetch.threads,
                 Arc::clone(&storage),
                 runtime.clone(),
                 Arc::clone(&cache),
                 ppg,
                 Arc::clone(&page_count),
                 #[cfg(feature = "zstd")]
-                config.dictionary.clone(),
-                config.encryption_key,
+                config.compression.dictionary.clone(),
+                config.encryption.key,
                 Arc::clone(&shared_manifest),
             )))
         };
@@ -321,7 +321,7 @@ impl TurboliteVfs {
         let has_loaded = existing.page_count > 0 || existing.version > 0;
         drop(existing);
 
-        match self.config.manifest_source {
+        match self.config.prefetch.manifest_source {
             ManifestSource::Auto => {
                 if has_loaded {
                     let m = (**self.shared_manifest.load()).clone();
@@ -372,13 +372,13 @@ impl TurboliteVfs {
             shared_dirty_groups: Arc::clone(&self.shared_dirty_groups),
             pending_flushes: Arc::clone(&self.pending_flushes),
             flush_lock: Arc::clone(&self.flush_lock),
-            compression_level: self.config.compression_level,
+            compression_level: self.config.compression.level,
             #[cfg(feature = "zstd")]
-            dictionary: self.config.dictionary.clone(),
-            encryption_key: self.config.encryption_key,
-            gc_enabled: self.config.gc_enabled,
-            override_threshold: self.config.override_threshold,
-            compaction_threshold: self.config.compaction_threshold,
+            dictionary: self.config.compression.dictionary.clone(),
+            encryption_key: self.config.encryption.key,
+            gc_enabled: self.config.cache.gc_enabled,
+            override_threshold: self.config.cache.override_threshold,
+            compaction_threshold: self.config.cache.compaction_threshold,
         }
     }
 
@@ -466,13 +466,13 @@ impl TurboliteVfs {
             &self.shared_manifest,
             &self.shared_dirty_groups,
             &self.pending_flushes,
-            self.config.compression_level,
+            self.config.compression.level,
             #[cfg(feature = "zstd")]
-            self.config.dictionary.as_deref(),
-            self.config.encryption_key,
-            self.config.gc_enabled,
-            self.config.override_threshold,
-            self.config.compaction_threshold,
+            self.config.compression.dictionary.as_deref(),
+            self.config.encryption.key,
+            self.config.cache.gc_enabled,
+            self.config.cache.override_threshold,
+            self.config.cache.compaction_threshold,
         )
     }
 
@@ -642,7 +642,7 @@ impl TurboliteVfs {
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
         let sub_ppf = manifest.sub_pages_per_frame;
-        let encryption_key = self.config.encryption_key.as_ref();
+        let encryption_key = self.config.encryption.key.as_ref();
 
         let total_pg = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count();
         let mut processed = 0usize;
@@ -931,7 +931,7 @@ impl Vfs for TurboliteVfs {
             let ppg = if manifest.pages_per_group > 0 {
                 manifest.pages_per_group
             } else {
-                self.config.pages_per_group
+                self.config.cache.pages_per_group
             };
 
             // Validate cache against manifest.
@@ -1027,7 +1027,7 @@ impl Vfs for TurboliteVfs {
             // WAL replication (walrust) is wired elsewhere; the VFS just
             // kicks off the background task when `wal` feature is on.
             #[cfg(feature = "wal")]
-            if self.config.wal_replication {
+            if self.config.wal.replication {
                 let mut wal = self.wal_state.lock().unwrap();
                 if !wal.is_started() {
                     let _ = (db, &mut *wal);
@@ -1053,20 +1053,20 @@ impl Vfs for TurboliteVfs {
                 Arc::clone(&self.staging_seq),
                 lock_path,
                 ppg,
-                self.config.compression_level,
+                self.config.compression.level,
                 self.config.read_only,
                 self.config.sync_mode,
-                self.config.prefetch_search.clone(),
-                self.config.prefetch_lookup.clone(),
+                self.config.prefetch.search.clone(),
+                self.config.prefetch.lookup.clone(),
                 self.prefetch_pool.as_ref().map(Arc::clone),
-                self.config.gc_enabled,
-                self.config.eager_index_load,
+                self.config.cache.gc_enabled,
+                self.config.prefetch.eager_index_load,
                 #[cfg(feature = "zstd")]
-                self.config.dictionary.as_deref(),
-                self.config.encryption_key,
-                self.config.query_plan_prefetch,
-                self.config.max_cache_bytes,
-                self.config.evict_on_checkpoint,
+                self.config.compression.dictionary.as_deref(),
+                self.config.encryption.key,
+                self.config.prefetch.query_plan,
+                self.config.cache.max_bytes,
+                self.config.cache.evict_on_checkpoint,
                 self.is_local,
             )
         } else {
@@ -1078,7 +1078,7 @@ impl Vfs for TurboliteVfs {
                 .write(true)
                 .create(true)
                 .open(&path)?;
-            Ok(TurboliteHandle::new_passthrough(file, path, self.config.encryption_key))
+            Ok(TurboliteHandle::new_passthrough(file, path, self.config.encryption.key))
         }
     }
 

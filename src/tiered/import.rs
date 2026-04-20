@@ -42,7 +42,7 @@ pub fn import_sqlite_file(
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
     let page_size: u32 = if raw_page_size == 1 { 65536 } else { raw_page_size as u32 };
     let page_count = (file_len / page_size as u64) as u64;
-    let ppg = config.pages_per_group;
+    let ppg = config.cache.pages_per_group;
     let total_groups = (page_count + ppg as u64 - 1) / ppg as u64;
 
     eprintln!(
@@ -54,8 +54,8 @@ pub fn import_sqlite_file(
         total_groups,
     );
 
-    let compression_level = config.compression_level;
-    let sub_ppf = config.sub_pages_per_frame;
+    let compression_level = config.compression.level;
+    let sub_ppf = config.cache.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
     // Use SQLite's file change counter as manifest version.
     let version = read_file_change_counter(&header);
@@ -185,7 +185,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
-                config.encryption_key.as_ref(),
+                config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(ft);
@@ -196,7 +196,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
-                config.encryption_key.as_ref(),
+                config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(Vec::new());
@@ -217,7 +217,7 @@ pub fn import_sqlite_file(
                     0,
                     #[cfg(feature = "zstd")]
                     None,
-                    config.encryption_key.as_ref(),
+                    config.encryption.key.as_ref(),
                 ).expect("decode roundtrip failed");
                 assert_eq!(dec_count as usize, page_nums.len(), "gid={} page count mismatch", gid);
                 for (idx, &pnum) in page_nums.iter().enumerate() {
@@ -274,7 +274,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
-            config.encryption_key.as_ref(),
+            config.encryption.key.as_ref(),
         )?;
         let key = keys::interior_chunk_key(chunk_id, version);
         eprintln!(
@@ -310,7 +310,7 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
-            config.encryption_key.as_ref(),
+            config.encryption.key.as_ref(),
         )?;
         let key = keys::index_chunk_key(chunk_id, version);
         eprintln!(

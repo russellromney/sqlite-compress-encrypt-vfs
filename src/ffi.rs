@@ -115,7 +115,10 @@ pub extern "C" fn turbolite_register_local(
 
     let config = crate::tiered::TurboliteConfig {
         cache_dir: std::path::PathBuf::from(cache_dir),
-        compression_level,
+        compression: crate::tiered::CompressionConfig {
+            level: compression_level,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

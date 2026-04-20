@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
-use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{CacheConfig, CompressionConfig, PrefetchConfig, TurboliteSharedState, TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -195,10 +195,13 @@ fn endpoint_url() -> Option<String> {
 fn make_config(_prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        gc_enabled: true,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: cli.ppg,
+            gc_enabled: true,
+            ..Default::default()
+        },
+        prefetch: PrefetchConfig { threads: cli.prefetch_threads, ..Default::default() },
         ..Default::default()
     }
 }
@@ -206,10 +209,10 @@ fn make_config(_prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> Turboli
 fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path, cli: &Cli) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
+        compression: CompressionConfig { level: 1, ..Default::default() },
         read_only: true,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
+        cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+        prefetch: PrefetchConfig { threads: cli.prefetch_threads, ..Default::default() },
         ..Default::default()
     }
 }
@@ -1032,10 +1035,13 @@ fn scenario_merge_write(cli: &Cli) {
     // Use default config but override ppg/page_size from manifest (manifest takes precedence)
     let config = TurboliteConfig {
         cache_dir: cache_dir.path().to_path_buf(),
-        compression_level: 1,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        gc_enabled: true,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: cli.ppg,
+            gc_enabled: true,
+            ..Default::default()
+        },
+        prefetch: PrefetchConfig { threads: cli.prefetch_threads, ..Default::default() },
         ..Default::default()
     };
     let runtime = bench_runtime();
@@ -1165,10 +1171,13 @@ fn scenario_arctic_write(cli: &Cli) {
     let cache_dir = TempDir::new().expect("cache dir");
     let config = TurboliteConfig {
         cache_dir: cache_dir.path().to_path_buf(),
-        compression_level: 1,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        gc_enabled: true,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: cli.ppg,
+            gc_enabled: true,
+            ..Default::default()
+        },
+        prefetch: PrefetchConfig { threads: cli.prefetch_threads, ..Default::default() },
         ..Default::default()
     };
     let runtime = bench_runtime();
@@ -1279,10 +1288,13 @@ fn scenario_two_phase(cli: &Cli) {
     let cache_dir = TempDir::new().expect("cache dir");
     let config = TurboliteConfig {
         cache_dir: cache_dir.path().to_path_buf(),
-        compression_level: 1,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        gc_enabled: true,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig {
+            pages_per_group: cli.ppg,
+            gc_enabled: true,
+            ..Default::default()
+        },
+        prefetch: PrefetchConfig { threads: cli.prefetch_threads, ..Default::default() },
         ..Default::default()
     };
     let runtime = bench_runtime();

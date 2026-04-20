@@ -4,7 +4,7 @@
 
 /// Re-encrypt, encrypt, or decrypt all backend data.
 ///
-/// Three modes based on `config.encryption_key` (old) and `new_key`:
+/// Three modes based on `config.encryption.key` (old) and `new_key`:
 /// - `Some(old), Some(new)`: key rotation (decrypt with old, re-encrypt with new)
 /// - `Some(old), None`: remove encryption (decrypt, store plaintext compressed data)
 /// - `None, Some(new)`: add encryption (encrypt previously plaintext data)
@@ -30,7 +30,7 @@ pub fn rotate_encryption_key(
     use super::storage as storage_helpers;
     let backend_ref = backend.as_ref();
     let runtime_ref = &runtime;
-    let old_key = config.encryption_key;
+    let old_key = config.encryption.key;
 
     if old_key.is_none() && new_key.is_none() {
         return Err(io::Error::new(

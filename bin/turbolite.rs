@@ -715,11 +715,11 @@ fn build_with_prefetch_threads(
     read_only: bool,
     prefetch_threads: u32,
 ) -> Result<(turbolite::tiered::TurboliteVfs, RuntimeGuard)> {
-    use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+    use turbolite::tiered::{PrefetchConfig, TurboliteConfig, TurboliteVfs};
     let config = TurboliteConfig {
         cache_dir,
         read_only,
-        prefetch_threads,
+        prefetch: PrefetchConfig { threads: prefetch_threads, ..Default::default() },
         ..Default::default()
     };
     match bucket {
@@ -881,12 +881,12 @@ fn cmd_import(
     pages_per_group: u32,
     compression_level: i32,
 ) -> Result<()> {
-    use turbolite::tiered::TurboliteConfig;
+    use turbolite::tiered::{CacheConfig, CompressionConfig, TurboliteConfig};
 
     let prefix_str = prefix.unwrap_or_default();
     let config = TurboliteConfig {
-        pages_per_group,
-        compression_level,
+        cache: CacheConfig { pages_per_group, ..Default::default() },
+        compression: CompressionConfig { level: compression_level, ..Default::default() },
         ..Default::default()
     };
 

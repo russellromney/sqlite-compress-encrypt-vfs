@@ -65,8 +65,7 @@ fn test_local_vfs_with_compression() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache_compression: true,
-            cache_compression_level: 3,
+            cache: CacheConfig { compression: true, compression_level: 3, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_cmp_{}", std::process::id());
@@ -85,8 +84,7 @@ fn test_local_vfs_with_compression() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache_compression: true,
-            cache_compression_level: 3,
+            cache: CacheConfig { compression: true, compression_level: 3, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_cmp2_{}", std::process::id());
@@ -378,8 +376,9 @@ fn test_local_vfs_override_write_cold_read() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100, // high threshold: everything goes to override path
-            compaction_threshold: 0, // disable auto-compact
+            // high threshold: everything goes to override path
+            // disable auto-compact
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_w_{}", id);
@@ -398,8 +397,7 @@ fn test_local_vfs_override_write_cold_read() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_r_{}", id);
@@ -428,8 +426,7 @@ fn test_local_vfs_override_then_full_rewrite() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr1_{}", id);
@@ -448,8 +445,8 @@ fn test_local_vfs_override_then_full_rewrite() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 0, // back to default, full rewrite
-            compaction_threshold: 0,
+            // back to default, full rewrite
+            cache: CacheConfig { override_threshold: 0, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_ovr_fr2_{}", id);
@@ -494,8 +491,8 @@ fn test_local_vfs_override_compaction() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 2, // compact after 2 overrides
+            // compact after 2 overrides
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 2, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("local_cmpct1_{}", id);
@@ -969,7 +966,8 @@ fn test_stress_large_database_10k_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group: 4, // small groups to exercise many page groups
+            // small groups to exercise many page groups
+            cache: CacheConfig { pages_per_group: 4, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_{}", std::process::id());
@@ -1008,7 +1006,7 @@ fn test_stress_large_database_10k_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group: 4,
+            cache: CacheConfig { pages_per_group: 4, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("stress_10k_r_{}", std::process::id());
@@ -1060,8 +1058,8 @@ fn test_stress_many_overrides_compaction() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 5, // compact after 5 overrides
+            // compact after 5 overrides
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 5, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_w_{}", id);
@@ -1105,8 +1103,7 @@ fn test_stress_many_overrides_compaction() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 5,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 5, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("stress_ovr_cmpct_r_{}", id);
@@ -1150,10 +1147,8 @@ fn test_override_with_compression_roundtrip() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache_compression: true,
-            cache_compression_level: 3,
-            override_threshold: 100,
-            compaction_threshold: 0, // disable compaction to keep overrides visible
+            // disable compaction to keep overrides visible
+            cache: CacheConfig { compression: true, compression_level: 3, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_w_{}", id);
@@ -1197,10 +1192,7 @@ fn test_override_with_compression_roundtrip() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            cache_compression: true,
-            cache_compression_level: 3,
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { compression: true, compression_level: 3, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("ovr_cmp_r_{}", id);
@@ -1240,8 +1232,7 @@ fn test_stress_rapid_checkpoint_cycles() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 10,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 10, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("stress_rapid_{}", std::process::id());
@@ -1421,7 +1412,7 @@ fn test_edge_group_boundary_pages() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group,
+            cache: CacheConfig { pages_per_group, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_w_{}", std::process::id());
@@ -1465,7 +1456,7 @@ fn test_edge_group_boundary_pages() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group,
+            cache: CacheConfig { pages_per_group, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_grpbnd_r_{}", std::process::id());
@@ -1509,10 +1500,14 @@ fn test_edge_override_at_frame_boundary() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group: 8, // 8 pages per group
-            sub_pages_per_frame: 4, // 2 frames per group
-            override_threshold: 100,
-            compaction_threshold: 0,
+            // 8 pages per group; 2 frames per group
+            cache: CacheConfig {
+                pages_per_group: 8,
+                sub_pages_per_frame: 4,
+                override_threshold: 100,
+                compaction_threshold: 0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_frame_w_{}", id);
@@ -1560,10 +1555,7 @@ fn test_edge_override_at_frame_boundary() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            pages_per_group: 8,
-            sub_pages_per_frame: 4,
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { pages_per_group: 8, sub_pages_per_frame: 4, override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_frame_r_{}", id);
@@ -1600,7 +1592,7 @@ fn test_rollback_multi_group_dirty_pages() {
 
     let config = TurboliteConfig {
         cache_dir: dir.path().to_path_buf(),
-        pages_per_group: 4,
+        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
         ..Default::default()
     };
     let vfs_name = format!("edge_rollback_mg_{}", std::process::id());
@@ -1672,8 +1664,7 @@ fn test_override_then_delete_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_w_{}", id);
@@ -1711,8 +1702,7 @@ fn test_override_then_delete_rows() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_ovr_del_r_{}", id);
@@ -1756,8 +1746,8 @@ fn test_compaction_threshold_one() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 1, // compact after every single override
+            // compact after every single override
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 1, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_w_{}", id);
@@ -1799,8 +1789,7 @@ fn test_compaction_threshold_one() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 1,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 1, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("edge_cmpct1_r_{}", id);
@@ -1846,8 +1835,7 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s1_{}", id);
@@ -1873,8 +1861,7 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s2_{}", id);
@@ -1892,8 +1879,7 @@ fn test_cache_validation_override_changes_between_sessions() {
     {
         let config = TurboliteConfig {
             cache_dir: dir.path().to_path_buf(),
-            override_threshold: 100,
-            compaction_threshold: 0,
+            cache: CacheConfig { override_threshold: 100, compaction_threshold: 0, ..Default::default() },
             ..Default::default()
         };
         let vfs_name = format!("cv_ovr_s3_{}", id);

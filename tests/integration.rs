@@ -1,7 +1,7 @@
 //! Integration tests using the VFS with SQLite
 
 use rusqlite::Connection;
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
+use turbolite::tiered::{CompressionConfig, TurboliteVfs, TurboliteConfig};
 
 #[test]
 fn test_basic_operations() {
@@ -187,7 +187,7 @@ fn test_passthrough_mode() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
         cache_dir: dir.path().into(),
-        compression_level: 0,
+        compression: CompressionConfig { level: 0, ..Default::default() },
         ..Default::default()
     };
     let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");

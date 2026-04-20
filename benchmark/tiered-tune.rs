@@ -17,7 +17,8 @@ use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{
     TurboliteSharedState, TurboliteConfig, TurboliteVfs,
-    parse_eqp_output, push_planned_accesses, push_setting,
+    CacheConfig, CompressionConfig, PrefetchConfig,
+    parse_eqp_output, push_planned_accesses,
 };
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -151,17 +152,13 @@ impl SchedulePair {
         Self { search: None, lookup: None }
     }
 
-    fn push(&self) {
-        let zeros = "0,0,0,0,0,0,0,0,0,0".to_string();
-        let search_str = self.search.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or_else(|| zeros.clone());
-        let lookup_str = self.lookup.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or(zeros);
-        push_setting("prefetch_search".to_string(), search_str);
-        push_setting("prefetch_lookup".to_string(), lookup_str);
-    }
+    /// No-op after Phase Cirrus a: prefetch schedules are now set at VFS-open
+    /// time via TurboliteConfig.prefetch.search / prefetch.lookup. The old
+    /// process-global SETTINGS_QUEUE was deleted. Kept for call-site shape;
+    /// tiered-tune's per-pair sweep currently runs every pair with the
+    /// open-time schedule. Reworking the sweep to re-open the VFS per pair
+    /// is a follow-up.
+    fn push(&self) {}
 
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {
@@ -494,11 +491,14 @@ fn main() {
     let vfs_name = unique_vfs_name();
     let config = TurboliteConfig {
         cache_dir: cache_dir.path().to_path_buf(),
-        compression_level: 1,
+        compression: CompressionConfig { level: 1, ..Default::default() },
         read_only: true,
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        query_plan_prefetch: cli.plan_aware,
+        cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: cli.prefetch_threads,
+            query_plan: cli.plan_aware,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

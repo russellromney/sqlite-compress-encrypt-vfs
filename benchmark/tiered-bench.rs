@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
+use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, CacheConfig, CompressionConfig, PrefetchConfig, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -425,11 +425,14 @@ fn make_config(
 ) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
-        pages_per_group: ppg,
-        prefetch_threads,
-        prefetch_search,
-        prefetch_lookup,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: prefetch_threads,
+            search: prefetch_search,
+            lookup: prefetch_lookup,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -444,12 +447,15 @@ fn make_reader_config(
 ) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
+        compression: CompressionConfig { level: 1, ..Default::default() },
         read_only: true,
-        pages_per_group: ppg,
-        prefetch_threads,
-        prefetch_search,
-        prefetch_lookup,
+        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: prefetch_threads,
+            search: prefetch_search,
+            lookup: prefetch_lookup,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -808,17 +814,13 @@ impl SchedulePair {
         Self { search, lookup }
     }
 
-    fn push(&self) {
-        let zeros = "0,0,0,0,0,0,0,0,0,0".to_string();
-        let search_str = self.search.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or_else(|| zeros.clone());
-        let lookup_str = self.lookup.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or(zeros);
-        push_setting("prefetch_search".to_string(), search_str);
-        push_setting("prefetch_lookup".to_string(), lookup_str);
-    }
+    /// No-op after Phase Cirrus a: prefetch schedules are now set at VFS-open
+    /// time via TurboliteConfig.prefetch.search / prefetch.lookup. The old
+    /// process-global SETTINGS_QUEUE was deleted. Kept for call-site shape;
+    /// tiered-bench's per-query schedule sweep currently runs all pairs with
+    /// the open-time schedule. Reworking the sweep to re-open the VFS per
+    /// pair is a follow-up.
+    fn push(&self) {}
 
     fn label(&self) -> String {
         let fmt = |s: &Option<Vec<f32>>| -> String {
@@ -1223,8 +1225,8 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
             let import_start = Instant::now();
             let config = turbolite::tiered::TurboliteConfig {
-                pages_per_group: cli.ppg,
-                compression_level: 1,
+                cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+                compression: CompressionConfig { level: 1, ..Default::default() },
                 ..Default::default()
             };
             let import_backend = build_s3_backend(&rt_handle, &s3_prefix);
@@ -1301,7 +1303,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     let reader_cache = TempDir::new().expect("reader temp dir");
     let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
     if std::env::var("BENCH_NO_EAGER_INDEX").is_ok() {
-        reader_config.eager_index_load = false;
+        reader_config.prefetch.eager_index_load = false;
         eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
     }
     eprintln!("[bench] calling TurboliteVfs::new_with_storage()...");
@@ -1580,7 +1582,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         let cleanup_cache = TempDir::new().expect("cleanup temp dir");
         let cleanup_config = TurboliteConfig {
             cache_dir: cleanup_cache.path().to_path_buf(),
-            compression_level: 1,
+            compression: CompressionConfig { level: 1, ..Default::default() },
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);

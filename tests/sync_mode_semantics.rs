@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
 use turbolite::tiered::{
-    SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs,
+    CacheConfig, CompressionConfig, SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs,
 };
 
 const SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);";
@@ -55,8 +55,8 @@ fn build_vfs_with_mode(
     let cfg = TurboliteConfig {
         cache_dir: dir.to_path_buf(),
         sync_mode,
-        compression_level: 1,
-        pages_per_group: 4,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
         ..Default::default()
     };
 

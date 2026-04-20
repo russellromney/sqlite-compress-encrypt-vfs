@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{CompressionConfig, TurboliteConfig, TurboliteVfs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -132,7 +132,7 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path) -> (TurboliteConfig, S
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
     let config = TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 3,
+        compression: CompressionConfig { level: 3, ..Default::default() },
         ..Default::default()
     };
     (config, unique_prefix)
@@ -141,7 +141,7 @@ fn make_config(prefix: &str, cache_dir: &std::path::Path) -> (TurboliteConfig, S
 fn make_reader_config(_prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     TurboliteConfig {
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 3,
+        compression: CompressionConfig { level: 3, ..Default::default() },
         read_only: true,
         ..Default::default()
     }
@@ -716,7 +716,7 @@ fn main() {
         let cleanup_cache = TempDir::new().unwrap();
         let cleanup_config = TurboliteConfig {
             cache_dir: cleanup_cache.path().to_path_buf(),
-            compression_level: 3,
+            compression: CompressionConfig { level: 3, ..Default::default() },
             ..Default::default()
         };
         let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
