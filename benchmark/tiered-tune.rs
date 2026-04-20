@@ -152,12 +152,12 @@ impl SchedulePair {
         Self { search: None, lookup: None }
     }
 
-    /// No-op after Phase Cirrus a: prefetch schedules are now set at VFS-open
-    /// time via TurboliteConfig.prefetch.search / prefetch.lookup. The old
-    /// process-global SETTINGS_QUEUE was deleted. Kept for call-site shape;
-    /// tiered-tune's per-pair sweep currently runs every pair with the
-    /// open-time schedule. Reworking the sweep to re-open the VFS per pair
-    /// is a follow-up.
+    /// Deprecated since Phase Cirrus a (SETTINGS_QUEUE deleted). Kept as a
+    /// no-op for backward call-site shape. Prefetch schedules are now set
+    /// at VFS-open time via `TurboliteConfig.prefetch.search` /
+    /// `prefetch.lookup`, and the sweep below builds a fresh VFS per pair
+    /// so each measurement actually reflects that pair's schedule.
+    #[allow(dead_code)]
     fn push(&self) {}
 
     fn label(&self) -> String {
@@ -290,9 +290,9 @@ fn run_query_pair(
     sql: &str,
     params: &[rusqlite::types::Value],
     plan_aware: bool,
-    pair: &SchedulePair,
+    _pair: &SchedulePair,
 ) -> Result<usize, rusqlite::Error> {
-    pair.push();
+    // Pair schedule is now baked into the VFS at open time; nothing to push.
     if plan_aware {
         push_query_plan(conn, sql, params);
     }
@@ -486,44 +486,59 @@ fn main() {
     println!("Total runs:   {}", total_runs);
     println!();
 
-    // Register VFS
-    let cache_dir = TempDir::new().expect("failed to create temp dir");
-    let vfs_name = unique_vfs_name();
-    let config = TurboliteConfig {
-        cache_dir: cache_dir.path().to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
-        read_only: true,
-        cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
-        prefetch: PrefetchConfig {
-            threads: cli.prefetch_threads,
-            query_plan: cli.plan_aware,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
     let owned_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("build bench runtime");
     let rt_handle = owned_runtime.handle().clone();
-    let s3 = build_s3_backend(&rt_handle, &cli.prefix);
-    let vfs = TurboliteVfs::with_backend(
-        config,
-        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
-        rt_handle.clone(),
-    ).expect("failed to create VFS");
-    let shared_state = vfs.shared_state();
-    let handle = BenchCtx::new(&shared_state, s3.clone());
-    turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
+
+    // Build a fresh VFS per schedule pair. Phase Cirrus a deleted the
+    // SETTINGS_QUEUE runtime-push primitive that the old sweep relied on,
+    // so the only honest way to measure a pair is to construct a
+    // TurboliteConfig with that pair's `prefetch.search` / `prefetch.lookup`
+    // and reopen. Fresh TempDir per pair keeps cache state from bleeding
+    // between measurements.
+    struct PairVfs {
+        name: String,
+        handle: BenchCtx,
+        _cache_dir: TempDir,
+    }
+    let pair_infra: Vec<PairVfs> = pairs.iter().map(|pair| {
+        let cache_dir = TempDir::new().expect("failed to create pair temp dir");
+        let config = TurboliteConfig {
+            cache_dir: cache_dir.path().to_path_buf(),
+            compression: CompressionConfig { level: 1, ..Default::default() },
+            read_only: true,
+            cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+            prefetch: PrefetchConfig {
+                threads: cli.prefetch_threads,
+                query_plan: cli.plan_aware,
+                search: pair.search.clone().unwrap_or_default(),
+                lookup: pair.lookup.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let s3 = build_s3_backend(&rt_handle, &cli.prefix);
+        let vfs = TurboliteVfs::with_backend(
+            config,
+            s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+            rt_handle.clone(),
+        ).expect("failed to create pair VFS");
+        let shared_state = vfs.shared_state();
+        let handle = BenchCtx::new(&shared_state, s3.clone());
+        let name = unique_vfs_name();
+        turbolite::tiered::register(&name, vfs).expect("failed to register pair VFS");
+        PairVfs { name, handle, _cache_dir: cache_dir }
+    }).collect();
 
     let db_name = "tune.db";
 
-    // Verify connection works
+    // Verify connection works (use first pair's VFS — any pair sees the same DB).
     {
         let conn = Connection::open_with_flags_and_vfs(
-            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &vfs_name,
+            db_name, OpenFlags::SQLITE_OPEN_READ_ONLY, &pair_infra[0].name,
         ).expect("failed to open database");
         let page_count: i64 = conn
             .query_row("PRAGMA page_count", [], |row| row.get(0))

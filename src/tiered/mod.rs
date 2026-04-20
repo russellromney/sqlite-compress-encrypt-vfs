@@ -85,7 +85,7 @@ mod wal_replication;
 
 // Public API (visible outside the crate)
 pub use bench::TurboliteSharedState;
-pub use config::{GroupState, GroupingStrategy, ManifestSource, SyncMode, TurboliteConfig, PageLocation, BTreeManifestEntry};
+pub use config::{GroupState, GroupingStrategy, ManifestSource, TurboliteConfig, PageLocation, BTreeManifestEntry};
 pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
 #[cfg(feature = "wal")]
 pub use config::WalConfig;
@@ -372,8 +372,8 @@ pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Er
 ///    18-19 = 0x01,0x01), which breaks out of WAL mode. The caller should then
 ///    close and reopen with `PRAGMA journal_mode=OFF`.
 ///
-/// After migration, close the connection and reopen with SyncMode::S3Primary
-/// and `PRAGMA journal_mode=OFF`.
+/// After migration, close the connection and reopen with
+/// `PRAGMA journal_mode=OFF`.
 pub fn turbolite_migrate_to_s3_primary(conn: &rusqlite::Connection) -> Result<(), io::Error> {
     // Check current journal_mode
     let current_mode: String = conn

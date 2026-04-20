@@ -86,20 +86,6 @@ fn test_deserialize_max_cache_bytes() {
 }
 
 #[test]
-fn test_deserialize_sync_mode_durable() {
-    let json = r#"{ "sync_mode": "Durable" }"#;
-    let c: TurboliteConfig = serde_json::from_str(json).expect("sync mode");
-    assert_eq!(c.sync_mode, SyncMode::Durable);
-}
-
-#[test]
-fn test_deserialize_sync_mode_local_then_flush() {
-    let json = r#"{ "sync_mode": "LocalThenFlush" }"#;
-    let c: TurboliteConfig = serde_json::from_str(json).expect("sync mode ltf");
-    assert_eq!(c.sync_mode, SyncMode::LocalThenFlush);
-}
-
-#[test]
 fn test_deserialize_manifest_source_remote() {
     let json = r#"{ "prefetch": { "manifest_source": "Remote" } }"#;
     let c: TurboliteConfig = serde_json::from_str(json).expect("manifest source");

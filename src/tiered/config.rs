@@ -19,41 +19,6 @@ impl Default for ManifestSource {
     }
 }
 
-// ===== Sync mode =====
-
-/// Controls whether checkpoint uploads synchronously (blocking) or defers to flush_to_storage().
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncMode {
-    /// Default. `sync()` uploads dirty pages to the backend during checkpoint.
-    /// The SQLite EXCLUSIVE lock is held for the entire upload duration.
-    /// Full remote durability on every checkpoint.
-    Durable,
-    /// `sync()` writes to local disk cache only; dirty groups are recorded for
-    /// later upload via `flush_to_storage()`. The EXCLUSIVE lock is held for ~1ms.
-    ///
-    /// Between checkpoint and flush, data exists only in local disk cache:
-    /// - Process crash: data survives (on local disk)
-    /// - Machine loss: data lost (not yet pushed to remote)
-    ///
-    /// Call `flush_to_storage()` (on TurboliteVfs or TurboliteSharedState) to upload.
-    LocalThenFlush,
-    /// Remote is the database. Local disk is disposable cache. Every `xSync()`
-    /// uploads dirty frames as subframe overrides and publishes the manifest.
-    /// The manifest publish is the atomic commit.
-    ///
-    /// Requires `journal_mode=OFF` or `MEMORY` (no WAL, no rollback journal).
-    /// Per-commit cost: ~256KB per dirty frame + manifest publish (~2-50ms).
-    /// Best for ephemeral compute (Lambda, scale-to-zero) where local disk is
-    /// not durable but the backend is.
-    RemotePrimary,
-}
-
-impl Default for SyncMode {
-    fn default() -> Self {
-        SyncMode::Durable
-    }
-}
-
 // ===== Grouping strategy =====
 
 /// Grouping strategy marker. Only BTreeAware is supported.
@@ -328,9 +293,6 @@ pub struct TurboliteConfig {
     pub cache_dir: PathBuf,
     /// Open in read-only mode (no writes, no WAL)
     pub read_only: bool,
-    /// Checkpoint sync mode. Default: Durable (upload on every checkpoint).
-    /// Local mode is always LocalThenFlush (this field is overridden).
-    pub sync_mode: SyncMode,
 
     /// Cache and durability-eviction knobs.
     pub cache: CacheConfig,
@@ -350,7 +312,6 @@ impl Default for TurboliteConfig {
         Self {
             cache_dir: PathBuf::from("/tmp/turbolite-cache"),
             read_only: false,
-            sync_mode: SyncMode::default(),
             cache: CacheConfig::default(),
             compression: CompressionConfig::default(),
             encryption: EncryptionConfig::default(),
@@ -374,7 +335,6 @@ impl TurboliteConfig {
             read_only: std::env::var("TURBOLITE_READ_ONLY")
                 .map(|v| matches!(v.as_str(), "true" | "1"))
                 .unwrap_or(false),
-            sync_mode: SyncMode::default(),
             cache: CacheConfig::from_env(),
             compression: CompressionConfig::from_env(),
             encryption: EncryptionConfig::default(),

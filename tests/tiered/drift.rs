@@ -5,7 +5,7 @@
 //! manifest during import. Tests use import_sqlite_file to bootstrap data in seekable format,
 //! then LocalThenFlush + flush_to_s3 to exercise the override path.
 
-use turbolite::tiered::{import_sqlite_file, ManifestSource, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{import_sqlite_file, ManifestSource, TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -14,7 +14,6 @@ use super::helpers::*;
 /// Config for override tests: seekable format, low override threshold, LocalThenFlush.
 fn drift_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut c = test_config(test_name, cache_dir);
-    c.sync_mode = SyncMode::LocalThenFlush;
     c.sub_pages_per_frame = 8; // enable seekable format (required for overrides)
     c.override_threshold = 100; // low threshold so small updates produce overrides
     c.compaction_threshold = 8;
@@ -131,7 +130,6 @@ fn drift_sanity_import_write_cold_read() {
 
     // Use Durable mode for sanity check (the btree_grouping tests use Durable and work)
     let mut durable_config = drift_config("drift_sanity", cache_dir.path());
-    durable_config.sync_mode = SyncMode::Durable;
     durable_config.bucket = config.bucket.clone();
     durable_config.prefix = config.prefix.clone();
     durable_config.cache_dir = config.cache_dir.clone();
@@ -383,8 +381,7 @@ fn drift_override_compaction_and_cold_read() {
 #[test]
 fn drift_two_writer_cache_validation() {
     let cache1 = TempDir::new().expect("cache1 dir");
-    let mut config1 = drift_config("drift_2w", cache1.path());
-    config1.sync_mode = SyncMode::Durable; // Durable for straightforward writes
+    let config1 = drift_config("drift_2w", cache1.path());
     let bucket = config1.bucket.clone();
     let prefix = config1.prefix.clone();
     let endpoint = config1.endpoint_url.clone();

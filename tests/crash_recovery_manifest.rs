@@ -12,7 +12,7 @@ use hadb_storage::StorageBackend;
 use hadb_storage_mem::MemStorage;
 use tempfile::TempDir;
 use turbolite::tiered::{
-    register_shared, CacheConfig, CompressionConfig, SharedTurboliteVfs, SyncMode, TurboliteConfig, TurboliteVfs,
+    register_shared, CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
 };
 
 fn unique_vfs_name(label: &str) -> String {
@@ -38,7 +38,6 @@ fn build_remote_vfs(
     let backend: Arc<dyn StorageBackend> = mem.clone();
     let cfg = TurboliteConfig {
         cache_dir: dir.to_path_buf(),
-        sync_mode: SyncMode::LocalThenFlush,
         compression: CompressionConfig { level: 1, ..Default::default() },
         cache: CacheConfig { pages_per_group: 4, ..Default::default() },
         ..Default::default()

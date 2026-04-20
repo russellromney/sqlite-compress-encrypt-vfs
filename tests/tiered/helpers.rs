@@ -127,12 +127,8 @@ impl TestMode {
                 // Local mode: no S3 fields needed, test_config already sets them
                 // but we override to local-only by clearing bucket
             }
-            StorageTier::S3Durable => {
-                // Default sync_mode is Durable, no change needed
-            }
-            StorageTier::S3LocalThenFlush => {
-                config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
-            }
+            StorageTier::S3Durable => {}
+            StorageTier::S3LocalThenFlush => {}
         }
     }
 

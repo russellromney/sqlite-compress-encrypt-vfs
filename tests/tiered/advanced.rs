@@ -668,7 +668,6 @@ fn test_evict_tree_skips_pending_flush_groups() {
     // Step 2: Import via import_sqlite_file (builds BTreeAware manifest with tree_name_to_groups)
     let mut config = test_config("evict_tree_pending", cache_dir.path());
     config.pages_per_group = 8;
-    config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();

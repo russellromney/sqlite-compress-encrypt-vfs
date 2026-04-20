@@ -2,7 +2,7 @@
 //! Tests that manifest is persisted locally, survives reconnection,
 //! and dirty groups are recovered after simulated crash.
 
-use turbolite::tiered::{SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -119,7 +119,6 @@ fn test_warm_reconnect_skips_s3() {
 fn test_dirty_groups_recovered_from_local_manifest() {
     let cache_dir = TempDir::new().unwrap();
     let mut config = test_config("dirty_recovery", cache_dir.path());
-    config.sync_mode = SyncMode::LocalThenFlush;
     let vfs_name = unique_vfs_name("dirty_recovery");
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
@@ -129,7 +128,6 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     {
         let mut cfg1 = test_config("dirty_recovery_placeholder", cache_dir.path());
         cfg1.prefix = prefix.clone();
-        cfg1.sync_mode = SyncMode::LocalThenFlush;
         let vfs = TurboliteVfs::new_local(cfg1).expect("TurboliteVfs");
         let state = vfs.shared_state();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -173,7 +171,6 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     let vfs_name2 = unique_vfs_name("dirty_recovery2");
     let mut cfg2 = test_config("dirty_recovery_placeholder2", cache_dir.path());
     cfg2.prefix = prefix.clone();
-    cfg2.sync_mode = SyncMode::LocalThenFlush;
     let vfs2 = TurboliteVfs::new_local(cfg2).expect("TurboliteVfs after restart");
     let state2 = vfs2.shared_state();
     turbolite::tiered::register(&vfs_name2, vfs2).unwrap();

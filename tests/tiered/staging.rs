@@ -3,7 +3,7 @@
 //! Comprehensive stress tests proving staging logs guarantee flush uploads
 //! exactly the state from the checkpoint under realistic and adversarial conditions.
 
-use turbolite::tiered::{ManifestSource, SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{ManifestSource, TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -101,9 +101,7 @@ fn update_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 
 /// Helper: create LocalThenFlush config.
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
-    let mut c = test_config(test_name, cache_dir);
-    c.sync_mode = SyncMode::LocalThenFlush;
-    c
+    test_config(test_name, cache_dir)
 }
 
 /// Helper: create a new TurboliteConfig with same bucket/prefix/endpoint but fresh cache_dir.
@@ -112,7 +110,6 @@ fn config_with_same_s3(
     prefix: &str,
     endpoint: &Option<String>,
     cache_dir: &std::path::Path,
-    sync_mode: SyncMode,
 ) -> TurboliteConfig {
     TurboliteConfig {
         bucket: bucket.to_string(),
@@ -120,7 +117,6 @@ fn config_with_same_s3(
         cache_dir: cache_dir.to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        sync_mode,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     }
 }
@@ -424,7 +420,7 @@ fn staging_crash_recover_then_continue() {
 
     // Phase 1: write + checkpoint, then crash
     {
-        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
         let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_cont_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -435,7 +431,7 @@ fn staging_crash_recover_then_continue() {
     }
 
     // Phase 2: reopen, write more, checkpoint, flush
-    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush(), "should recover staging from phase 1");
@@ -470,7 +466,7 @@ fn staging_crash_two_checkpoints() {
     let (bucket, prefix, endpoint) = (base.bucket.clone(), base.prefix.clone(), base.endpoint_url.clone());
 
     {
-        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
         let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_two_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -485,7 +481,7 @@ fn staging_crash_two_checkpoints() {
     assert!(staging_log_count(cache_dir.path()) >= 2, "both staging logs should survive crash");
 
     // Recover and verify from local cache, then flush
-    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush());
@@ -511,7 +507,7 @@ fn staging_crash_double() {
 
     // Phase 1: write two batches with two checkpoints, then "crash" (drop without flush)
     {
-        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+        let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
         let vfs = TurboliteVfs::new_local(config).unwrap();
         let vfs_name = unique_vfs_name("crash_dbl_1");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -526,7 +522,7 @@ fn staging_crash_double() {
     assert!(staging_log_count(cache_dir.path()) >= 2, "both staging logs should survive crash");
 
     // Phase 2: recover all staging logs, flush, verify
-    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path(), SyncMode::LocalThenFlush);
+    let config = config_with_same_s3(&bucket, &prefix, &endpoint, cache_dir.path());
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(shared.has_pending_flush(), "should recover staging logs");
@@ -690,7 +686,6 @@ fn staging_follower_no_staging_files() {
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
-        sync_mode: SyncMode::LocalThenFlush,
         runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
     };
     let follower_vfs_name = unique_vfs_name("follower_nolog_r");
@@ -715,7 +710,6 @@ fn staging_follower_no_staging_files() {
 fn staging_durable_overwrite_no_staging() {
     let cache_dir = TempDir::new().unwrap();
     let mut config = test_config("durable_ow", cache_dir.path());
-    config.sync_mode = SyncMode::Durable;
     let (bucket, prefix, endpoint) = (config.bucket.clone(), config.prefix.clone(), config.endpoint_url.clone());
 
     let vfs = TurboliteVfs::new_local(config).unwrap();

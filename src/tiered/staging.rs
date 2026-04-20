@@ -1,9 +1,10 @@
-//! Append-only staging log for two-phase checkpoint.
+//! Append-only staging log for two-phase checkpoint (legacy recovery path).
 //!
-//! When `SyncMode::LocalThenFlush`, dirty pages are written to a staging log
-//! during `write_all_at()` (alongside the normal disk cache write). The staging
-//! log captures exact page contents at checkpoint time, immune to overwrite by
-//! subsequent checkpoints.
+//! turbolite is now always synchronous ("Durable"): checkpoints upload dirty
+//! pages to the backend inline. The staging-log writer is no longer invoked
+//! during writes, but the format + recovery reader are kept so a cache
+//! directory written by an older turbolite (with deferred flush) can still
+//! be recovered cleanly on reopen.
 //!
 //! Format: 4-byte header + fixed-size records:
 //! ```text

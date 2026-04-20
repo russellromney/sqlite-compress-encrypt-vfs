@@ -4,7 +4,7 @@
 //! Kursk stress testing. Tests are written to FAIL against the current code,
 //! then fixed one by one.
 
-use turbolite::tiered::{SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
@@ -40,9 +40,7 @@ fn insert_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 }
 
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
-    let mut c = test_config(test_name, cache_dir);
-    c.sync_mode = SyncMode::LocalThenFlush;
-    c
+    test_config(test_name, cache_dir)
 }
 
 fn cold_reader(

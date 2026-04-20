@@ -44,8 +44,6 @@ pub struct TurboliteHandle {
     pages_per_group: u32,
     compression_level: i32,
     read_only: bool,
-    /// Per-VFS sync mode (Durable = upload in sync, LocalThenFlush = defer to flush_to_storage)
-    sync_mode: SyncMode,
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
     tree_miss_counts: HashMap<String, u8>,
@@ -145,7 +143,6 @@ impl TurboliteHandle {
         pages_per_group: u32,
         compression_level: i32,
         read_only: bool,
-        sync_mode: SyncMode,
         prefetch_search: Vec<f32>,
         prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
@@ -268,7 +265,6 @@ impl TurboliteHandle {
             pages_per_group,
             compression_level,
             read_only,
-            sync_mode,
             tree_miss_counts: HashMap::new(),
             prefetch_search,
             prefetch_lookup,
@@ -317,7 +313,6 @@ impl TurboliteHandle {
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             compression_level: 0,
             read_only: false,
-            sync_mode: SyncMode::Durable,
             tree_miss_counts: HashMap::new(),
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
@@ -1420,22 +1415,6 @@ impl DatabaseHandle for TurboliteHandle {
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
 
-        // Append to staging log for LocalThenFlush mode.
-        // Captures exact page contents at write time, immune to overwrite
-        // by subsequent checkpoints.
-        if self.sync_mode == SyncMode::LocalThenFlush {
-            let ps = self.page_size.load(Ordering::Relaxed);
-            if self.staging_writer.is_none() && ps > 0 {
-                let seq = self.staging_seq.fetch_add(1, Ordering::Relaxed);
-                self.staging_writer = Some(
-                    staging::StagingWriter::open(&self.staging_dir, seq, ps)?
-                );
-            }
-            if let Some(ref mut writer) = self.staging_writer {
-                writer.append(page_num, buf)?;
-            }
-        }
-
         // Update manifest page_count if this page extends the database.
         // Fast path: read lock to check if update is needed (common case: no).
         {
@@ -1480,7 +1459,7 @@ impl DatabaseHandle for TurboliteHandle {
 
     fn sync(&mut self, _data_only: bool) -> Result<(), io::Error> {
         let dirty_count = self.dirty_page_nums.read().len();
-        turbolite_debug!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
+        turbolite_debug!("[vfs::sync] called (dirty={}, read_only={})", dirty_count, self.read_only);
         if self.is_passthrough() {
             return self
                 .passthrough_file
@@ -1500,10 +1479,10 @@ impl DatabaseHandle for TurboliteHandle {
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
                 self.dirty_since_sync = false;
-                turbolite_debug!("[sync] early return: 0 dirty pages, 0 pending groups (sync_mode={:?})", self.sync_mode);
+                turbolite_debug!("[sync] early return: 0 dirty pages, 0 pending groups");
                 return Ok(());
             }
-            turbolite_debug!("[sync] dirty={}, pending={}, sync_mode={:?}", dirty.len(), has_pending_groups, self.sync_mode);
+            turbolite_debug!("[sync] dirty={}, pending={}", dirty.len(), has_pending_groups);
             dirty.clone()
         };
 
@@ -1512,7 +1491,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Local-checkpoint-only: record dirty group IDs, scan interior pages,
         // free in-memory dirty map, but skip S3 upload entirely.
         // Pages are already in disk cache from write_all_at().
-        if self.sync_mode == SyncMode::LocalThenFlush || LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
+        if LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
             let cache_arc = self.cache.as_ref().expect("cache required for tiered handle").clone();
             let cache = &*cache_arc;
             let mut manifest = (**self.manifest.load()).clone();
@@ -1639,388 +1618,6 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // ── RemotePrimary sync path: upload dirty frames as overrides + publish manifest ──
-        // Every xSync is a backend commit. No staging logs, no deferred flush.
-        // Override-only (no full group rewrites) to keep per-commit latency bounded.
-        if self.sync_mode == SyncMode::RemotePrimary {
-            let page_size = self.page_size.load(Ordering::Relaxed);
-            let storage = Arc::clone(
-                self.storage.as_ref().expect("RemotePrimary requires a storage backend"),
-            );
-            let runtime = self
-                .runtime
-                .as_ref()
-                .expect("RemotePrimary requires a runtime handle")
-                .clone();
-            let storage_ref = storage.as_ref();
-            let runtime_ref = &runtime;
-            let cache = self.cache.as_ref().expect("cache required").clone();
-
-            // Enforce journal_mode != WAL. SQLite stores journal mode at page 0
-            // offset 18-19. WAL mode = 2 at offset 18. RemotePrimary is incompatible
-            // with WAL because xSync must be the atomic commit point.
-            if dirty_snapshot.contains(&0) || self.manifest.load().version == 0 {
-                let mut page0 = vec![0u8; page_size as usize];
-                if cache.read_page(0, &mut page0).is_ok() && page0.len() > 19 {
-                    let journal_mode = page0[18];
-                    if journal_mode == 2 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "RemotePrimary mode requires journal_mode=OFF or MEMORY, not WAL. \
-                             Run PRAGMA journal_mode=OFF before enabling RemotePrimary.",
-                        ));
-                    }
-                }
-            }
-
-            // Assign new pages to groups
-            {
-                let mut manifest = (**self.manifest.load()).clone();
-                let unassigned: Vec<u64> = dirty_snapshot.iter()
-                    .filter(|&&pn| manifest.page_location(pn).is_none())
-                    .copied()
-                    .collect();
-                if !unassigned.is_empty() {
-                    Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
-                }
-                self.manifest.store(Arc::new(manifest));
-            }
-
-            let manifest_snap = (**self.manifest.load()).clone();
-            let page_count = manifest_snap.page_count;
-            let next_version = manifest_snap.version + 1;
-            let ovr_count: usize = manifest_snap.subframe_overrides.iter()
-                .map(|ovs| ovs.len()).sum();
-            turbolite_debug!("[sync:s3primary] building v{} from v{} (page_count={}, dirty={}, overrides={}, pg_keys={})",
-                next_version, manifest_snap.version, page_count, dirty_snapshot.len(),
-                ovr_count, manifest_snap.page_group_keys.len());
-            let change_counter = read_change_counter_from_cache(&cache, page_size);
-            let old_sub_ppf = manifest_snap.sub_pages_per_frame;
-            let use_seekable = old_sub_ppf > 0;
-
-            // Group dirty pages by group ID
-            let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
-            for &page_num in &dirty_snapshot {
-                let gid = manifest_snap.page_location(page_num)
-                    .expect("page must have group assignment after new-page assignment")
-                    .group_id;
-                groups_dirty.entry(gid).or_default().push(page_num);
-            }
-
-            let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
-            let mut new_keys = manifest_snap.page_group_keys.clone();
-            let mut new_frame_tables = manifest_snap.frame_tables.clone();
-            let mut replaced_keys: Vec<String> = Vec::new();
-
-            // Ensure override vectors are large enough
-            while new_subframe_overrides.len() <= manifest_snap.group_pages.len() {
-                new_subframe_overrides.push(HashMap::new());
-            }
-
-            for (&gid, dirty_pnums) in &groups_dirty {
-                let pages_in_group = manifest_snap.group_page_nums(gid);
-                let group_size = pages_in_group.len();
-                let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
-                let has_frame_table = use_seekable
-                    && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
-
-                if has_frame_table {
-                    // Override path: encode only dirty frames
-                    turbolite_debug!("[sync:s3primary] gid={}: override path (frame_table has {} entries)", gid, frame_table_ref.map(|ft| ft.len()).unwrap_or(0));
-                    let dirty_frames = manifest::dirty_frames_for_group(
-                        dirty_pnums,
-                        &pages_in_group,
-                        frame_table_ref.expect("checked above"),
-                        old_sub_ppf,
-                    );
-
-                    for &frame_idx in &dirty_frames {
-                        let frame_start = frame_idx * old_sub_ppf as usize;
-                        let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
-                        let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
-
-                        // Pre-fetch the existing frame data for pages not in cache.
-                        // Without this, evicted pages (e.g., after set_manifest) would
-                        // be zeroed in the override, silently corrupting the database.
-                        let existing_frame_data: Option<Vec<u8>> = {
-                            let needs_merge = (frame_start..frame_end).any(|pos| {
-                                pos < pages_in_group.len()
-                                    && pages_in_group[pos] < page_count
-                                    && !cache.is_present(pages_in_group[pos])
-                            });
-                            if needs_merge {
-                                // Try existing override first, then base page group
-                                let existing_ovr = manifest_snap.subframe_overrides
-                                    .get(gid as usize)
-                                    .and_then(|ovs| ovs.get(&frame_idx));
-                                if let Some(ovr) = existing_ovr {
-                                    storage_helpers::get_page_group(storage_ref, runtime_ref, &ovr.key).ok().flatten()
-                                        .and_then(|data| decode_seekable_subchunk(
-                                            &data,
-                                            #[cfg(feature = "zstd")]
-                                            self.decoder_dict.as_ref(),
-                                            self.encryption_key.as_ref(),
-                                        ).ok())
-                                } else if let Some(base_key) = manifest_snap.page_group_keys.get(gid as usize) {
-                                    if !base_key.is_empty() {
-                                        let ft = frame_table_ref.expect("seekable path requires frame table");
-                                        if frame_idx < ft.len() {
-                                            let entry = &ft[frame_idx];
-                                            storage_helpers::range_get(storage_ref, runtime_ref, base_key, entry.offset, entry.len).ok().flatten()
-                                                .and_then(|data| decode_seekable_subchunk(
-                                                    &data,
-                                                    #[cfg(feature = "zstd")]
-                                                    self.decoder_dict.as_ref(),
-                                                    self.encryption_key.as_ref(),
-                                                ).ok())
-                                        } else { None }
-                                    } else { None }
-                                } else { None }
-                            } else { None }
-                        };
-
-                        for pos in frame_start..frame_end {
-                            if pos >= pages_in_group.len() { break; }
-                            let pnum = pages_in_group[pos];
-                            if pnum >= page_count { break; }
-                            let mut buf = vec![0u8; page_size as usize];
-                            if cache.read_page(pnum, &mut buf).is_ok() {
-                                frame_pages.push((pnum, buf));
-                            } else if let Some(ref existing) = existing_frame_data {
-                                // Page evicted from cache: use existing S3 data
-                                let offset_in_frame = (pos - frame_start) * page_size as usize;
-                                let end = offset_in_frame + page_size as usize;
-                                if end <= existing.len() {
-                                    buf.copy_from_slice(&existing[offset_in_frame..end]);
-                                }
-                                frame_pages.push((pnum, buf));
-                            } else {
-                                // No cache, no S3 fallback. This should not happen
-                                // in normal operation. Log and use zeros as last resort.
-                                eprintln!(
-                                    "[sync:s3primary] WARNING: page {} not in cache and no S3 fallback for gid={} frame={}",
-                                    pnum, gid, frame_idx
-                                );
-                                frame_pages.push((pnum, vec![0u8; page_size as usize]));
-                            }
-                        }
-
-                        let override_key = keys::override_frame_key(gid, frame_idx, next_version);
-                        let encoded = encode_override_frame(
-                            &frame_pages,
-                            page_size,
-                            self.compression_level,
-                            #[cfg(feature = "zstd")]
-                            self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-
-                        // Track old override being replaced
-                        if let Some(old_ov) = new_subframe_overrides
-                            .get(gid as usize)
-                            .and_then(|ovs| ovs.get(&frame_idx))
-                        {
-                            replaced_keys.push(old_ov.key.clone());
-                        }
-
-                        uploads.push((override_key.clone(), encoded.clone()));
-                        while new_subframe_overrides.len() <= gid as usize {
-                            new_subframe_overrides.push(HashMap::new());
-                        }
-                        new_subframe_overrides[gid as usize].insert(
-                            frame_idx,
-                            SubframeOverride {
-                                key: override_key,
-                                entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
-                            },
-                        );
-                    }
-                } else {
-                    // No frame table (legacy format or new group): full group rewrite
-                    let existing_ovrs = new_subframe_overrides.get(gid as usize).map(|o| o.len()).unwrap_or(0);
-                    if existing_ovrs > 0 {
-                        turbolite_debug!("[sync:s3primary] gid={}: FULL REWRITE draining {} overrides!", gid, existing_ovrs);
-                    } else {
-                        turbolite_debug!("[sync:s3primary] gid={}: full rewrite (no overrides to drain)", gid);
-                    }
-                    let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
-                    let mut need_s3_merge = false;
-
-                    for (i, &pnum) in pages_in_group.iter().enumerate() {
-                        if pnum >= page_count { break; }
-                        if cache.is_present(pnum) {
-                            let mut buf = vec![0u8; page_size as usize];
-                            if cache.read_page(pnum, &mut buf).is_ok() {
-                                pages[i] = Some(buf);
-                            }
-                        } else {
-                            need_s3_merge = true;
-                        }
-                    }
-
-                    if need_s3_merge {
-                        if let Some(existing_key) = new_keys.get(gid as usize) {
-                            if !existing_key.is_empty() {
-                                if let Ok(Some(pg_data)) = storage_helpers::get_page_group(storage_ref, runtime_ref, existing_key) {
-                                    let existing_ft = manifest_snap.frame_tables.get(gid as usize);
-                                    let has_ft = use_seekable
-                                        && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
-                                    if has_ft {
-                                        let ft = existing_ft.expect("checked");
-                                        if let Ok((_pc, _ps, bulk)) = decode_page_group_seekable_full(
-                                            &pg_data, ft, page_size,
-                                            pages_in_group.len() as u32, page_count, 0,
-                                            #[cfg(feature = "zstd")]
-                                            self.decoder_dict.as_ref(),
-                                            self.encryption_key.as_ref(),
-                                        ) {
-                                            let ps = page_size as usize;
-                                            for j in 0..pages_in_group.len() {
-                                                if pages_in_group[j] >= page_count { break; }
-                                                if pages[j].is_none() {
-                                                    let start = j * ps;
-                                                    let end = start + ps;
-                                                    if end <= bulk.len() {
-                                                        pages[j] = Some(bulk[start..end].to_vec());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if let Ok((_pc, _ps, existing)) = decode_page_group(
-                                        &pg_data,
-                                        #[cfg(feature = "zstd")]
-                                        self.decoder_dict.as_ref(),
-                                        self.encryption_key.as_ref(),
-                                    ) {
-                                        for (j, ep) in existing.into_iter().enumerate() {
-                                            if j >= pages_in_group.len() { break; }
-                                            if pages_in_group[j] >= page_count { break; }
-                                            if pages[j].is_none() { pages[j] = Some(ep); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let key = keys::page_group_key(gid, next_version);
-                    if use_seekable {
-                        let (encoded, ft) = encode_page_group_seekable(
-                            &pages, page_size, old_sub_ppf, self.compression_level,
-                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-                        uploads.push((key.clone(), encoded));
-                        while new_frame_tables.len() <= gid as usize {
-                            new_frame_tables.push(Vec::new());
-                        }
-                        new_frame_tables[gid as usize] = ft;
-                    } else {
-                        let encoded = encode_page_group(
-                            &pages, page_size, self.compression_level,
-                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-                        uploads.push((key.clone(), encoded));
-                    }
-
-                    while new_keys.len() <= gid as usize { new_keys.push(String::new()); }
-                    if let Some(old_key) = new_keys.get(gid as usize) {
-                        if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
-                    }
-                    new_keys[gid as usize] = key;
-
-                    // Clear overrides for this group (full rewrite supersedes them)
-                    if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
-                        for (_, ov) in group_ovs.drain() {
-                            replaced_keys.push(ov.key);
-                        }
-                    }
-                }
-            }
-
-            // Upload all overrides + page groups
-            if !uploads.is_empty() {
-                turbolite_debug!("[sync:remote-primary] uploading {} objects...", uploads.len());
-                storage_helpers::put_page_groups(storage_ref, runtime_ref, &uploads)?;
-            }
-
-            // Build and publish new manifest
-            let old_manifest = manifest_snap;
-            // Capture full page 0 for multiwriter catch-up
-            let ps = self.page_size.load(Ordering::Relaxed);
-            let db_header = if ps > 0 {
-                let mut page0 = vec![0u8; ps as usize];
-                if cache.read_page(0, &mut page0).is_ok() {
-                    Some(page0)
-                } else {
-                    old_manifest.db_header.clone()
-                }
-            } else {
-                None
-            };
-
-            let mut new_manifest = Manifest {
-                version: next_version,
-                change_counter,
-                epoch: old_manifest.epoch,
-                page_count: old_manifest.page_count,
-                page_size: old_manifest.page_size,
-                pages_per_group: ppg,
-                page_group_keys: new_keys,
-                interior_chunk_keys: old_manifest.interior_chunk_keys.clone(),
-                index_chunk_keys: old_manifest.index_chunk_keys.clone(),
-                frame_tables: new_frame_tables,
-                sub_pages_per_frame: old_sub_ppf,
-                subframe_overrides: new_subframe_overrides,
-                strategy: old_manifest.strategy,
-                group_pages: old_manifest.group_pages.clone(),
-                btrees: old_manifest.btrees.clone(),
-                page_index: HashMap::new(),
-                btree_groups: HashMap::new(),
-                page_to_tree_name: HashMap::new(),
-                tree_name_to_groups: HashMap::new(),
-                group_to_tree_name: HashMap::new(),
-                db_header,
-            };
-            new_manifest.build_page_index();
-            storage_helpers::put_manifest(storage_ref, runtime_ref, &new_manifest)?;
-
-            // Commit local state
-            {
-                cache.set_group_pages(new_manifest.group_pages.clone());
-                self.manifest.store(Arc::new(new_manifest.clone()));
-            }
-            {
-                let mut dirty = self.dirty_page_nums.write();
-                for &page_num in &dirty_snapshot {
-                    dirty.remove(&page_num);
-                }
-            }
-            self.dirty_since_sync = false;
-            if let Some(c) = &self.cache { self.cached_generation = c.bump_generation(); }
-
-            // Persist local manifest for crash recovery
-            manifest::persist_manifest_local(&cache.cache_dir, &new_manifest)?;
-            manifest::persist_dirty_groups(&cache.cache_dir, &[])?;
-            let _ = cache.persist_bitmap();
-
-            // Synchronous GC of replaced keys. Async GC previously depended on
-            // the S3Client's built-in runtime; the backend-agnostic path runs
-            // through storage_helpers which blocks on the shared runtime.
-            if self.gc_enabled && !replaced_keys.is_empty() {
-                if let Err(e) = storage_helpers::delete_objects(storage_ref, runtime_ref, &replaced_keys) {
-                    eprintln!("[gc] ERROR deleting replaced objects: {}", e);
-                }
-            }
-
-            turbolite_debug!(
-                "[sync:remote-primary] committed v{} ({} dirty pages, {} uploads)",
-                next_version, dirty_snapshot.len(), uploads.len(),
-            );
-            return Ok(());
-        }
 
         // Durable sync path: full remote upload. Backend-agnostic.
         {

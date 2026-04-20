@@ -1,6 +1,7 @@
 //! Non-blocking backend flush for the two-phase checkpoint path.
 //!
-//! After a local-only checkpoint (`SyncMode::LocalThenFlush`), dirty pages are
+//! After a local-only checkpoint (runtime `LOCAL_CHECKPOINT_ONLY` flag, or
+//! recovery of staging logs written by an older turbolite), dirty pages are
 //! captured in staging log files on disk. This module reads from those logs
 //! (not the live disk cache), encodes page groups, and uploads to the backend
 //! without holding any SQLite lock. The flush is backend-agnostic: an

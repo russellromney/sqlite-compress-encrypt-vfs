@@ -39,12 +39,11 @@ pub struct TurboliteVfs {
     /// read by flush_to_storage() for non-blocking storage upload.
     shared_manifest: Arc<ArcSwap<Manifest>>,
     /// Shared pending dirty groups. Accumulated by TurboliteHandle during
-    /// local-only checkpoints, drained by flush_to_storage(). Legacy path
-    /// for the global LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush
-    /// uses staging logs.
+    /// local-only checkpoints, drained by flush_to_storage(). Used for the
+    /// global LOCAL_CHECKPOINT_ONLY runtime flag path.
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
-    /// Pending staging log flushes. Populated by sync() in
-    /// LocalThenFlush mode, drained by flush_to_storage().
+    /// Pending staging log flushes. Drained by flush_to_storage() for any
+    /// staging logs recovered on open from older turbolite versions.
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     /// Monotonic counter for staging log filenames.
     /// Avoids version collisions when manifest version is updated by flush
@@ -82,9 +81,8 @@ impl TurboliteVfs {
         Self::assemble(config, storage, runtime, Some(owned), true)
     }
 
-    /// Caller-supplied backend. The caller's `config.sync_mode` is honoured:
-    /// `Durable` uploads on every checkpoint, `LocalThenFlush` stages for
-    /// later `flush_to_storage()`, `RemotePrimary` publishes per commit.
+    /// Caller-supplied backend. Checkpoints upload dirty pages to the backend
+    /// synchronously (full remote durability on every checkpoint).
     pub fn with_backend(
         config: TurboliteConfig,
         backend: Arc<dyn StorageBackend>,
@@ -98,19 +96,12 @@ impl TurboliteVfs {
     /// [`Self::with_backend`]. `owned_runtime` is Some only when the caller
     /// handed us a runtime to keep alive.
     fn assemble(
-        mut config: TurboliteConfig,
+        config: TurboliteConfig,
         storage: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,
         owned_runtime: Option<tokio::runtime::Runtime>,
         is_local: bool,
     ) -> io::Result<Self> {
-        if is_local {
-            // Local mode has no remote to upload to; staging logs drain to
-            // the same filesystem. LocalThenFlush is the only coherent
-            // mode here.
-            config.sync_mode = SyncMode::LocalThenFlush;
-        }
-
         // 1. Decide which manifest to start from.
         //    Warm cache file wins unless it's missing, in which case we
         //    go to the backend. Dirty groups survive independently in
@@ -1021,10 +1012,7 @@ impl Vfs for TurboliteVfs {
                 .write(true)
                 .open(&lock_path)?;
 
-            // S3Primary -> RemotePrimary: no WAL stub.
-            let skip_wal_stub = self.config.sync_mode == SyncMode::RemotePrimary;
-
-            if !self.config.read_only && !skip_wal_stub {
+            if !self.config.read_only {
                 let wal_path = self.config.cache_dir.join(format!("{}-wal", db));
                 let _ = FsOpenOptions::new()
                     .create(true)
@@ -1063,7 +1051,6 @@ impl Vfs for TurboliteVfs {
                 ppg,
                 self.config.compression.level,
                 self.config.read_only,
-                self.config.sync_mode,
                 self.config.prefetch.search.clone(),
                 self.config.prefetch.lookup.clone(),
                 self.prefetch_pool.as_ref().map(Arc::clone),
