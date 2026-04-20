@@ -211,28 +211,26 @@ fn two_threads_isolated_via_sql_function() {
     assert_ne!(a_value, b_value, "threads must not share queue state");
 }
 
-/// **Known limitation** (documented here so it's visible in code, not
-/// just prose). Two connections open concurrently on the *same* thread:
-/// the thread-local active-handle stack has both queues, most-recently
-/// opened on top. `turbolite_config_set` called from either connection
-/// routes to whichever queue is on top of the stack — which is the
-/// most recently opened handle, not necessarily the connection whose
-/// statement is currently executing.
+/// Two connections open concurrently on the *same* thread: each
+/// connection's `turbolite_config_set` push lands on its *own* queue,
+/// regardless of open order.
 ///
-/// This test **asserts the current behavior**, not the desired one. In
-/// production this scenario does not arise (rusqlite `Connection` is
-/// `!Sync`, typical pool patterns are one connection per thread, and
-/// cinch's engines are one-tenant-per-process). If/when we do the
-/// proper fix (a `sqlite3_trace_v2` STMT/PROFILE hook that pushes the
-/// active connection's handle onto the stack at statement start and
-/// pops at completion), the assertion below flips: each connection's
-/// push lands on its *own* queue regardless of open order.
+/// Mechanism: `install_config_functions` captures the calling
+/// connection's handle queue at install time (via the thread-local
+/// active-handle stack, which top-of-stack is THIS connection's queue
+/// because install is called immediately after open) and the scalar
+/// function's closure pushes into that captured queue directly. No
+/// thread-local lookup happens at scalar-function-call time, so stack
+/// order at call time doesn't matter.
 ///
-/// Until then, a multi-connection-per-thread caller should either:
-/// - Drop A before opening B (see `sequential_connections_dont_share_queue`)
-/// - Run each connection on its own thread (see `two_threads_isolated_via_sql_function`)
+/// This is the regression guard for the multi-connection-per-thread
+/// case — rare in rusqlite production use (pool patterns enforce one
+/// connection per thread) but the right thing to get right. The
+/// equivalent C-side fix lives in the turbolite-ffi extraction (Cirrus
+/// step h); loadable-extension users keep the "top-of-stack wins"
+/// behavior until then.
 #[test]
-fn multi_connection_same_thread_top_of_stack_wins() {
+fn multi_connection_same_thread_routes_per_connection() {
     let tmp = TempDir::new().unwrap();
     let vfs_name = unique_name("multi_same_thread");
 
@@ -246,40 +244,53 @@ fn multi_connection_same_thread_top_of_stack_wins() {
     let conn_a = open_connection(&vfs_name, "multi_a.db");
     let conn_b = open_connection(&vfs_name, "multi_b.db");
     // Thread-local stack is now [queue_a, queue_b], B on top.
+    // Each connection's install_config_functions captured its own queue
+    // at the moment just after its own open — so A's scalar function
+    // holds an Arc to queue_a and B's holds an Arc to queue_b.
 
-    // A calls the SQL function. Current design: the push lands on B's
-    // queue (top of stack), not A's. If the proper fix lands, this
-    // push should land on A's queue and the peek comment below flips.
+    // A pushes — must land on A's queue, not B's (the top of the stack).
     let _: i64 = conn_a
         .query_row(
             "SELECT turbolite_config_set('prefetch_search', '0.11,0.22')",
             [],
             |row| row.get(0),
         )
-        .expect("A set (routes to B's queue under current design)");
+        .expect("A set");
 
-    // peek_top_for_key returns the top-of-stack queue's pending value.
-    // Top-of-stack is conn_b's queue (opened most recently).
-    let peeked = settings::peek_top_for_key("prefetch_search")
-        .expect("some queue has the push");
-    assert_eq!(
-        peeked, "0.11,0.22",
-        "current design: A's push lands on B's queue (top of stack)"
-    );
-
-    // Drop B. Now A is on top. A pushing lands on its own queue.
-    drop(conn_b);
-
-    let _: i64 = conn_a
+    // B pushes — must land on B's queue.
+    let _: i64 = conn_b
         .query_row(
-            "SELECT turbolite_config_set('prefetch_search', '0.33,0.44')",
+            "SELECT turbolite_config_set('prefetch_search', '0.99,0.88')",
             [],
             |row| row.get(0),
         )
-        .expect("A set (now routes to A's own queue)");
-    let peeked = settings::peek_top_for_key("prefetch_search")
-        .expect("A queue has pending");
-    assert_eq!(peeked, "0.33,0.44");
+        .expect("B set");
+
+    // Verify by draining each connection's next xRead. Force a real
+    // page read on each; after the drain, peek should show no pending
+    // update for that connection's queue (drain removed it).
+    conn_a.execute("INSERT INTO _bootstrap VALUES (1)", []).unwrap();
+    conn_b.execute("INSERT INTO _bootstrap VALUES (2)", []).unwrap();
+
+    // The real proof: push again on A, without touching B. Then peek
+    // the top of the stack (which is queue_b since B was opened most
+    // recently) and verify no `prefetch_search` entry is pending there —
+    // A's second push must have landed on A's queue, not B's.
+    let _: i64 = conn_a
+        .query_row(
+            "SELECT turbolite_config_set('prefetch_search', '0.55,0.44')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("A set (again)");
+
+    // peek_top_for_key inspects top of stack = queue_b.
+    // B's queue must NOT have A's latest push.
+    assert!(
+        settings::peek_top_for_key("prefetch_search").is_none(),
+        "queue_b (top of stack) must not carry A's push — the closure \
+         bypasses the thread-local and pushes directly to queue_a"
+    );
 }
 
 /// Single thread, two sequential connections on the same VFS. After

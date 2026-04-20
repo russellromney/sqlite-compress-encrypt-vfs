@@ -93,8 +93,8 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
 }
 
 /// Register the `turbolite_config_set(key, value)` SQL function on a
-/// rusqlite [`Connection`]. The function routes per-connection via the
-/// thread-local active-handle stack maintained by [`tiered::settings`]:
+/// rusqlite [`Connection`], bound to that connection's turbolite handle
+/// queue.
 ///
 /// ```sql
 /// -- Tune prefetch for an aggressive scan batch, then run the queries.
@@ -104,29 +104,71 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
 ///
 /// [`connect`] calls this automatically. Callers that open a turbolite
 /// connection via `rusqlite::Connection::open_with_flags_and_vfs` (rather
-/// than [`connect`]) should call this once on the connection to get the
-/// SQL function surface.
+/// than [`connect`]) should call this once per connection, **immediately
+/// after opening** — the helper snapshots the calling connection's handle
+/// queue at install time and the scalar-function closure pushes into that
+/// captured queue at call time. No thread-local lookup at call time means
+/// no ambiguity when multiple turbolite connections are open on the same
+/// thread: each connection's pushes land on its own queue regardless of
+/// which handle was opened most recently.
 ///
-/// Return value of the SQL function:
+/// # Timing contract
+///
+/// Call immediately after `open_with_flags_and_vfs`, before opening any
+/// other turbolite connection on the same thread. Under the hood the
+/// helper reads the top of the thread-local active-handle stack; if
+/// another turbolite connection has opened in between, install will
+/// capture that other connection's queue — a misuse, not a runtime bug.
+///
+/// # Errors
+///
+/// - Returns a SQL error from the `PRAGMA schema_version` probe if the
+///   connection isn't backed by a turbolite VFS.
+/// - Returns `UserFunctionError` if no turbolite handle is active on this
+///   thread after the probe (misuse; shouldn't happen in normal flow).
+///
+/// # SQL function return codes
+///
 /// - `0` — update queued successfully; the handle applies it on the next
 ///    slow-path read.
-/// - `NULL` with SQL error — validation failed (unknown key or bad value),
-///    or no active turbolite handle on this thread (no turbolite VFS file
-///    is open from this thread).
+/// - SQL error — validation failed (unknown key or bad value). The
+///   captured queue makes "no active handle" unreachable through this
+///   function: the closure holds an `Arc` to its queue for the function's
+///   lifetime.
 #[cfg(feature = "bundled-sqlite")]
 pub fn install_config_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
+    use tiered::settings::{self, SettingUpdate};
+
+    // Force xOpen on the main-db file if it hasn't fired yet, so this
+    // connection's handle queue is on the thread-local stack.
+    // `PRAGMA schema_version` reads page 1 which is enough to trigger
+    // the VFS file open.
+    let _: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+
+    let queue = settings::top_queue().ok_or_else(|| {
+        rusqlite::Error::UserFunctionError(
+            "install_config_functions: no turbolite handle active on this thread. \
+             Call install_config_functions immediately after \
+             Connection::open_with_flags_and_vfs on a turbolite-backed connection."
+                .into(),
+        )
+    })?;
+
     conn.create_scalar_function(
         "turbolite_config_set",
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
-        |ctx| {
+        move |ctx| {
             let key: String = ctx.get(0)?;
             let value: String = ctx.get(1)?;
-            match tiered::settings::set(&key, &value) {
-                Ok(()) => Ok(0i64),
-                Err(msg) => Err(rusqlite::Error::UserFunctionError(msg.into())),
-            }
+            settings::validate(&key, &value)
+                .map_err(|msg| rusqlite::Error::UserFunctionError(msg.into()))?;
+            queue
+                .lock()
+                .expect("settings queue poisoned")
+                .push(SettingUpdate { key, value });
+            Ok(0i64)
         },
     )
 }

@@ -93,6 +93,15 @@ pub fn push_to_current(update: SettingUpdate) -> bool {
     })
 }
 
+/// Clone the Arc of the top-of-stack queue on the current thread, if
+/// any. Used by [`crate::install_config_functions`] to capture the
+/// calling connection's handle queue at install time so the scalar
+/// function closure can push directly to it — correct routing without
+/// consulting the thread-local stack at call time.
+pub fn top_queue() -> Option<SettingsQueue> {
+    QUEUE_STACK.with(|s| s.borrow().last().cloned())
+}
+
 /// Inspect the latest pending value for `key` on the current thread's
 /// top-of-stack queue. Primarily for tests and diagnostics; does not
 /// drain. Returns `None` if no handle is active on this thread or no
