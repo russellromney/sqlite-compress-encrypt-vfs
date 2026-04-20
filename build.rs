@@ -22,11 +22,20 @@ fn main() {
         // otherwise strip it because no Rust code references it.
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         if target_os == "macos" {
-            // -exported_symbol prevents dead-stripping of the entry point.
-            // -undefined dynamic_lookup lets sqlite3_create_function_v2 etc.
-            // resolve at dlopen time from the host process.
+            // Exported symbols:
+            // - sqlite3_turbolite_init: SQLite's dlsym entry point.
+            // - turbolite_install_config_functions: explicit per-connection
+            //   install helper, called by language bindings via ctypes /
+            //   cgo / koffi to bind `turbolite_config_set` to THIS
+            //   connection's handle queue (Phase Cirrus h2).
+            //
+            // -undefined dynamic_lookup lets sqlite3_create_function_v2
+            // etc. resolve at dlopen time from the host process.
             println!(
                 "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_sqlite3_turbolite_init"
+            );
+            println!(
+                "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_turbolite_install_config_functions"
             );
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");

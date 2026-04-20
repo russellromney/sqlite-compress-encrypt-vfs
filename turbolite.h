@@ -13,12 +13,24 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef struct Option_CreateFnDestroy Option_CreateFnDestroy;
+
+typedef struct Option_CreateFnFinal Option_CreateFnFinal;
+
+typedef struct Option_CreateFnStep Option_CreateFnStep;
+
 #if !defined(TURBOLITE_LOADABLE_EXTENSION)
 /**
  * Opaque database connection handle.
  */
 typedef struct TurboliteDb TurboliteDb;
 #endif
+
+typedef void sqlite3;
+
+typedef void sqlite3_context;
+
+typedef void sqlite3_value;
 
 #ifdef __cplusplus
 extern "C" {
@@ -419,6 +431,49 @@ void turbolite_settings_queue_free_cb(void *ptr);
  * strings.
  */
 int turbolite_settings_queue_push(const void *queue_ptr, const char *key, const char *value);
+
+extern int sqlite3_exec(sqlite3 *db,
+                        const char *sql,
+                        const void *callback,
+                        const void *arg,
+                        char **errmsg);
+
+extern void sqlite3_free(void *ptr);
+
+extern int sqlite3_create_function_v2(sqlite3 *db,
+                                      const char *zFunctionName,
+                                      int nArg,
+                                      int eTextRep,
+                                      void *pApp,
+                                      struct Option_CreateFnStep xFunc,
+                                      struct Option_CreateFnStep xStep,
+                                      struct Option_CreateFnFinal xFinal,
+                                      struct Option_CreateFnDestroy xDestroy);
+
+extern void *sqlite3_user_data(sqlite3_context *ctx);
+
+extern const char *sqlite3_value_text(sqlite3_value *value);
+
+extern void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int len);
+
+extern void sqlite3_result_int(sqlite3_context *ctx, int val);
+
+/**
+ * Register the `turbolite_config_set(key, value)` SQL function on this
+ * connection, capturing the calling connection's handle queue via
+ * `sqlite3_create_function_v2`'s `pApp`.
+ *
+ * Returns:
+ * - `SQLITE_OK` (0) on success
+ * - A SQLite error code if the `PRAGMA schema_version` probe fails
+ *   (connection isn't turbolite-backed)
+ * - `SQLITE_MISUSE` if no turbolite handle is active on this thread
+ *   after the probe
+ *
+ * # Safety
+ * `db` must be a live `sqlite3*` handle.
+ */
+int turbolite_install_config_functions(sqlite3 *db);
 
 #ifdef __cplusplus
 }  // extern "C"

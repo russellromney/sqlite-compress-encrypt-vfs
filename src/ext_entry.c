@@ -50,10 +50,11 @@ extern int turbolite_gc(void);
 /* Rust function -- compact B-tree groups. Defined in src/ext.rs. */
 extern const char *turbolite_compact(void);
 
-/* Rust function -- runtime config (per-handle prefetch / cache tuning).
- * Defined in src/tiered/settings.rs. Scoping is per-TurboliteHandle via
- * a thread-local stack; see settings.rs for the contract. */
-extern int turbolite_config_set(const char *key, const char *value);
+/* `turbolite_install_config_functions` and its scalar-function
+ * counterpart are defined in turbolite-ffi/src/install.rs — they're
+ * what embedders call per connection. The extension entry point
+ * below no longer auto-registers the SQL function. */
+extern int turbolite_install_config_functions(sqlite3 *db);
 
 /* Rust functions -- cache eviction + observability.
  * Defined in src/ext.rs. */
@@ -166,41 +167,15 @@ static void turbolite_s3_bytes_func(
 }
 
 /*
- * turbolite_config_set(key TEXT, value TEXT)
+ * turbolite_config_set / turbolite_install_config_functions
  *
- * Runtime prefetch / cache tuning. Scoped to the current connection's
- * turbolite handle — see src/tiered/settings.rs for the scoping contract.
- *
- * Keys: 'prefetch', 'prefetch_search', 'prefetch_lookup',
- *       'prefetch_reset', 'plan_aware', 'cache_limit',
- *       'evict_on_checkpoint'.
- *
- * Returns 0 on success; errors out with a message on invalid key/value
- * or when no turbolite handle is open on this thread.
+ * Both live in turbolite-ffi/src/install.rs (Rust, callable from C).
+ * The scalar function is NOT auto-registered at extension load —
+ * callers invoke `turbolite_install_config_functions(db)` per
+ * connection, which captures THIS connection's handle queue via
+ * sqlite3_create_function_v2's pApp so multi-connection-per-thread
+ * routing is correct. See install.rs for the contract.
  */
-static void turbolite_config_set_func(
-    sqlite3_context *ctx,
-    int argc,
-    sqlite3_value **argv
-) {
-    (void)argc;
-    const char *key = (const char *)sqlite3_value_text(argv[0]);
-    const char *value = (const char *)sqlite3_value_text(argv[1]);
-    if (!key || !value) {
-        sqlite3_result_error(ctx, "turbolite_config_set: key and value required", -1);
-        return;
-    }
-    int rc = turbolite_config_set(key, value);
-    if (rc == 1) {
-        sqlite3_result_error(ctx, "turbolite_config_set: invalid key or value", -1);
-        return;
-    }
-    if (rc == 2) {
-        sqlite3_result_error(ctx, "turbolite_config_set: no active turbolite handle on this thread", -1);
-        return;
-    }
-    sqlite3_result_int(ctx, 0);
-}
 
 /*
  * turbolite_evict_tree(tree_names TEXT)
@@ -532,16 +507,10 @@ int sqlite3_turbolite_init(
         SQLITE_UTF8, 0, turbolite_compact_func, 0, 0, 0
     );
 
-    /* Runtime prefetch / cache tuning. Per-handle scoped via thread-local
-     * stack; see src/tiered/settings.rs.
-     *
-     * Keys: 'prefetch', 'prefetch_search', 'prefetch_lookup',
-     *       'prefetch_reset', 'plan_aware', 'cache_limit',
-     *       'evict_on_checkpoint'. */
-    sqlite3_create_function_v2(
-        db, "turbolite_config_set", 2,
-        SQLITE_UTF8, 0, turbolite_config_set_func, 0, 0, 0
-    );
+    /* turbolite_config_set is NOT auto-registered. Users invoke
+     * `turbolite_install_config_functions(db)` per connection to bind
+     * the scalar function to THIS connection's handle queue via pApp.
+     * See the function's block comment above for the contract. */
     return SQLITE_OK;
 }
 

@@ -41,3 +41,6 @@ pub use settings::{
     turbolite_config_set, turbolite_current_queue_clone, turbolite_settings_queue_free,
     turbolite_settings_queue_free_cb, turbolite_settings_queue_push,
 };
+
+pub mod install;
+pub use install::turbolite_install_config_functions;
