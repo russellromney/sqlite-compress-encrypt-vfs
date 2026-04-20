@@ -1924,3 +1924,94 @@ fn test_cache_validation_override_changes_between_sessions() {
         assert_eq!(count, 10);
     }
 }
+
+// =========================================================================
+// Phase Cirrus c: per-handle `turbolite_config_set` integration tests
+//
+// Unit tests in `settings.rs` cover queue/stack routing mechanics. These
+// exercise the full path: open a VFS-backed connection, push a setting
+// via `settings::set()` (same code path as the C FFI), run a query,
+// confirm the drain applies without crashing and without poisoning other
+// handles on the thread.
+// =========================================================================
+
+#[test]
+fn test_settings_set_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let config = TurboliteConfig {
+        cache_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+
+    let vfs_name = format!("settings_rt_{}", std::process::id());
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let db_path = format!("file:test.db?vfs={}", vfs_name);
+    let conn = rusqlite::Connection::open(&db_path).expect("open");
+    conn.execute_batch(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+         INSERT INTO t VALUES (1, 'hello'), (2, 'world');",
+    )
+    .unwrap();
+
+    // Main-db handle is registered on the thread-local stack.
+    crate::tiered::settings::set("prefetch_search", "0.5,0.5,0.0")
+        .expect("set prefetch_search on active handle");
+    crate::tiered::settings::set("prefetch_lookup", "0.0,0.0,0.0")
+        .expect("set prefetch_lookup on active handle");
+    crate::tiered::settings::set("plan_aware", "true")
+        .expect("set plan_aware on active handle");
+
+    // Next read drains the queue. No observable field from outside for
+    // local VFS, but the drain path must not crash and queries must
+    // continue to work.
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 2);
+
+    crate::tiered::settings::set("prefetch_reset", "").expect("reset");
+    let v: String = conn.query_row("SELECT v FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, "hello");
+}
+
+#[test]
+fn test_settings_set_without_handle_errors() {
+    // No turbolite connection on this thread; push must fail loudly
+    // rather than silently drop.
+    let r = crate::tiered::settings::set("prefetch_search", "0.3,0.3,0.4");
+    assert!(r.is_err(), "expected error with no active handle, got Ok");
+}
+
+#[test]
+fn test_settings_set_per_connection_isolation() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let cfg_a = TurboliteConfig { cache_dir: dir_a.path().to_path_buf(), ..Default::default() };
+    let cfg_b = TurboliteConfig { cache_dir: dir_b.path().to_path_buf(), ..Default::default() };
+
+    let vfs_a_name = format!("settings_iso_a_{}", std::process::id());
+    let vfs_b_name = format!("settings_iso_b_{}", std::process::id());
+    crate::tiered::register(&vfs_a_name, TurboliteVfs::new_local(cfg_a).expect("vfs A"))
+        .expect("reg A");
+    crate::tiered::register(&vfs_b_name, TurboliteVfs::new_local(cfg_b).expect("vfs B"))
+        .expect("reg B");
+
+    let conn_a = rusqlite::Connection::open(&format!("file:a.db?vfs={}", vfs_a_name)).expect("open A");
+    conn_a.execute_batch("CREATE TABLE a (id INTEGER); INSERT INTO a VALUES (1);").unwrap();
+
+    let conn_b = rusqlite::Connection::open(&format!("file:b.db?vfs={}", vfs_b_name)).expect("open B");
+    conn_b.execute_batch("CREATE TABLE b (id INTEGER); INSERT INTO b VALUES (2);").unwrap();
+
+    // B is on top; push lands on B's queue.
+    crate::tiered::settings::set("prefetch_search", "1.0").expect("set while B on top");
+
+    // Close B → A back on top.
+    drop(conn_b);
+
+    // Push now lands on A, not the dropped B.
+    crate::tiered::settings::set("prefetch_search", "0.5,0.5").expect("set while A on top");
+
+    // A's next read drains A's queue, query still works.
+    let n: i64 = conn_a.query_row("SELECT COUNT(*) FROM a", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}

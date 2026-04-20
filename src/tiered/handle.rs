@@ -120,6 +120,23 @@ pub struct TurboliteHandle {
     lock_file: Option<std::sync::Arc<File>>,
     /// Active byte-range locks
     active_db_locks: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+
+    /// Per-handle settings queue. The SQL function `turbolite_config_set`
+    /// pushes here (via thread-local routing in `settings.rs`); xRead
+    /// drains and applies on the next slow-path read. Only registered on
+    /// the thread-local stack for tiered (main-db) handles — passthrough
+    /// (WAL / journal) handles allocate a queue but don't register, so
+    /// pushes land on the main-db handle even when SQLite opens the WAL
+    /// after the main file. Removed on `Drop`.
+    settings_queue: settings::SettingsQueue,
+}
+
+impl Drop for TurboliteHandle {
+    fn drop(&mut self) {
+        // `leave_handle` is a no-op if the queue was never registered
+        // (passthrough case), so this covers both constructors.
+        settings::leave_handle(&self.settings_queue);
+    }
 }
 
 // SQLite main database lock byte offsets (same as lib.rs)
@@ -253,6 +270,11 @@ impl TurboliteHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
+        // Per-handle settings queue. Register on the thread-local stack
+        // so `turbolite_config_set` pushes route here.
+        let settings_queue = settings::new_queue();
+        settings::enter_handle(settings_queue.clone());
+
         Ok(Self {
             storage,
             runtime,
@@ -296,6 +318,7 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            settings_queue,
         })
     }
 
@@ -344,6 +367,11 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            // Passthrough gets a queue too (keeps the struct uniform and
+            // Drop safe) but never registers on the thread-local stack —
+            // SQL pushes bypass the journal/WAL file and land on the
+            // main-db handle.
+            settings_queue: settings::new_queue(),
         }
     }
 
@@ -776,6 +804,52 @@ impl DatabaseHandle for TurboliteHandle {
         let current_tree_name = manifest_ref.group_to_tree_name.get(&gid).cloned();
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
+
+        // 3b. Drain per-handle settings queue (turbolite_config_set).
+        //
+        // Applied BEFORE the eviction trigger below so a new `cache_limit`
+        // or prefetch schedule takes effect on this query's first slow
+        // read. The drain is a no-op (one mutex try-lock) when nothing is
+        // queued, which is the common case.
+        {
+            let updates = settings::drain_queue(&self.settings_queue);
+            for update in updates {
+                match update.key.as_str() {
+                    "prefetch" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops.clone();
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_search" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops;
+                        }
+                    }
+                    "prefetch_lookup" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_reset" => {
+                        self.prefetch_search = vec![0.3, 0.3, 0.4];
+                        self.prefetch_lookup = vec![0.0, 0.0, 0.0];
+                    }
+                    "plan_aware" => {
+                        self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    "cache_limit" => {
+                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
+                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                        }
+                    }
+                    "evict_on_checkpoint" => {
+                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // 3c. between-query eviction trigger.
         //

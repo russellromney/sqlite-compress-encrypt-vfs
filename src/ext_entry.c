@@ -50,6 +50,11 @@ extern int turbolite_gc(void);
 /* Rust function -- compact B-tree groups. Defined in src/ext.rs. */
 extern const char *turbolite_compact(void);
 
+/* Rust function -- runtime config (per-handle prefetch / cache tuning).
+ * Defined in src/tiered/settings.rs. Scoping is per-TurboliteHandle via
+ * a thread-local stack; see settings.rs for the contract. */
+extern int turbolite_config_set(const char *key, const char *value);
+
 /* Rust functions -- cache eviction + observability.
  * Defined in src/ext.rs. */
 extern int turbolite_evict_tree(const char *tree_names);
@@ -158,6 +163,43 @@ static void turbolite_s3_bytes_func(
     (void)argc;
     (void)argv;
     sqlite3_result_int64(ctx, turbolite_bench_s3_bytes());
+}
+
+/*
+ * turbolite_config_set(key TEXT, value TEXT)
+ *
+ * Runtime prefetch / cache tuning. Scoped to the current connection's
+ * turbolite handle — see src/tiered/settings.rs for the scoping contract.
+ *
+ * Keys: 'prefetch', 'prefetch_search', 'prefetch_lookup',
+ *       'prefetch_reset', 'plan_aware', 'cache_limit',
+ *       'evict_on_checkpoint'.
+ *
+ * Returns 0 on success; errors out with a message on invalid key/value
+ * or when no turbolite handle is open on this thread.
+ */
+static void turbolite_config_set_func(
+    sqlite3_context *ctx,
+    int argc,
+    sqlite3_value **argv
+) {
+    (void)argc;
+    const char *key = (const char *)sqlite3_value_text(argv[0]);
+    const char *value = (const char *)sqlite3_value_text(argv[1]);
+    if (!key || !value) {
+        sqlite3_result_error(ctx, "turbolite_config_set: key and value required", -1);
+        return;
+    }
+    int rc = turbolite_config_set(key, value);
+    if (rc == 1) {
+        sqlite3_result_error(ctx, "turbolite_config_set: invalid key or value", -1);
+        return;
+    }
+    if (rc == 2) {
+        sqlite3_result_error(ctx, "turbolite_config_set: no active turbolite handle on this thread", -1);
+        return;
+    }
+    sqlite3_result_int(ctx, 0);
 }
 
 /*
@@ -488,6 +530,17 @@ int sqlite3_turbolite_init(
     sqlite3_create_function_v2(
         db, "turbolite_compact", 0,
         SQLITE_UTF8, 0, turbolite_compact_func, 0, 0, 0
+    );
+
+    /* Runtime prefetch / cache tuning. Per-handle scoped via thread-local
+     * stack; see src/tiered/settings.rs.
+     *
+     * Keys: 'prefetch', 'prefetch_search', 'prefetch_lookup',
+     *       'prefetch_reset', 'plan_aware', 'cache_limit',
+     *       'evict_on_checkpoint'. */
+    sqlite3_create_function_v2(
+        db, "turbolite_config_set", 2,
+        SQLITE_UTF8, 0, turbolite_config_set_func, 0, 0, 0
     );
     return SQLITE_OK;
 }
