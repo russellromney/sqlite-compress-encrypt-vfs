@@ -155,19 +155,11 @@ example-node-tiered: lib-bundled ## Run Node.js S3 tiered example (HTTP server)
 
 # ── Packages ─────────────────────────────────────────────────────
 
-.PHONY: pkg-python
-pkg-python: ext ## Build Python package (builds ext, bundles binary, creates wheel)
-	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
-	cd packages/python && pip wheel . --no-deps -w dist/
-
-.PHONY: pkg-python-dev
-pkg-python-dev: ext ## Install Python package in dev mode (builds ext first)
-	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
-	cd packages/python && pip install -e .
-
-.PHONY: pkg-node
-pkg-node: ## Build Node.js package (napi-rs native addon)
-	cd packages/node && npm install && npx @napi-rs/cli build --release --platform
+.PHONY: pkg-python pkg-python-dev pkg-node
+pkg-python pkg-python-dev pkg-node: ## Packages live in ../turbolite-ffi now
+	@echo "Language packages moved to ../turbolite-ffi/packages as of Phase Cirrus h3."
+	@echo "Run: make -C ../turbolite-ffi $@"
+	@exit 1
 
 # ── Cleanup ────────────────────────────────────────────────────────
 
