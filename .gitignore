@@ -68,3 +68,9 @@ packages/python/turbolite/turbolite
 # OS / editor
 *.DS_Store
 .context
+
+# Claude Code worktrees / scratch
+.claude/
+
+# Proptest regression minimization files (generated during failing runs)
+*.proptest-regressions
