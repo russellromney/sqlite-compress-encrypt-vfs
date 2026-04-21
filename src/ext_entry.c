@@ -582,6 +582,7 @@ static int install_config_functions_autoext(
 #undef sqlite3_value_text
 #undef sqlite3_result_error
 #undef sqlite3_result_int
+#undef sqlite3_file_control
 
 /* Shims for the Rust-side `install_config_functions` + its scalar
  * function (src/install.rs). Each extern "C" symbol Rust references
@@ -630,6 +631,10 @@ void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int len) {
 
 void sqlite3_result_int(sqlite3_context *ctx, int val) {
     sqlite3_api->result_int(ctx, val);
+}
+
+int sqlite3_file_control(sqlite3 *db, const char *zDbName, int op, void *arg) {
+    return sqlite3_api->file_control(db, zDbName, op, arg);
 }
 
 int sqlite3_trace_v2(sqlite3 *db, unsigned mask,

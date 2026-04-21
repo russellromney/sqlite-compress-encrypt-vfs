@@ -50,6 +50,22 @@ type CreateFnStep = unsafe extern "C" fn(*mut sqlite3_context, c_int, *mut *mut 
 type CreateFnFinal = unsafe extern "C" fn(*mut sqlite3_context);
 type CreateFnDestroy = unsafe extern "C" fn(*mut c_void);
 
+const SQLITE_FCNTL_VFS_POINTER: c_int = 27;
+
+// Minimal shape of sqlite3_vfs — we only touch `zName`. The real struct
+// has ~20 fields; we keep the prefix-compatible layout so &vfs->zName
+// lands at the right offset. Defined here as a local opaque-ish struct
+// rather than binding all of sqlite3_vfs via cbindgen or bindgen.
+#[repr(C)]
+struct sqlite3_vfs_prefix {
+    i_version: c_int,
+    sz_os_file: c_int,
+    mx_pathname: c_int,
+    p_next: *mut c_void,
+    z_name: *const c_char,
+    // ... rest of struct follows but we don't touch it.
+}
+
 extern "C" {
     fn sqlite3_exec(
         db: *mut sqlite3,
@@ -77,6 +93,13 @@ extern "C" {
     fn sqlite3_value_text(value: *mut sqlite3_value) -> *const c_char;
     fn sqlite3_result_error(ctx: *mut sqlite3_context, msg: *const c_char, len: c_int);
     fn sqlite3_result_int(ctx: *mut sqlite3_context, val: c_int);
+
+    fn sqlite3_file_control(
+        db: *mut sqlite3,
+        zDbName: *const c_char,
+        op: c_int,
+        arg: *mut c_void,
+    ) -> c_int;
 }
 
 /// Scalar function body wired via `sqlite3_create_function_v2`. Reads
@@ -117,6 +140,11 @@ unsafe extern "C" fn config_set_scalar(
 ///
 /// Returns:
 /// - `SQLITE_OK` (0) on success
+/// - `SQLITE_MISUSE` if the connection's VFS isn't one of turbolite's
+///   registered names (protects against cross-connection queue leaks
+///   when this function is called on a non-turbolite connection while
+///   a turbolite handle is alive on the same thread — the queue would
+///   otherwise route pushes to the wrong connection)
 /// - A SQLite error code if the `PRAGMA schema_version` probe fails
 ///   (connection isn't turbolite-backed)
 /// - `SQLITE_MISUSE` if no turbolite handle is active on this thread
@@ -128,6 +156,14 @@ unsafe extern "C" fn config_set_scalar(
 pub unsafe extern "C" fn turbolite_install_config_functions(
     db: *mut sqlite3,
 ) -> c_int {
+    // VFS-name guard. See the `install_hook.rs` equivalent comment:
+    // without this, a non-turbolite connection opened on a thread with
+    // an active turbolite handle would receive a scalar pointing at
+    // the turbolite handle's queue.
+    if !connection_uses_turbolite_vfs(db) {
+        return SQLITE_MISUSE;
+    }
+
     // Force xOpen on the main-db file so THIS connection's handle
     // queue is top-of-stack on the thread-local. `PRAGMA schema_version`
     // reads page 1 which is enough to trigger the VFS open.
@@ -166,4 +202,33 @@ pub unsafe extern "C" fn turbolite_install_config_functions(
         None,
         Some(turbolite_settings_queue_free_cb),
     )
+}
+
+/// Ask SQLite for the sqlite3_vfs pointer backing the "main" database
+/// on this connection, read its zName, and check the name against
+/// turbolite's registered-VFS-name set. Returns false for plain sqlite
+/// connections; true only when the connection was opened with
+/// `vfs=<some name passed to turbolite::tiered::register>`.
+unsafe fn connection_uses_turbolite_vfs(db: *mut sqlite3) -> bool {
+    let mut vfs_ptr: *mut sqlite3_vfs_prefix = std::ptr::null_mut();
+    let main = b"main\0".as_ptr() as *const c_char;
+    let rc = sqlite3_file_control(
+        db,
+        main,
+        SQLITE_FCNTL_VFS_POINTER,
+        &mut vfs_ptr as *mut _ as *mut c_void,
+    );
+    if rc != SQLITE_OK || vfs_ptr.is_null() {
+        return false;
+    }
+    let name_ptr = (*vfs_ptr).z_name;
+    if name_ptr.is_null() {
+        return false;
+    }
+    let name_cstr = CStr::from_ptr(name_ptr);
+    let name = match name_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    turbolite::tiered::is_registered_vfs_name(name)
 }
