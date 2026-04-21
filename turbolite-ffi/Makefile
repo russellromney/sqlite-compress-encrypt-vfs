@@ -17,7 +17,11 @@ endif
 
 LIB_NAME := turbolite_ffi
 LIB_FILE := $(LIB_PREFIX)$(LIB_NAME).$(LIB_EXT)
-CARGO_TARGET_DIR ?= ../cinch-target
+# turbolite is a Cargo workspace; its .cargo/config.toml points at
+# `target-dir = "../cinch-target"` relative to the workspace root,
+# resolving to ~/Documents/Github/cinch-target. From this crate's
+# directory that's two levels up.
+CARGO_TARGET_DIR ?= ../../cinch-target
 TARGET_DIR := $(CARGO_TARGET_DIR)/release
 
 # Features forwarded to cargo. Override with: make lib FEATURES="zstd,encryption"

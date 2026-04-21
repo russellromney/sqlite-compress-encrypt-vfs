@@ -29,7 +29,12 @@ import tempfile
 # in both the shared location and the crate-local one for flexibility.
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 _candidates = [
+    # Workspace layout (turbolite/turbolite-ffi/tests/): shared
+    # cinch-target sits next to the turbolite workspace root.
+    os.path.join(_this_dir, "..", "..", "..", "cinch-target", "release", "turbolite"),
+    # Legacy sibling-repo layout.
     os.path.join(_this_dir, "..", "..", "cinch-target", "release", "turbolite"),
+    # Per-crate local target.
     os.path.join(_this_dir, "..", "target", "release", "turbolite"),
 ]
 EXT_PATH = next(

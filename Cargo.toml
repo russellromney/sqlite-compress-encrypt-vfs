@@ -1,3 +1,10 @@
+[workspace]
+# Pure-Rust library crate at the root + C-FFI / loadable-extension crate
+# in `turbolite-ffi/`. Consumers who only need the Rust API pull in the
+# root crate; C / Python / Node / Go / loadable-ext consumers pull in
+# turbolite-ffi's cdylib.
+members = [".", "turbolite-ffi"]
+
 [package]
 name = "turbolite"
 version = "0.4.1"
