@@ -36,6 +36,9 @@ macro_rules! turbolite_debug {
 pub mod compress;
 pub mod dict;
 pub mod tiered;
+
+#[cfg(feature = "bundled-sqlite")]
+mod install_hook;
 pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
 pub use tiered::ManifestSource;
 pub use hadb_storage::StorageBackend;
@@ -79,11 +82,12 @@ pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connecti
     // built-in cache so all reads go through turbolite's VFS.
     conn.execute_batch("PRAGMA cache_size=0;")?;
 
-    // Register the per-connection `turbolite_config_set` SQL function.
-    // Routes to this connection's handle via the thread-local stack set up
-    // in xOpen, so `SELECT turbolite_config_set(...)` from this connection
-    // always lands on this connection's handle.
-    install_config_functions(&conn)?;
+    // `turbolite_config_set` is installed automatically via the
+    // `sqlite3_auto_extension` hook registered by `TurboliteVfs::new_local`
+    // above — SQLite fires the hook on this `sqlite3_open_v2` after xOpen
+    // has pushed the handle queue onto the thread-local stack, so the
+    // scalar binds to THIS connection's queue via pApp. See
+    // `install_hook.rs` for the mechanism.
 
     Ok(conn)
 }

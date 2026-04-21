@@ -78,6 +78,8 @@ impl TurboliteVfs {
         fs::create_dir_all(&config.cache_dir)?;
 
         let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&config.cache_dir));
+        #[cfg(feature = "bundled-sqlite")]
+        crate::install_hook::ensure_registered();
         Self::assemble(config, storage, runtime, Some(owned), true)
     }
 
@@ -89,6 +91,8 @@ impl TurboliteVfs {
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
         fs::create_dir_all(&config.cache_dir)?;
+        #[cfg(feature = "bundled-sqlite")]
+        crate::install_hook::ensure_registered();
         Self::assemble(config, backend, runtime, None, false)
     }
 
