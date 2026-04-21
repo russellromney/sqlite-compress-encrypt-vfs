@@ -800,6 +800,41 @@ impl TurboliteVfs {
         (**self.shared_manifest.load()).clone()
     }
 
+    /// Serialize the current manifest to the turbolite wire format, for
+    /// publication through a `turbodb::ManifestStore` (as the envelope's
+    /// opaque `payload`). See `src/tiered/wire.rs` for the tag byte
+    /// layout. Consumers (haqlite, haqlite-turbolite) never interpret
+    /// these bytes — they pipe them through as-is.
+    pub fn manifest_bytes(&self) -> io::Result<Vec<u8>> {
+        let m = self.manifest();
+        super::wire::encode_pure(&m)
+    }
+
+    /// Serialize the current manifest + a walrust WAL delta position.
+    /// Used by "Turbolite + walrust" deployments where turbolite holds
+    /// the page-group base state and walrust ships incremental WAL
+    /// frames since the last checkpoint.
+    pub fn manifest_bytes_with_walrust_delta(
+        &self,
+        walrust_txid: u64,
+        walrust_changeset_prefix: &str,
+    ) -> io::Result<Vec<u8>> {
+        let m = self.manifest();
+        super::wire::encode_hybrid(&m, walrust_txid, walrust_changeset_prefix)
+    }
+
+    /// Decode wire bytes produced by `manifest_bytes` /
+    /// `manifest_bytes_with_walrust_delta` and apply the resulting
+    /// manifest via `set_manifest()`. If the bytes were hybrid, returns
+    /// `Some((walrust_txid, walrust_changeset_prefix))` so the caller
+    /// can hand that delta position to walrust. Pure payloads return
+    /// `Ok(None)`.
+    pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<Option<(u64, String)>> {
+        let decoded = super::wire::decode(bytes)?;
+        self.set_manifest(decoded.manifest);
+        Ok(decoded.walrust)
+    }
+
     /// Fetch the latest manifest from the backend and apply it via `set_manifest`.
     /// Returns the new manifest version, or None if no manifest exists.
     /// Used by HA followers to catch up from the leader's turbolite state.

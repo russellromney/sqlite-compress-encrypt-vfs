@@ -80,6 +80,7 @@ pub mod settings;
 mod staging;
 mod storage;
 mod vfs;
+mod wire;
 #[cfg(feature = "wal")]
 mod wal_replication;
 
