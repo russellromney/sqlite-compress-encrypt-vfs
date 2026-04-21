@@ -41,6 +41,6 @@
     "build": "tsc",
     "postinstall": "node postinstall.js",
     "test": "npm run build && node test.mjs",
-    "build-ext": "cd ../.. && cargo build --release --no-default-features --features 'loadable-extension,cli-s3,zstd' --lib && cp ../cinch-target/release/libturbolite_ffi.dylib packages/node/turbolite.dylib 2>/dev/null || cp ../cinch-target/release/libturbolite_ffi.so packages/node/turbolite.so 2>/dev/null"
+    "build-ext": "cd ../.. && cargo build --release --no-default-features --features 'loadable-extension,cli-s3,zstd' --lib && cp ../../cinch-target/release/libturbolite_ffi.dylib packages/node/turbolite.dylib 2>/dev/null || cp ../../cinch-target/release/libturbolite_ffi.so packages/node/turbolite.so 2>/dev/null"
   }
 }
