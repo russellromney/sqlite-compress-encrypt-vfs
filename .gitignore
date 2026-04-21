@@ -36,3 +36,4 @@ packages/go/p/
 
 # Browser / misc
 packages/*/p/
+/data.cache
