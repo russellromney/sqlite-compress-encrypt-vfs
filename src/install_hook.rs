@@ -73,34 +73,46 @@ unsafe extern "C" fn auto_extension_entry(
     ffi::SQLITE_OK
 }
 
-/// Internal install: if this thread has an active turbolite handle,
-/// bind `turbolite_config_set` to `db` with that handle's queue as
-/// `pApp`.
+/// Internal install: if `db` is backed by a turbolite VFS AND this
+/// thread has an active turbolite handle, bind `turbolite_config_set`
+/// to `db` with the handle's queue as `pApp`. The VFS-name guard is
+/// load-bearing: without it, any plain sqlite3 connection opened on a
+/// thread where a turbolite handle happens to be alive would get the
+/// scalar installed pointing at the wrong queue (cross-connection
+/// leak). See the `plain_connection_does_not_inherit_scalar_from_alive_turbolite_handle`
+/// regression test.
 ///
-/// Three outcomes, each observable via `tracing` (target = `turbolite`):
-///
-/// - `trace!` — no turbolite handle on this thread. Benign: the
-///   auto-extension fired for a non-turbolite `sqlite3_open_v2` (e.g.
-///   unrelated code in the same process opened its own sqlite db).
-///   No scalar installed. The connection is untouched.
-/// - `error!` — `sqlite3_create_function_v2` returned non-OK. The
-///   connection LOOKED turbolite-backed (had a queue on stack) but
-///   binding the scalar failed. We reclaim the Arc and give up; the
-///   caller later sees "no such function" on `turbolite_config_set`.
-///   If you hit this, something's wrong with the SQLite handle or the
-///   process is in a weird state — escalate.
-/// - silent success on the happy path.
+/// Outcomes, each observable via `tracing` (target = `turbolite`):
+/// - `trace!` on non-turbolite VFS (benign; normal for unrelated
+///   sqlite3_open in the same process).
+/// - `trace!` on "turbolite VFS but no queue on stack" (unexpected —
+///   means xOpen didn't push; should not happen in practice).
+/// - `error!` if `sqlite3_create_function_v2` fails after all other
+///   guards pass (real bug).
+/// - silent on the happy path.
 unsafe fn install(db: *mut ffi::sqlite3) {
+    // VFS guard: resolve the "main" db's VFS on this connection and
+    // bail unless it's one of ours.
+    if !connection_uses_turbolite_vfs(db) {
+        tracing::trace!(
+            target: "turbolite",
+            db = ?db,
+            "install_hook: connection's VFS is not turbolite-registered; \
+             skipping turbolite_config_set binding"
+        );
+        return;
+    }
+
     let queue = match settings::top_queue() {
         Some(q) => q,
         None => {
-            // Non-turbolite connection. Normal when turbolite is linked
-            // into a process that also opens plain sqlite databases.
             tracing::trace!(
                 target: "turbolite",
                 db = ?db,
-                "install_hook: no active turbolite handle on this thread, \
-                 skipping turbolite_config_set binding (non-turbolite connection)"
+                "install_hook: connection uses a turbolite VFS but no \
+                 handle queue is active on this thread; skipping bind. \
+                 Call install_config_functions(&conn) manually if you \
+                 need turbolite_config_set on this connection."
             );
             return;
         }
@@ -203,4 +215,33 @@ unsafe extern "C" fn destroy(ptr: *mut std::ffi::c_void) {
             ptr as *const Mutex<Vec<SettingUpdate>>,
         ));
     }
+}
+
+/// Ask SQLite for the sqlite3_vfs pointer backing the "main" database
+/// on this connection, read its zName, and check the name against
+/// turbolite's registered-VFS-name set. Returns false for plain sqlite
+/// connections (default / memory / other VFSes), true only when the
+/// connection was opened with `vfs=<some name passed to turbolite::tiered::register>`.
+unsafe fn connection_uses_turbolite_vfs(db: *mut ffi::sqlite3) -> bool {
+    let mut vfs_ptr: *mut ffi::sqlite3_vfs = std::ptr::null_mut();
+    let main = b"main\0".as_ptr() as *const c_char;
+    let rc = ffi::sqlite3_file_control(
+        db,
+        main,
+        ffi::SQLITE_FCNTL_VFS_POINTER,
+        &mut vfs_ptr as *mut _ as *mut std::ffi::c_void,
+    );
+    if rc != ffi::SQLITE_OK || vfs_ptr.is_null() {
+        return false;
+    }
+    let name_ptr = (*vfs_ptr).zName;
+    if name_ptr.is_null() {
+        return false;
+    }
+    let name_cstr = std::ffi::CStr::from_ptr(name_ptr);
+    let name = match name_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::tiered::is_registered_vfs_name(name)
 }

@@ -278,10 +278,30 @@ fn is_valid_btree_page(buf: &[u8], hdr_offset: usize) -> bool {
     true
 }
 
+/// Process-global set of turbolite VFS names. Written by [`register`] /
+/// [`register_shared`], read by the auto-extension install hook so it
+/// only binds `turbolite_config_set` on connections actually using a
+/// turbolite VFS — not on unrelated sqlite3 connections that happen to
+/// open on a thread with an active turbolite handle.
+///
+/// Names never leave the set; turbolite VFS registrations live for the
+/// process lifetime today. If that ever changes, add removal here too.
+static REGISTERED_VFS_NAMES: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+/// True if `name` was registered via `turbolite::tiered::register` or
+/// `register_shared`. Used by the install-hook's VFS guard.
+pub fn is_registered_vfs_name(name: &str) -> bool {
+    REGISTERED_VFS_NAMES.lock().contains(name)
+}
+
 /// Register a TurboliteVfs with SQLite under the given name.
 pub fn register(name: &str, vfs: TurboliteVfs) -> Result<(), io::Error> {
     sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
+    REGISTERED_VFS_NAMES.lock().insert(name.to_string());
+    Ok(())
 }
 
 /// Shared VFS wrapper: holds the VFS behind an Arc so it can be registered
@@ -358,7 +378,9 @@ impl Vfs for SharedTurboliteVfs {
 /// This is required for haqlite's shared-mode turbolite integration.
 pub fn register_shared(name: &str, vfs: SharedTurboliteVfs) -> Result<(), io::Error> {
     sqlite_vfs::register(name, vfs, false)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{:?}", e)))?;
+    REGISTERED_VFS_NAMES.lock().insert(name.to_string());
+    Ok(())
 }
 
 #[cfg(feature = "bundled-sqlite")]
