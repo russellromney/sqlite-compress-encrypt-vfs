@@ -41,10 +41,8 @@ pub mod btree_walker;
 
 #[cfg(feature = "bundled-sqlite")]
 mod install_hook;
-pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
 pub use tiered::ManifestSource;
 pub use hadb_storage::StorageBackend;
-pub mod btree_walker;
 
 /// Open a turbolite-backed SQLite connection.
 ///

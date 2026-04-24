@@ -147,6 +147,9 @@ name = "tiered-tune"
 path = "benchmark/tiered-tune.rs"
 required-features = ["bench-s3"]
 
+[build-dependencies]
+cc = "1"
+
 [[example]]
 name = "quick-bench"
 path = "benchmark/quick-bench.rs"
