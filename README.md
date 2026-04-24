@@ -1,6 +1,10 @@
 # turbolite
 
-turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency. 
+turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency.
+
+This repo is a Cargo workspace with two crates:
+- **`turbolite`** — Pure Rust library. SQLite VFS with page-level compression, encryption, and S3 tiering.
+- **`turbolite-ffi`** — C FFI / loadable extension + language bindings (Python, Node.js, Go).
 
 It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest, which can be used separately from S3.
 
@@ -370,7 +374,9 @@ Page-level operation means most SQLite features still work: FTS, R-tree, JSON, W
 
 ## Installation
 
-**Python**: `pip install turbolite` — see [packages/python/](packages/python/)
+This repo is a Cargo workspace. The `turbolite` crate is the pure Rust library at the workspace root. Language bindings and the loadable extension live in `turbolite-ffi/`.
+
+**Python**: `pip install turbolite` — see [turbolite-ffi/packages/python/](turbolite-ffi/packages/python/)
 
 ```python
 import turbolite
@@ -390,7 +396,7 @@ conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
 conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
 ```
 
-**Node.js**: `npm install turbolite` — see [packages/node/](packages/node/)
+**Node.js**: `npm install turbolite` — see [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/)
 
 **Rust**:
 ```toml
@@ -450,15 +456,14 @@ const rows = db.query("SELECT * FROM users");
 db.close();
 ```
 
-Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [packages/node/](packages/node/) for full docs.
+Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/) for full docs.
 
 ### Rust (local)
 
 ```rust
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 
 let config = TurboliteConfig {
-    storage_backend: StorageBackend::Local,
     cache_dir: "/path/to/data".into(),
     ..Default::default()
 };
@@ -475,19 +480,15 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 ### Rust (S3 cloud)
 
 ```rust
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
+use hadb_storage::StorageBackend;
 
 let config = TurboliteConfig {
-    storage_backend: StorageBackend::S3 {
-        bucket: "my-bucket".into(),
-        prefix: "my-database".into(),
-        endpoint_url: None,
-        region: None,
-    },
     cache_dir: "/tmp/cache".into(),
     ..Default::default()
 };
-let vfs = TurboliteVfs::new(config)?;
+let storage: Arc<dyn StorageBackend> = /* your S3 backend */;
+let vfs = TurboliteVfs::with_backend(config, storage, tokio::runtime::Handle::current())?;
 turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(
