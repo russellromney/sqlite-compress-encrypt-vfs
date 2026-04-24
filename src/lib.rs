@@ -36,6 +36,8 @@ macro_rules! turbolite_debug {
 pub mod compress;
 pub mod dict;
 pub mod tiered;
+pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
+pub mod btree_walker;
 
 #[cfg(feature = "bundled-sqlite")]
 mod install_hook;
