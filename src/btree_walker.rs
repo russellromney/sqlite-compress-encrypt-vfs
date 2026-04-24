@@ -2,7 +2,7 @@
 //!
 //! Parses sqlite_master (page 1) to discover root pages, then walks each B-tree
 //! to collect all interior, leaf, and overflow pages. Used by the tiered VFS to
-//! build B-tree-aware page groups (Phase Midway).
+//! build B-tree-aware page groups.
 //!
 //! SQLite page types:
 //!   0x02 = interior index B-tree

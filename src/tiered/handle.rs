@@ -1,41 +1,49 @@
 use super::*;
 
+use hadb_storage::StorageBackend;
+use tokio::runtime::Handle as TokioHandle;
+
+use super::storage as storage_helpers;
+
 // ===== TurboliteHandle =====
 
-/// Database handle for tiered S3-backed storage.
+/// Database handle for tiered turbolite storage.
 ///
-/// MainDb files are backed by S3 with a local page-level cache.
-/// WAL/journal files are passthrough to local disk.
+/// MainDb files are backed by a pluggable `StorageBackend` with a local
+/// page-level cache. WAL/journal files are passthrough to local disk.
 pub struct TurboliteHandle {
     // --- Tiered mode (MainDb) ---
-    s3: Option<Arc<S3Client>>,
-    /// Unified storage client for local page group flush (local mode only).
-    storage: Option<Arc<StorageClient>>,
+    /// Pluggable storage backend. Same `Arc` the VFS holds.
+    storage: Option<Arc<dyn StorageBackend>>,
+    /// Tokio runtime handle used to drive async backend calls. Required
+    /// whenever `storage` is `Some`.
+    runtime: Option<TokioHandle>,
+    /// True when the backend is local-filesystem. Some paths differ
+    /// between local and remote (e.g. no eager interior fetch in local).
+    is_local: bool,
     cache: Option<Arc<DiskCache>>,
     /// Shared manifest via ArcSwap (lock-free reads, atomic store on writes).
     ///
     /// Safety of clone-modify-store pattern: SQLite's EXCLUSIVE lock serializes all
     /// writes within a process. Only one handle calls sync()/write_all_at() at a time.
-    /// flush_to_s3() runs outside the SQLite lock but is serialized by flush_lock.
+    /// flush_to_storage() runs outside the SQLite lock but is serialized by flush_lock.
     /// set_manifest() from HA followers uses monotonic version checks to reject stale updates.
     /// Readers (load()) see a consistent snapshot; they may briefly see an old version
     /// during a store(), which is safe because page data in the cache file is immutable
     /// once written (pages are never overwritten, only new versions are added).
     manifest: Arc<ArcSwap<Manifest>>,
     /// Dirty page numbers (data lives in disk cache, not in memory).
-    /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
+    /// Replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
     /// holding a second copy of every dirty page in memory.
     dirty_page_nums: RwLock<HashSet<u64>>,
     /// Page group IDs that were locally checkpointed but not yet synced to S3.
-    /// Populated during local-checkpoint-only mode; drained by flush_to_s3().
-    /// Arc'd so flush_to_s3 can drain from outside SQLite lock.
+    /// Populated during local-checkpoint-only mode; drained by flush_to_storage().
+    /// Arc'd so flush_to_storage can drain from outside SQLite lock.
     s3_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     page_size: std::sync::atomic::AtomicU32,
     pages_per_group: u32,
     compression_level: i32,
     read_only: bool,
-    /// Per-VFS sync mode (Durable = S3 upload in sync, LocalThenFlush = defer to flush_to_s3)
-    sync_mode: SyncMode,
     /// Per-tree consecutive cache miss counters (for fraction-based prefetch).
     /// Keyed by B-tree name. Unknown trees use `default_miss_count`.
     tree_miss_counts: HashMap<String, u8>,
@@ -57,7 +65,7 @@ pub struct TurboliteHandle {
     #[cfg(feature = "zstd")]
     dictionary_bytes: Option<Vec<u8>>,
 
-    /// Phase Zenith-c: true if dirty pages have been written since the last
+    /// True if dirty pages have been written since the last
     /// successful sync. Used to detect transaction rollback (lock downgrade
     /// from EXCLUSIVE/RESERVED without sync having been called).
     dirty_since_sync: bool,
@@ -73,11 +81,11 @@ pub struct TurboliteHandle {
     /// AES-256-GCM encryption key for S3 data and local cache.
     encryption_key: Option<[u8; 32]>,
 
-    // --- Phase Marne: query-plan-aware prefetch ---
+    // Query-plan-aware prefetch
     /// When true, the VFS drains the global plan queue on first read after step().
     query_plan_prefetch: bool,
 
-    // --- Phase Midway: VACUUM detection ---
+    // VACUUM detection
     /// Schema cookie from page 0 offset 24 (4 bytes BE). Changes on schema modifications
     /// and VACUUM. Used to detect VACUUM and trigger B-tree re-walk at checkpoint.
     last_schema_cookie: Option<u32>,
@@ -85,17 +93,17 @@ pub struct TurboliteHandle {
     /// consumed during the upload phase.
     vacuum_replaced_keys: Option<Vec<String>>,
 
-    // --- Phase Stalingrad: cache eviction ---
+    // Cache eviction
     /// Maximum cache size in bytes. None = unlimited.
     cache_limit: Option<u64>,
     /// Evict data tier after successful checkpoint S3 upload.
     evict_on_checkpoint: bool,
 
-    // --- Phase Kursk: staging log for two-phase checkpoint ---
+    // Staging log for two-phase checkpoint
     /// Append-only staging log writer (open during LocalThenFlush checkpoint).
     /// Lazily opened on first dirty write; closed+fsynced in sync().
     staging_writer: Option<staging::StagingWriter>,
-    /// Shared pending flushes. Populated by sync(), drained by flush_to_s3().
+    /// Shared pending flushes. Populated by sync(), drained by flush_to_storage().
     pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     /// Monotonic counter for staging log filenames (avoids version collisions).
     staging_seq: Arc<AtomicU64>,
@@ -112,6 +120,23 @@ pub struct TurboliteHandle {
     lock_file: Option<std::sync::Arc<File>>,
     /// Active byte-range locks
     active_db_locks: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
+
+    /// Per-handle settings queue. The SQL function `turbolite_config_set`
+    /// pushes here (via thread-local routing in `settings.rs`); xRead
+    /// drains and applies on the next slow-path read. Only registered on
+    /// the thread-local stack for tiered (main-db) handles — passthrough
+    /// (WAL / journal) handles allocate a queue but don't register, so
+    /// pushes land on the main-db handle even when SQLite opens the WAL
+    /// after the main file. Removed on `Drop`.
+    settings_queue: settings::SettingsQueue,
+}
+
+impl Drop for TurboliteHandle {
+    fn drop(&mut self) {
+        // `leave_handle` is a no-op if the queue was never registered
+        // (passthrough case), so this covers both constructors.
+        settings::leave_handle(&self.settings_queue);
+    }
 }
 
 // SQLite main database lock byte offsets (same as lib.rs)
@@ -121,10 +146,11 @@ const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 const SHARED_SIZE: u64 = 510;
 
 impl TurboliteHandle {
-    /// Create a tiered handle backed by S3 + local page cache.
+    /// Create a tiered handle backed by a pluggable `StorageBackend` +
+    /// local page cache.
     pub(crate) fn new_tiered(
-        s3: Option<Arc<S3Client>>,
-        storage: Option<Arc<StorageClient>>,
+        storage: Option<Arc<dyn StorageBackend>>,
+        runtime: Option<TokioHandle>,
         cache: Arc<DiskCache>,
         shared_manifest: Arc<ArcSwap<Manifest>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
@@ -134,33 +160,44 @@ impl TurboliteHandle {
         pages_per_group: u32,
         compression_level: i32,
         read_only: bool,
-        sync_mode: SyncMode,
         prefetch_search: Vec<f32>,
         prefetch_lookup: Vec<f32>,
         prefetch_pool: Option<Arc<PrefetchPool>>,
         gc_enabled: bool,
-        eager_index_load: bool,
         #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
         encryption_key: Option<[u8; 32]>,
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
+        is_local: bool,
     ) -> io::Result<Self> {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = (**shared_manifest.load()).clone();
         let page_size = manifest.page_size;
 
-        // Eagerly fetch page group 0 and interior/index chunks from S3.
-        // In local mode (s3=None), these are not fetched eagerly; they're fetched
-        // on demand from local page groups when first accessed.
-        #[cfg(feature = "cloud")]
-        if let Some(ref s3_ref) = s3 {
+        // Eagerly fetch page group 0 on open. Group 0 holds SQLite's schema +
+        // root page (page 1), which is hit on every connection open, so the
+        // round-trip is load-bearing. Interior and index chunk bundles are NOT
+        // fetched eagerly (Phase Cirrus d): they come in as cache misses on
+        // first query like any other page group. In local mode (is_local=true)
+        // nothing is prefetched; the local page-group files back the reads.
+        if !is_local {
+            let storage_ref = storage
+                .as_ref()
+                .expect("non-local mode requires a storage backend");
+            let runtime_ref = runtime
+                .as_ref()
+                .expect("non-local mode requires a runtime handle");
             // Eagerly fetch page group 0 (contains schema + root page, hit on every query)
             if manifest.page_count > 0 && cache.group_state(0) != GroupState::Present {
                 if let Some(key) = manifest.page_group_keys.first() {
                     if !key.is_empty() {
                         if cache.try_claim_group(0) {
-                            if let Ok(Some(pg_data)) = s3_ref.get_page_group(key) {
+                            if let Ok(Some(pg_data)) = storage_helpers::get_page_group(
+                                storage_ref.as_ref(),
+                                runtime_ref,
+                                key,
+                            ) {
                                 let ft = manifest.frame_tables.first().map(|v| v.as_slice());
                                 let gp0 = manifest.group_page_nums(0);
                                 let _ = Self::decode_and_cache_group_static(
@@ -175,12 +212,16 @@ impl TurboliteHandle {
                                     dictionary,
                                     encryption_key.as_ref(),
                                 );
-                                // Phase Drift-c: apply overrides for group 0
+                                // Apply overrides for group 0
                                 if let Some(overrides) = manifest.subframe_overrides.get(0) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
                                         for (&frame_idx, ovr) in overrides {
-                                            if let Ok(Some(ovr_data)) = s3_ref.get_page_group(&ovr.key) {
+                                            if let Ok(Some(ovr_data)) = storage_helpers::get_page_group(
+                                                storage_ref.as_ref(),
+                                                runtime_ref,
+                                                &ovr.key,
+                                            ) {
                                                 if let Ok(decompressed) = decode_seekable_subchunk(
                                                     &ovr_data,
                                                     #[cfg(feature = "zstd")]
@@ -212,107 +253,8 @@ impl TurboliteHandle {
                 }
             }
 
-            // Eagerly fetch interior chunks (B-tree interior pages split across S3 objects).
-            let interior_already_cached = !cache.interior_pages.lock().is_empty();
-            if interior_already_cached {
-                turbolite_debug!(
-                    "[tiered] interior pages already cached ({} pages), skipping chunk fetch",
-                    cache.interior_pages.lock().len(),
-                );
-            } else if !manifest.interior_chunk_keys.is_empty() {
-                let chunk_keys: Vec<String> = manifest.interior_chunk_keys.values().cloned().collect();
-                turbolite_debug!("[tiered] fetching {} interior chunks in parallel...", chunk_keys.len());
-                match s3_ref.get_page_groups_by_key(&chunk_keys) {
-                    Ok(results) => {
-                        #[cfg(feature = "zstd")]
-                        let ib_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                        let mut total_pages = 0usize;
-                        let mut total_bytes = 0usize;
-                        for (key, data) in &results {
-                            total_bytes += data.len();
-                            match decode_interior_bundle(
-                                data,
-                                #[cfg(feature = "zstd")]
-                                ib_decoder.as_ref(),
-                                encryption_key.as_ref(),
-                            ) {
-                                Ok(pages) => {
-                                    total_pages += pages.len();
-                                    for (pnum, pdata) in &pages {
-                                        let _ = cache.write_page(*pnum, pdata);
-                                        let loc = manifest.page_location(*pnum)
-                                            .expect("interior page must have group assignment");
-                                        cache.mark_interior_group(loc.group_id, *pnum, loc.index);
-                                    }
-                                }
-                                Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                        format!("interior chunk {} decode failed: {}", key, e)));
-                                }
-                            }
-                        }
-                        turbolite_debug!(
-                            "[tiered] interior chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                            total_pages, results.len(), total_bytes as f64 / 1024.0,
-                        );
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other,
-                            format!("interior chunk fetch failed: {}", e)));
-                    }
-                }
-            }
-
-            // Index leaf bundles: synchronous fetch (errors must surface on open)
-            let index_already_cached = !cache.index_pages.lock().is_empty();
-            if eager_index_load && !manifest.index_chunk_keys.is_empty() && !index_already_cached {
-                let chunk_keys: Vec<String> = manifest.index_chunk_keys.values().cloned().collect();
-                let n_chunks = chunk_keys.len();
-                turbolite_debug!("[tiered] fetching {} index leaf chunks...", n_chunks);
-                match s3_ref.get_page_groups_by_key(&chunk_keys) {
-                    Ok(results) => {
-                        #[cfg(feature = "zstd")]
-                        let ix_decoder = dictionary.map(zstd::dict::DecoderDictionary::copy);
-                        let mut total_pages = 0usize;
-                        let mut total_bytes = 0usize;
-                        for (key, data) in &results {
-                            total_bytes += data.len();
-                            match decode_interior_bundle(
-                                data,
-                                #[cfg(feature = "zstd")]
-                                ix_decoder.as_ref(),
-                                encryption_key.as_ref(),
-                            ) {
-                                Ok(pages) => {
-                                    total_pages += pages.len();
-                                    for (pnum, pdata) in &pages {
-                                        let _ = cache.write_page(*pnum, pdata);
-                                        cache.index_pages.lock().insert(*pnum);
-                                    }
-                                }
-                                Err(e) => {
-                                    return Err(io::Error::new(io::ErrorKind::InvalidData,
-                                        format!("index chunk {} decode failed: {}", key, e)));
-                                }
-                            }
-                        }
-                        turbolite_debug!(
-                            "[tiered] index leaf chunks loaded: {} pages from {} chunks ({:.1}KB total)",
-                            total_pages, results.len(), total_bytes as f64 / 1024.0,
-                        );
-                    }
-                    Err(e) => {
-                        return Err(io::Error::new(io::ErrorKind::Other,
-                            format!("index chunk fetch failed: {}", e)));
-                    }
-                }
-            } else if index_already_cached {
-                turbolite_debug!(
-                    "[tiered] index pages already cached ({} pages), skipping chunk fetch",
-                    cache.index_pages.lock().len(),
-                );
-            }
-        } // end #[cfg(feature = "cloud")] S3 eager fetch block
+        } // end non-local eager fetch block (group 0 only; interior + index
+          // bundles removed in Phase Cirrus d)
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {
@@ -328,9 +270,15 @@ impl TurboliteHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
+        // Per-handle settings queue. Register on the thread-local stack
+        // so `turbolite_config_set` pushes route here.
+        let settings_queue = settings::new_queue();
+        settings::enter_handle(settings_queue.clone());
+
         Ok(Self {
-            s3,
             storage,
+            runtime,
+            is_local,
             cache: Some(cache),
             manifest: shared_manifest,
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -339,7 +287,6 @@ impl TurboliteHandle {
             pages_per_group,
             compression_level,
             read_only,
-            sync_mode,
             tree_miss_counts: HashMap::new(),
             prefetch_search,
             prefetch_lookup,
@@ -371,14 +318,16 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            settings_queue,
         })
     }
 
     /// Create a passthrough handle for WAL/journal files (local file I/O).
     pub(crate) fn new_passthrough(file: File, db_path: PathBuf, encryption_key: Option<[u8; 32]>) -> Self {
         Self {
-            s3: None,
             storage: None,
+            runtime: None,
+            is_local: true,
             cache: None,
             manifest: Arc::new(ArcSwap::from_pointee(Manifest::empty())),
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -387,7 +336,6 @@ impl TurboliteHandle {
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             compression_level: 0,
             read_only: false,
-            sync_mode: SyncMode::Durable,
             tree_miss_counts: HashMap::new(),
             prefetch_search: vec![0.3, 0.3, 0.4],
             prefetch_lookup: vec![0.0, 0.0, 0.0],
@@ -419,6 +367,11 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            // Passthrough gets a queue too (keeps the struct uniform and
+            // Drop safe) but never registers on the thread-local stack —
+            // SQL pushes bypass the journal/WAL file and land on the
+            // main-db handle.
+            settings_queue: settings::new_queue(),
         }
     }
 
@@ -450,8 +403,17 @@ impl TurboliteHandle {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn s3(&self) -> &S3Client {
-        self.s3.as_ref().expect("s3 client required for tiered mode")
+    pub(crate) fn storage_backend(&self) -> &dyn StorageBackend {
+        self.storage
+            .as_deref()
+            .expect("storage backend required for tiered mode")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn storage_runtime(&self) -> &TokioHandle {
+        self.runtime
+            .as_ref()
+            .expect("runtime handle required for tiered mode")
     }
 
     #[allow(dead_code)]
@@ -683,7 +645,8 @@ impl TurboliteHandle {
         current_gid: u64,
         manifest: &Manifest,
         cache: &Arc<DiskCache>,
-        _s3: &Arc<S3Client>,
+        _storage: &dyn StorageBackend,
+        _runtime: &TokioHandle,
     ) {
         let pool = match &self.prefetch_pool {
             Some(pool) => pool,
@@ -813,7 +776,7 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // 1. Check dirty pages first (new pages may not be in manifest yet).
-        // Phase Marne: data lives in disk cache, not in memory.
+        // Data lives in disk cache, not in memory.
         if self.dirty_page_nums.read().contains(&page_num) {
             if let Some(cache) = &self.cache {
                 cache.read_page(page_num, buf)?;
@@ -828,7 +791,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // 3. Look up page location (Phase Midway).
+        // 3. Look up page location.
         // Safe to .expect() here because:
         //    - New pages (not in manifest) are always in dirty_page_nums (returned above)
         //    - Pages beyond page_count are zero-filled (returned above)
@@ -842,7 +805,53 @@ impl DatabaseHandle for TurboliteHandle {
         drop(manifest_ref);
         let page_in_group_idx = loc.index as usize;
 
-        // 3c. Phase Stalingrad: between-query eviction trigger.
+        // 3b. Drain per-handle settings queue (turbolite_config_set).
+        //
+        // Applied BEFORE the eviction trigger below so a new `cache_limit`
+        // or prefetch schedule takes effect on this query's first slow
+        // read. The drain is a no-op (one mutex try-lock) when nothing is
+        // queued, which is the common case.
+        {
+            let updates = settings::drain_queue(&self.settings_queue);
+            for update in updates {
+                match update.key.as_str() {
+                    "prefetch" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops.clone();
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_search" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_search = hops;
+                        }
+                    }
+                    "prefetch_lookup" => {
+                        if let Some(hops) = settings::parse_hops(&update.value) {
+                            self.prefetch_lookup = hops;
+                        }
+                    }
+                    "prefetch_reset" => {
+                        self.prefetch_search = vec![0.3, 0.3, 0.4];
+                        self.prefetch_lookup = vec![0.0, 0.0, 0.0];
+                    }
+                    "plan_aware" => {
+                        self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    "cache_limit" => {
+                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
+                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
+                        }
+                    }
+                    "evict_on_checkpoint" => {
+                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3c. between-query eviction trigger.
         //
         // Check if a query completed since our last read (SQLITE_TRACE_PROFILE
         // fires on statement completion and sets the end-query signal). If so,
@@ -884,57 +893,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // 3e. Drain per-connection settings (turbolite_config_set SQL function).
-        // Same global-queue pattern as plan drain. Users can tune prefetch schedules
-        // before each query without reopening the connection.
-        //
-        // Keys:
-        //   prefetch        - convenience, sets both search and lookup
-        //   prefetch_search - SEARCH queries (aggressive warmup)
-        //   prefetch_lookup - index lookups / point queries (conservative)
-        //   prefetch_reset  - reset both to defaults
-        //   plan_aware      - enable/disable plan-aware prefetch
-        {
-            let updates = settings::drain_settings();
-            for update in updates {
-                match update.key.as_str() {
-                    "prefetch" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_search = hops.clone();
-                            self.prefetch_lookup = hops;
-                        }
-                    }
-                    "prefetch_search" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_search = hops;
-                        }
-                    }
-                    "prefetch_lookup" => {
-                        if let Some(hops) = settings::parse_hops(&update.value) {
-                            self.prefetch_lookup = hops;
-                        }
-                    }
-                    "prefetch_reset" => {
-                        self.prefetch_search = vec![0.3, 0.3, 0.4];
-                        self.prefetch_lookup = vec![0.0, 0.0, 0.0];
-                    }
-                    "plan_aware" => {
-                        self.query_plan_prefetch = matches!(update.value.as_str(), "true" | "1");
-                    }
-                    "cache_limit" => {
-                        if let Some(bytes) = settings::parse_byte_size(&update.value) {
-                            self.cache_limit = if bytes == 0 { None } else { Some(bytes) };
-                        }
-                    }
-                    "evict_on_checkpoint" => {
-                        self.evict_on_checkpoint = matches!(update.value.as_str(), "true" | "1");
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 3f. Phase Marne: query-plan-aware prefetch.
+        // 3e. query-plan-aware prefetch.
         //
         // Drain the global plan queue and submit ALL planned groups to the
         // prefetch pool in EQP order: all groups for tree 1, then all groups
@@ -960,7 +919,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
 
-                if std::env::var("BENCH_VERBOSE").is_ok() {
+                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     let manifest_snap = self.manifest.load();
                     let tree_names: Vec<&String> = manifest_snap.tree_name_to_groups.keys().collect();
                     let planned_names: Vec<&str> = planned.iter().map(|a| a.tree_name.as_str()).collect();
@@ -1043,14 +1002,19 @@ impl DatabaseHandle for TurboliteHandle {
         }
         cache.stat_misses.fetch_add(1, Ordering::Relaxed);
 
-        // 5.local: For local-only mode, fetch the page group from local pg/ directory,
-        // decode it, populate the cache, then read the page.
-        if self.s3.is_none() {
-            if let Some(ref storage) = self.storage {
+        // 5.local: For local-only mode, fetch the page group from local pg/
+        // directory (backed by hadb-storage-local), decode, populate cache,
+        // then read the page.
+        if self.is_local {
+            if let (Some(ref storage), Some(ref runtime)) = (self.storage.as_ref(), self.runtime.as_ref()) {
                 let manifest = (**self.manifest.load()).clone();
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
-                        if let Ok(Some(pg_data)) = storage.get_page_group(key) {
+                        if let Ok(Some(pg_data)) = storage_helpers::get_page_group(
+                            storage.as_ref(),
+                            runtime,
+                            key,
+                        ) {
                             let pages_in_group = manifest.group_page_nums(gid);
                             let ft = manifest.frame_tables.get(gid as usize);
                             let has_ft = manifest.sub_pages_per_frame > 0
@@ -1086,12 +1050,16 @@ impl DatabaseHandle for TurboliteHandle {
                             } else { false };
 
                             if decoded_ok {
-                                // Phase Drift-c: apply override frames
+                                // Apply override frames
                                 if let Some(overrides) = manifest.subframe_overrides.get(gid as usize) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
                                         for (&frame_idx, ovr) in overrides {
-                                            if let Ok(Some(ovr_data)) = storage.get_page_group(&ovr.key) {
+                                            if let Ok(Some(ovr_data)) = storage_helpers::get_page_group(
+                                                storage.as_ref(),
+                                                runtime,
+                                                &ovr.key,
+                                            ) {
                                                 if let Ok(decompressed) = decode_seekable_subchunk(
                                                     &ovr_data,
                                                     #[cfg(feature = "zstd")]
@@ -1146,10 +1114,16 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // S3 fetch paths (seekable + legacy) only available with cloud feature.
-        #[cfg(feature = "cloud")]
+        // Remote backend fetch paths (seekable + legacy).
         {
-        let s3_arc = Arc::clone(self.s3.as_ref().expect("s3 checked above"));
+        let storage_arc = Arc::clone(self.storage.as_ref().expect("storage checked above"));
+        let storage_ref = storage_arc.as_ref();
+        let runtime_owned = self
+            .runtime
+            .as_ref()
+            .expect("runtime required for remote fetch")
+            .clone();
+        let runtime_ref = &runtime_owned;
         let miss_start = Instant::now();
 
         // Check if seekable format is available for sub-chunk range GETs.
@@ -1169,7 +1143,7 @@ impl DatabaseHandle for TurboliteHandle {
                     .expect("gid must be valid index into page_group_keys");
                 let entry = &ft[frame_idx];
 
-                // Phase Drift-c: check for override frame
+                // Check for override frame
                 let override_entry = manifest.subframe_overrides
                     .get(gid as usize)
                     .and_then(|ovs| ovs.get(&frame_idx));
@@ -1196,13 +1170,13 @@ impl DatabaseHandle for TurboliteHandle {
                         }
                     }
                 }
-                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
+                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, storage_ref, runtime_ref);
 
                 let s3_start = Instant::now();
                 let fetch_result = if let Some(ovr) = override_entry {
-                    s3_arc.get_page_group(&ovr.key).map(|opt| opt.map(|d| d))
+                    storage_helpers::get_page_group(storage_ref, runtime_ref, &ovr.key)
                 } else {
-                    s3_arc.range_get(base_key, entry.offset, entry.len)
+                    storage_helpers::range_get(storage_ref, runtime_ref, base_key, entry.offset, entry.len)
                 };
                 match fetch_result {
                     Ok(Some(compressed_frame)) => {
@@ -1280,7 +1254,7 @@ impl DatabaseHandle for TurboliteHandle {
                         cache.touch_group(gid);
                         self.reset_misses(current_tree_name.as_ref());
 
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
+                        if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!(
                                 "  [range-get] page={} gid={} frame={}/{} s3={}ms decode={}ms total={}ms ({:.1}KB)",
                                 page_num, gid, frame_idx, ft.len(), s3_ms, decode_ms,
@@ -1292,7 +1266,7 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                     Ok(None) | Err(_) => {
                         // Fall through to legacy path
-                        if std::env::var("BENCH_VERBOSE").is_ok() {
+                        if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             eprintln!(
                                 "  [range-get] page={} gid={} frame={} failed, falling through to legacy path",
                                 page_num, gid, frame_idx,
@@ -1309,7 +1283,7 @@ impl DatabaseHandle for TurboliteHandle {
         if state == GroupState::Fetching {
             let wait_start = Instant::now();
             cache.wait_for_group(gid);
-            if std::env::var("BENCH_VERBOSE").is_ok() {
+            if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                 turbolite_debug!(
                     "  [inline] page={} gid={} WAITED for prefetch worker {}ms",
                     page_num, gid, wait_start.elapsed().as_millis(),
@@ -1318,11 +1292,11 @@ impl DatabaseHandle for TurboliteHandle {
         } else if state != GroupState::Present {
             if cache.try_claim_group(gid) {
                 self.increment_misses(current_tree_name.as_ref());
-                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, &s3_arc);
+                self.trigger_prefetch(page_num, gid, &manifest, &cache_arc, storage_ref, runtime_ref);
                 if let Some(key) = manifest.page_group_keys.get(gid as usize) {
                     if !key.is_empty() {
                         let s3_start = Instant::now();
-                        match s3_arc.get_page_group(key) {
+                        match storage_helpers::get_page_group(storage_ref, runtime_ref, key) {
                             Ok(Some(pg_data)) => {
                                 let s3_ms = s3_start.elapsed().as_millis();
                                 let decode_start = Instant::now();
@@ -1378,7 +1352,7 @@ impl DatabaseHandle for TurboliteHandle {
                                 }
                                 cache.mark_group_present(gid);
                                 cache.touch_group(gid);
-                                if std::env::var("BENCH_VERBOSE").is_ok() {
+                                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                                     turbolite_debug!(
                                         "  [inline] page={} gid={} s3={}ms decode={}ms write={}ms total={}ms ({:.1}KB)",
                                         page_num, gid, s3_ms, decode_ms, write_ms,
@@ -1411,7 +1385,7 @@ impl DatabaseHandle for TurboliteHandle {
             } else {
                 let wait_start = Instant::now();
                 cache.wait_for_group(gid);
-                if std::env::var("BENCH_VERBOSE").is_ok() {
+                if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     turbolite_debug!(
                         "  [inline] page={} gid={} WAITED (race) {}ms",
                         page_num, gid, wait_start.elapsed().as_millis(),
@@ -1419,7 +1393,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
             }
         }
-        } // end #[cfg(feature = "cloud")] S3 fetch block
+        } // end remote backend fetch block
 
         // Read the page from cache (should be present now after legacy download).
         if cache.is_present(page_num) {
@@ -1430,7 +1404,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // Phase Kursk: fallback read from cache file even if bitmap says absent.
+        // Fallback read from cache file even if bitmap says absent.
         if cache.read_page(page_num, buf).is_ok() && buf.iter().any(|&b| b != 0) {
             cache.bitmap_mark(page_num);
             cache.mark_group_present(gid);
@@ -1473,7 +1447,7 @@ impl DatabaseHandle for TurboliteHandle {
         let page_size = self.page_size.load(Ordering::Relaxed) as u64;
         let page_num = offset / page_size;
 
-        // Phase Midway: capture schema cookie from page 0 for VACUUM detection.
+        // Capture schema cookie from page 0 for VACUUM detection.
         // Read the EXISTING cookie before this write overwrites it.
         if page_num == 0 && self.last_schema_cookie.is_none() {
             if let Some(cache) = &self.cache {
@@ -1494,7 +1468,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
+        // Write to local cache and track as dirty (data only in cache, not in memory)
         if let Some(cache) = &self.cache {
             cache.write_page(page_num, buf)?;
             // Invalidate mem_cache for this page so reads see the fresh disk write,
@@ -1514,22 +1488,6 @@ impl DatabaseHandle for TurboliteHandle {
         }
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
-
-        // Phase Kursk: append to staging log for LocalThenFlush mode.
-        // Captures exact page contents at write time, immune to overwrite
-        // by subsequent checkpoints.
-        if self.sync_mode == SyncMode::LocalThenFlush {
-            let ps = self.page_size.load(Ordering::Relaxed);
-            if self.staging_writer.is_none() && ps > 0 {
-                let seq = self.staging_seq.fetch_add(1, Ordering::Relaxed);
-                self.staging_writer = Some(
-                    staging::StagingWriter::open(&self.staging_dir, seq, ps)?
-                );
-            }
-            if let Some(ref mut writer) = self.staging_writer {
-                writer.append(page_num, buf)?;
-            }
-        }
 
         // Update manifest page_count if this page extends the database.
         // Fast path: read lock to check if update is needed (common case: no).
@@ -1575,7 +1533,7 @@ impl DatabaseHandle for TurboliteHandle {
 
     fn sync(&mut self, _data_only: bool) -> Result<(), io::Error> {
         let dirty_count = self.dirty_page_nums.read().len();
-        turbolite_debug!("[vfs::sync] called (dirty={}, read_only={}, sync_mode={:?})", dirty_count, self.read_only, self.sync_mode);
+        turbolite_debug!("[vfs::sync] called (dirty={}, read_only={})", dirty_count, self.read_only);
         if self.is_passthrough() {
             return self
                 .passthrough_file
@@ -1589,16 +1547,16 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(());
         }
 
-        // Phase Marne: snapshot is just page numbers, not page data.
+        // Snapshot is just page numbers, not page data.
         let dirty_snapshot: HashSet<u64> = {
             let dirty = self.dirty_page_nums.read();
             let has_pending_groups = !self.s3_dirty_groups.lock().unwrap().is_empty();
             if dirty.is_empty() && !has_pending_groups {
                 self.dirty_since_sync = false;
-                turbolite_debug!("[sync] early return: 0 dirty pages, 0 pending groups (sync_mode={:?})", self.sync_mode);
+                turbolite_debug!("[sync] early return: 0 dirty pages, 0 pending groups");
                 return Ok(());
             }
-            turbolite_debug!("[sync] dirty={}, pending={}, sync_mode={:?}", dirty.len(), has_pending_groups, self.sync_mode);
+            turbolite_debug!("[sync] dirty={}, pending={}", dirty.len(), has_pending_groups);
             dirty.clone()
         };
 
@@ -1607,7 +1565,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Local-checkpoint-only: record dirty group IDs, scan interior pages,
         // free in-memory dirty map, but skip S3 upload entirely.
         // Pages are already in disk cache from write_all_at().
-        if self.sync_mode == SyncMode::LocalThenFlush || LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
+        if LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
             let cache_arc = self.cache.as_ref().expect("cache required for tiered handle").clone();
             let cache = &*cache_arc;
             let mut manifest = (**self.manifest.load()).clone();
@@ -1659,10 +1617,11 @@ impl DatabaseHandle for TurboliteHandle {
             // Append manifest to staging log before finalize, so a single fsync
             // durably commits both page data and manifest state.
             if let Some(mut writer) = self.staging_writer.take() {
-                // Serialize manifest + dirty groups into staging log trailer
+                // Serialize manifest into staging log trailer. Staging log
+                // trailers now carry only the Manifest (dirty_groups live
+                // in their own sibling file, see persist_dirty_groups).
                 let m = (**self.manifest.load()).clone();
-                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot.clone() };
-                let manifest_bytes = rmp_serde::to_vec(&local)
+                let manifest_bytes = rmp_serde::to_vec(&m)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize manifest for staging: {e}")))?;
                 writer.append_manifest(&manifest_bytes)?;
 
@@ -1681,33 +1640,37 @@ impl DatabaseHandle for TurboliteHandle {
                     page_size,
                 });
             } else {
-                // No staging writer (no dirty pages?) -- persist manifest separately
+                // No staging writer (no dirty pages?) -- persist manifest + dirty groups separately.
                 let m = (**self.manifest.load()).clone();
-                let local = manifest::LocalManifest { manifest: m, dirty_groups: pending_groups_snapshot.clone() };
-                local.persist(&cache_dir)?;
+                manifest::persist_manifest_local(&cache_dir, &m)?;
+                manifest::persist_dirty_groups(&cache_dir, &pending_groups_snapshot)?;
             }
 
             // Persist bitmap so reopened sessions see which pages are cached.
             let _ = cache.persist_bitmap();
 
-            // Local mode: flush dirty page groups to local pg/ directory.
-            // Runs synchronously to prevent manifest races: the flush updates
-            // the shared manifest (page_group_keys), so it must complete before
-            // the next checkpoint's sync() reads and modifies the manifest.
-            // A background flush would race with the next checkpoint, causing
-            // lost manifest updates and SQLite corruption under concurrent writes.
-            if self.s3.is_none() {
+            // Persist manifest + dirty_groups locally for crash recovery.
+            {
+                let m = (**self.manifest.load()).clone();
+                let _ = manifest::persist_manifest_local(&cache_dir, &m);
+                let _ = manifest::persist_dirty_groups(&cache_dir, &pending_groups_snapshot);
+            }
+
+            // LocalThenFlush contract:
+            //   - Local backend (filesystem): page groups must land on disk for
+            //     followers/reopens to see them. Cheap; stay inline.
+            //   - Remote backend: DEFER. The whole point of LocalThenFlush is to
+            //     release the SQLite EXCLUSIVE lock in ~1ms by not touching the
+            //     network. `flush_to_storage()` drains pending_flushes later,
+            //     outside the lock, via the same flush_dirty_groups path.
+            if self.is_local {
+                if let (Some(ref storage), Some(ref runtime)) =
+                    (self.storage.as_ref(), self.runtime.as_ref())
                 {
-                    let m = (**self.manifest.load()).clone();
-                    let local = manifest::LocalManifest {
-                        manifest: m,
-                        dirty_groups: pending_groups_snapshot.clone(),
-                    };
-                    let _ = local.persist(&cache_dir);
-                }
-                if let Some(ref storage) = self.storage {
-                    if let Err(e) = flush::flush_local_groups(
-                        storage,
+                    let flush_res = flush::flush_dirty_groups(
+                        storage.as_ref(),
+                        runtime,
+                        true,
                         cache,
                         &self.manifest,
                         &self.s3_dirty_groups,
@@ -1716,433 +1679,26 @@ impl DatabaseHandle for TurboliteHandle {
                         #[cfg(feature = "zstd")]
                         self.dictionary_bytes.as_deref(),
                         self.encryption_key,
+                        self.gc_enabled,
                         self.override_threshold,
                         self.compaction_threshold,
-                    ) {
+                    );
+                    if let Err(ref e) = flush_res {
                         eprintln!("[sync] local flush failed: {}", e);
                     }
                 }
-            } else {
-                // S3 mode: persist manifest locally for crash recovery,
-                // then flush page groups if storage is available.
-                {
-                    let m = (**self.manifest.load()).clone();
-                    let local = manifest::LocalManifest {
-                        manifest: m,
-                        dirty_groups: pending_groups_snapshot.clone(),
-                    };
-                    let _ = local.persist(&cache_dir);
-                }
-                if let Some(ref storage) = self.storage {
-                    flush::flush_local_groups(
-                        storage,
-                        cache,
-                        &self.manifest,
-                        &self.s3_dirty_groups,
-                        &self.pending_flushes,
-                        self.compression_level,
-                        #[cfg(feature = "zstd")]
-                        self.dictionary_bytes.as_deref(),
-                        self.encryption_key,
-                        self.override_threshold,
-                        self.compaction_threshold,
-                    )?;
-                }
             }
 
             return Ok(());
         }
 
-        // ── S3Primary sync path: upload dirty frames as overrides + publish manifest ──
-        // Every xSync is an S3 commit. No staging logs, no deferred flush.
-        // Override-only (no full group rewrites) to keep per-commit latency bounded.
-        #[cfg(feature = "cloud")]
-        if self.sync_mode == SyncMode::S3Primary {
-            let page_size = self.page_size.load(Ordering::Relaxed);
-            let s3 = self.s3.as_ref().expect("S3Primary requires cloud feature with S3 client").clone();
-            let cache = self.cache.as_ref().expect("cache required").clone();
 
-            // Enforce journal_mode != WAL. SQLite stores journal mode at page 0
-            // offset 18-19. WAL mode = 2 at offset 18. S3Primary is incompatible
-            // with WAL because xSync must be the atomic commit point.
-            if dirty_snapshot.contains(&0) || self.manifest.load().version == 0 {
-                let mut page0 = vec![0u8; page_size as usize];
-                if cache.read_page(0, &mut page0).is_ok() && page0.len() > 19 {
-                    let journal_mode = page0[18];
-                    if journal_mode == 2 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "S3Primary mode requires journal_mode=OFF or MEMORY, not WAL. \
-                             Run PRAGMA journal_mode=OFF before enabling S3Primary.",
-                        ));
-                    }
-                }
-            }
-
-            // Assign new pages to groups
-            {
-                let mut manifest = (**self.manifest.load()).clone();
-                let unassigned: Vec<u64> = dirty_snapshot.iter()
-                    .filter(|&&pn| manifest.page_location(pn).is_none())
-                    .copied()
-                    .collect();
-                if !unassigned.is_empty() {
-                    Self::assign_new_pages_to_groups(&mut manifest, &unassigned, ppg);
-                }
-                self.manifest.store(Arc::new(manifest));
-            }
-
-            let manifest_snap = (**self.manifest.load()).clone();
-            let page_count = manifest_snap.page_count;
-            let next_version = manifest_snap.version + 1;
-            let ovr_count: usize = manifest_snap.subframe_overrides.iter()
-                .map(|ovs| ovs.len()).sum();
-            turbolite_debug!("[sync:s3primary] building v{} from v{} (page_count={}, dirty={}, overrides={}, pg_keys={})",
-                next_version, manifest_snap.version, page_count, dirty_snapshot.len(),
-                ovr_count, manifest_snap.page_group_keys.len());
-            let change_counter = read_change_counter_from_cache(&cache, page_size);
-            let old_sub_ppf = manifest_snap.sub_pages_per_frame;
-            let use_seekable = old_sub_ppf > 0;
-
-            // Group dirty pages by group ID
-            let mut groups_dirty: HashMap<u64, Vec<u64>> = HashMap::new();
-            for &page_num in &dirty_snapshot {
-                let gid = manifest_snap.page_location(page_num)
-                    .expect("page must have group assignment after new-page assignment")
-                    .group_id;
-                groups_dirty.entry(gid).or_default().push(page_num);
-            }
-
-            let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
-            let mut new_subframe_overrides = manifest_snap.subframe_overrides.clone();
-            let mut new_keys = manifest_snap.page_group_keys.clone();
-            let mut new_frame_tables = manifest_snap.frame_tables.clone();
-            let mut replaced_keys: Vec<String> = Vec::new();
-
-            // Ensure override vectors are large enough
-            while new_subframe_overrides.len() <= manifest_snap.group_pages.len() {
-                new_subframe_overrides.push(HashMap::new());
-            }
-
-            for (&gid, dirty_pnums) in &groups_dirty {
-                let pages_in_group = manifest_snap.group_page_nums(gid);
-                let group_size = pages_in_group.len();
-                let frame_table_ref = manifest_snap.frame_tables.get(gid as usize);
-                let has_frame_table = use_seekable
-                    && frame_table_ref.map(|ft| !ft.is_empty()).unwrap_or(false);
-
-                if has_frame_table {
-                    // Override path: encode only dirty frames
-                    turbolite_debug!("[sync:s3primary] gid={}: override path (frame_table has {} entries)", gid, frame_table_ref.map(|ft| ft.len()).unwrap_or(0));
-                    let dirty_frames = manifest::dirty_frames_for_group(
-                        dirty_pnums,
-                        &pages_in_group,
-                        frame_table_ref.expect("checked above"),
-                        old_sub_ppf,
-                    );
-
-                    for &frame_idx in &dirty_frames {
-                        let frame_start = frame_idx * old_sub_ppf as usize;
-                        let frame_end = std::cmp::min(frame_start + old_sub_ppf as usize, group_size);
-                        let mut frame_pages: Vec<(u64, Vec<u8>)> = Vec::new();
-
-                        // Pre-fetch the existing frame data for pages not in cache.
-                        // Without this, evicted pages (e.g., after set_manifest) would
-                        // be zeroed in the override, silently corrupting the database.
-                        let existing_frame_data: Option<Vec<u8>> = {
-                            let needs_merge = (frame_start..frame_end).any(|pos| {
-                                pos < pages_in_group.len()
-                                    && pages_in_group[pos] < page_count
-                                    && !cache.is_present(pages_in_group[pos])
-                            });
-                            if needs_merge {
-                                // Try existing override first, then base page group
-                                let existing_ovr = manifest_snap.subframe_overrides
-                                    .get(gid as usize)
-                                    .and_then(|ovs| ovs.get(&frame_idx));
-                                if let Some(ovr) = existing_ovr {
-                                    s3.get_page_group(&ovr.key).ok().flatten()
-                                        .and_then(|data| decode_seekable_subchunk(
-                                            &data,
-                                            #[cfg(feature = "zstd")]
-                                            self.decoder_dict.as_ref(),
-                                            self.encryption_key.as_ref(),
-                                        ).ok())
-                                } else if let Some(base_key) = manifest_snap.page_group_keys.get(gid as usize) {
-                                    if !base_key.is_empty() {
-                                        let ft = frame_table_ref.expect("seekable path requires frame table");
-                                        if frame_idx < ft.len() {
-                                            let entry = &ft[frame_idx];
-                                            s3.range_get(base_key, entry.offset, entry.len).ok().flatten()
-                                                .and_then(|data| decode_seekable_subchunk(
-                                                    &data,
-                                                    #[cfg(feature = "zstd")]
-                                                    self.decoder_dict.as_ref(),
-                                                    self.encryption_key.as_ref(),
-                                                ).ok())
-                                        } else { None }
-                                    } else { None }
-                                } else { None }
-                            } else { None }
-                        };
-
-                        for pos in frame_start..frame_end {
-                            if pos >= pages_in_group.len() { break; }
-                            let pnum = pages_in_group[pos];
-                            if pnum >= page_count { break; }
-                            let mut buf = vec![0u8; page_size as usize];
-                            if cache.read_page(pnum, &mut buf).is_ok() {
-                                frame_pages.push((pnum, buf));
-                            } else if let Some(ref existing) = existing_frame_data {
-                                // Page evicted from cache: use existing S3 data
-                                let offset_in_frame = (pos - frame_start) * page_size as usize;
-                                let end = offset_in_frame + page_size as usize;
-                                if end <= existing.len() {
-                                    buf.copy_from_slice(&existing[offset_in_frame..end]);
-                                }
-                                frame_pages.push((pnum, buf));
-                            } else {
-                                // No cache, no S3 fallback. This should not happen
-                                // in normal operation. Log and use zeros as last resort.
-                                eprintln!(
-                                    "[sync:s3primary] WARNING: page {} not in cache and no S3 fallback for gid={} frame={}",
-                                    pnum, gid, frame_idx
-                                );
-                                frame_pages.push((pnum, vec![0u8; page_size as usize]));
-                            }
-                        }
-
-                        let override_key = s3.override_frame_key(gid, frame_idx, next_version);
-                        let encoded = encode_override_frame(
-                            &frame_pages,
-                            page_size,
-                            self.compression_level,
-                            #[cfg(feature = "zstd")]
-                            self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-
-                        // Track old override being replaced
-                        if let Some(old_ov) = new_subframe_overrides
-                            .get(gid as usize)
-                            .and_then(|ovs| ovs.get(&frame_idx))
-                        {
-                            replaced_keys.push(old_ov.key.clone());
-                        }
-
-                        uploads.push((override_key.clone(), encoded.clone()));
-                        while new_subframe_overrides.len() <= gid as usize {
-                            new_subframe_overrides.push(HashMap::new());
-                        }
-                        new_subframe_overrides[gid as usize].insert(
-                            frame_idx,
-                            SubframeOverride {
-                                key: override_key,
-                                entry: FrameEntry { offset: 0, len: encoded.len() as u32 },
-                            },
-                        );
-                    }
-                } else {
-                    // No frame table (legacy format or new group): full group rewrite
-                    let existing_ovrs = new_subframe_overrides.get(gid as usize).map(|o| o.len()).unwrap_or(0);
-                    if existing_ovrs > 0 {
-                        turbolite_debug!("[sync:s3primary] gid={}: FULL REWRITE draining {} overrides!", gid, existing_ovrs);
-                    } else {
-                        turbolite_debug!("[sync:s3primary] gid={}: full rewrite (no overrides to drain)", gid);
-                    }
-                    let mut pages: Vec<Option<Vec<u8>>> = vec![None; group_size];
-                    let mut need_s3_merge = false;
-
-                    for (i, &pnum) in pages_in_group.iter().enumerate() {
-                        if pnum >= page_count { break; }
-                        if cache.is_present(pnum) {
-                            let mut buf = vec![0u8; page_size as usize];
-                            if cache.read_page(pnum, &mut buf).is_ok() {
-                                pages[i] = Some(buf);
-                            }
-                        } else {
-                            need_s3_merge = true;
-                        }
-                    }
-
-                    if need_s3_merge {
-                        if let Some(existing_key) = new_keys.get(gid as usize) {
-                            if !existing_key.is_empty() {
-                                if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
-                                    let existing_ft = manifest_snap.frame_tables.get(gid as usize);
-                                    let has_ft = use_seekable
-                                        && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
-                                    if has_ft {
-                                        let ft = existing_ft.expect("checked");
-                                        if let Ok((_pc, _ps, bulk)) = decode_page_group_seekable_full(
-                                            &pg_data, ft, page_size,
-                                            pages_in_group.len() as u32, page_count, 0,
-                                            #[cfg(feature = "zstd")]
-                                            self.decoder_dict.as_ref(),
-                                            self.encryption_key.as_ref(),
-                                        ) {
-                                            let ps = page_size as usize;
-                                            for j in 0..pages_in_group.len() {
-                                                if pages_in_group[j] >= page_count { break; }
-                                                if pages[j].is_none() {
-                                                    let start = j * ps;
-                                                    let end = start + ps;
-                                                    if end <= bulk.len() {
-                                                        pages[j] = Some(bulk[start..end].to_vec());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    } else if let Ok((_pc, _ps, existing)) = decode_page_group(
-                                        &pg_data,
-                                        #[cfg(feature = "zstd")]
-                                        self.decoder_dict.as_ref(),
-                                        self.encryption_key.as_ref(),
-                                    ) {
-                                        for (j, ep) in existing.into_iter().enumerate() {
-                                            if j >= pages_in_group.len() { break; }
-                                            if pages_in_group[j] >= page_count { break; }
-                                            if pages[j].is_none() { pages[j] = Some(ep); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let key = s3.page_group_key(gid, next_version);
-                    if use_seekable {
-                        let (encoded, ft) = encode_page_group_seekable(
-                            &pages, page_size, old_sub_ppf, self.compression_level,
-                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-                        uploads.push((key.clone(), encoded));
-                        while new_frame_tables.len() <= gid as usize {
-                            new_frame_tables.push(Vec::new());
-                        }
-                        new_frame_tables[gid as usize] = ft;
-                    } else {
-                        let encoded = encode_page_group(
-                            &pages, page_size, self.compression_level,
-                            #[cfg(feature = "zstd")] self.encoder_dict.as_ref(),
-                            self.encryption_key.as_ref(),
-                        )?;
-                        uploads.push((key.clone(), encoded));
-                    }
-
-                    while new_keys.len() <= gid as usize { new_keys.push(String::new()); }
-                    if let Some(old_key) = new_keys.get(gid as usize) {
-                        if !old_key.is_empty() { replaced_keys.push(old_key.clone()); }
-                    }
-                    new_keys[gid as usize] = key;
-
-                    // Clear overrides for this group (full rewrite supersedes them)
-                    if let Some(group_ovs) = new_subframe_overrides.get_mut(gid as usize) {
-                        for (_, ov) in group_ovs.drain() {
-                            replaced_keys.push(ov.key);
-                        }
-                    }
-                }
-            }
-
-            // Upload all overrides + page groups
-            if !uploads.is_empty() {
-                turbolite_debug!("[sync:s3primary] uploading {} objects...", uploads.len());
-                s3.put_page_groups(&uploads)?;
-            }
-
-            // Build and publish new manifest
-            let old_manifest = manifest_snap;
-            // Capture full page 0 for multiwriter catch-up
-            let ps = self.page_size.load(Ordering::Relaxed);
-            let db_header = if ps > 0 {
-                let mut page0 = vec![0u8; ps as usize];
-                if cache.read_page(0, &mut page0).is_ok() {
-                    Some(page0)
-                } else {
-                    old_manifest.db_header.clone()
-                }
-            } else {
-                None
-            };
-
-            let mut new_manifest = Manifest {
-                version: next_version,
-                change_counter,
-                page_count: old_manifest.page_count,
-                page_size: old_manifest.page_size,
-                pages_per_group: ppg,
-                page_group_keys: new_keys,
-                interior_chunk_keys: old_manifest.interior_chunk_keys.clone(),
-                index_chunk_keys: old_manifest.index_chunk_keys.clone(),
-                frame_tables: new_frame_tables,
-                sub_pages_per_frame: old_sub_ppf,
-                subframe_overrides: new_subframe_overrides,
-                strategy: old_manifest.strategy,
-                group_pages: old_manifest.group_pages.clone(),
-                btrees: old_manifest.btrees.clone(),
-                page_index: HashMap::new(),
-                btree_groups: HashMap::new(),
-                page_to_tree_name: HashMap::new(),
-                tree_name_to_groups: HashMap::new(),
-                group_to_tree_name: HashMap::new(),
-                db_header,
-            };
-            new_manifest.build_page_index();
-            s3.put_manifest(&new_manifest)?;
-
-            // Commit local state
-            {
-                cache.set_group_pages(new_manifest.group_pages.clone());
-                self.manifest.store(Arc::new(new_manifest.clone()));
-            }
-            {
-                let mut dirty = self.dirty_page_nums.write();
-                for &page_num in &dirty_snapshot {
-                    dirty.remove(&page_num);
-                }
-            }
-            self.dirty_since_sync = false;
-            if let Some(c) = &self.cache { self.cached_generation = c.bump_generation(); }
-
-            // Persist local manifest for crash recovery
-            let local = manifest::LocalManifest {
-                manifest: new_manifest,
-                dirty_groups: Vec::new(),
-            };
-            local.persist(&cache.cache_dir)?;
-            let _ = cache.persist_bitmap();
-
-            // Async GC of replaced keys
-            if self.gc_enabled && !replaced_keys.is_empty() {
-                let gc_s3 = Arc::clone(&s3);
-                let runtime = gc_s3.runtime.clone();
-                runtime.spawn(async move {
-                    gc_s3.delete_objects_async_owned(replaced_keys).await;
-                });
-            }
-
-            turbolite_debug!(
-                "[sync:s3primary] committed v{} ({} dirty pages, {} uploads)",
-                next_version, dirty_snapshot.len(), uploads.len(),
-            );
-            return Ok(());
-        }
-
-        // Durable sync path: full S3 upload. Only available with cloud feature.
-        #[cfg(not(feature = "cloud"))]
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Durable sync requires cloud feature",
-        ));
-
-        #[cfg(feature = "cloud")]
+        // Durable sync path: full remote upload. Backend-agnostic.
         {
 
         let page_size = self.page_size.load(Ordering::Relaxed);
 
-        // Phase Midway: detect VACUUM by checking schema cookie change.
+        // Detect VACUUM by checking schema cookie change.
         // VACUUM rewrites the entire database with new page numbers.
         // When detected, re-walk B-trees and rebuild group_pages from scratch.
         // Done before borrowing cache/s3 to avoid borrow conflicts with self mutation.
@@ -2256,7 +1812,7 @@ impl DatabaseHandle for TurboliteHandle {
                         manifest.interior_chunk_keys.clear();
                         manifest.index_chunk_keys.clear();
                         manifest.frame_tables.clear();
-                        // Phase Drift: clear overrides on VACUUM
+                        // Clear overrides on VACUUM
                         for overrides in &manifest.subframe_overrides {
                             for ovr in overrides.values() {
                                 vacuum_keys.push(ovr.key.clone());
@@ -2273,7 +1829,16 @@ impl DatabaseHandle for TurboliteHandle {
         }
 
         // Clone Arcs to avoid borrow conflicts with self.vacuum_replaced_keys
-        let s3 = self.s3.as_ref().expect("s3 required").clone();
+        let storage = Arc::clone(
+            self.storage.as_ref().expect("storage backend required"),
+        );
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime handle required")
+            .clone();
+        let storage_ref = storage.as_ref();
+        let runtime_ref = &runtime;
         let cache = self.cache.as_ref().expect("cache required").clone();
 
         // Assign new pages (not in page_index) to new groups before grouping
@@ -2309,7 +1874,7 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Dual counter (Phase Borodino):
+        // Dual counter:
         // - version: monotonic +1, for S3 key uniqueness
         // - change_counter: SQLite file change counter, for walrust WAL replay
         let next_version = self.manifest.load().version + 1;
@@ -2374,11 +1939,11 @@ impl DatabaseHandle for TurboliteHandle {
                     }
                 }
 
-                // S3 merge if needed
+                // Remote merge if needed
                 if need_s3_merge {
                     if let Some(existing_key) = new_keys.get(gid as usize) {
                         if !existing_key.is_empty() {
-                            if let Ok(Some(pg_data)) = s3.get_page_group(existing_key) {
+                            if let Ok(Some(pg_data)) = storage_helpers::get_page_group(storage_ref, runtime_ref, existing_key) {
                                 let existing_ft = manifest_snap.frame_tables.get(gid as usize);
                                 let has_ft = use_seekable
                                     && existing_ft.map(|ft| !ft.is_empty()).unwrap_or(false);
@@ -2421,7 +1986,7 @@ impl DatabaseHandle for TurboliteHandle {
                 }
 
                 // Encode
-                let key = s3.page_group_key(gid, next_version);
+                let key = keys::page_group_key(gid, next_version);
                 let old_key = new_keys.get(gid as usize)
                     .filter(|k| !k.is_empty())
                     .cloned();
@@ -2465,7 +2030,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Only re-upload chunks that contain dirty interior pages.
         let mut all_interior: HashMap<u64, Vec<u8>> = HashMap::new(); // pnum → data
         {
-            // Phase Marne: collect interior pages from cache (dirty_snapshot is just page numbers)
+            // Collect interior pages from cache (dirty_snapshot is just page numbers)
             let mut dirty_interior_count = 0usize;
             let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
@@ -2550,7 +2115,7 @@ impl DatabaseHandle for TurboliteHandle {
                     self.encoder_dict.as_ref(),
                     self.encryption_key.as_ref(),
                 )?;
-                let key = s3.interior_chunk_key(chunk_id, next_version);
+                let key = keys::interior_chunk_key(chunk_id, next_version);
                 turbolite_debug!(
                     "[sync] interior chunk {}: {} pages, {:.1}KB compressed",
                     chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -2581,7 +2146,7 @@ impl DatabaseHandle for TurboliteHandle {
         // ── Index leaf bundles (same pattern as interior) ──
         let mut all_index_leaves: HashMap<u64, Vec<u8>> = HashMap::new();
         {
-            // Phase Marne: read dirty pages from cache for index leaf classification
+            // Read dirty pages from cache for index leaf classification
             let mut dirty_index_count = 0usize;
             let mut read_buf = vec![0u8; page_size as usize];
             for &pnum in &dirty_snapshot {
@@ -2670,7 +2235,7 @@ impl DatabaseHandle for TurboliteHandle {
                     self.encoder_dict.as_ref(),
                     self.encryption_key.as_ref(),
                 )?;
-                let key = s3.index_chunk_key(chunk_id, next_version);
+                let key = keys::index_chunk_key(chunk_id, next_version);
                 turbolite_debug!(
                     "[sync] index chunk {}: {} pages, {:.1}KB compressed",
                     chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -2696,8 +2261,8 @@ impl DatabaseHandle for TurboliteHandle {
         uploads.extend(index_chunk_uploads);
 
         // Single parallel upload: page groups + interior + index chunks
-        turbolite_debug!("[sync] uploading {} objects to S3...", uploads.len());
-        s3.put_page_groups(&uploads)?;
+        turbolite_debug!("[sync] uploading {} objects...", uploads.len());
+        storage_helpers::put_page_groups(storage_ref, runtime_ref, &uploads)?;
         turbolite_debug!("[sync] all {} objects uploaded", uploads.len());
 
         // Update manifest atomically
@@ -2718,6 +2283,7 @@ impl DatabaseHandle for TurboliteHandle {
         let mut new_manifest = Manifest {
             version: next_version,
             change_counter,
+            epoch: old_manifest.epoch,
             page_count: old_manifest.page_count,
             page_size: old_manifest.page_size,
             pages_per_group: ppg,
@@ -2751,7 +2317,7 @@ impl DatabaseHandle for TurboliteHandle {
             db_header,
         };
         new_manifest.build_page_index();
-        s3.put_manifest(&new_manifest)?;
+        storage_helpers::put_manifest(storage_ref, runtime_ref, &new_manifest)?;
 
         // Commit local state
         {
@@ -2771,7 +2337,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Persist bitmap
         let _ = cache.persist_bitmap();
 
-        // Phase Marathon: truncate cache file if it's larger than current page_count.
+        // Truncate cache file if it's larger than current page_count.
         // After VACUUM, page_count decreases but the sparse cache file retains its old size.
         {
             let current_page_count = self.manifest.load().page_count;
@@ -2793,55 +2359,25 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Post-checkpoint GC: delete old page group/interior chunk versions asynchronously.
-        // Phase Thermopylae: fire-and-forget on tokio runtime so checkpoint doesn't block on deletes.
+        // Post-checkpoint GC: delete old page group / chunk versions.
+        // The old path spawned these asynchronously on the S3Client's
+        // dedicated runtime. Here we run them synchronously on the shared
+        // runtime; the caller is already past the critical section.
         if self.gc_enabled && !replaced_keys.is_empty() {
-            let gc_s3 = Arc::clone(self.s3.as_ref().expect("s3 client required"));
-            let runtime = gc_s3.runtime.clone();
-            turbolite_debug!("[gc] spawning async delete of {} replaced S3 objects", replaced_keys.len());
-            runtime.spawn(async move {
-                gc_s3.delete_objects_async_owned(replaced_keys).await;
-            });
+            turbolite_debug!("[gc] deleting {} replaced objects", replaced_keys.len());
+            if let Err(e) = storage_helpers::delete_objects(storage_ref, runtime_ref, &replaced_keys) {
+                eprintln!("[gc] ERROR deleting replaced objects: {}", e);
+            }
         }
 
-        // Phase Somme-e: GC old WAL segments after checkpoint.
-        // WAL segments with txid <= change_counter are in the page groups (redundant).
-        // Uses change_counter (not version) because walrust txids are file change counters.
+        // GC old WAL segments after checkpoint.
+        // WAL segments with txid <= change_counter are in the page groups.
+        // The new backend-agnostic path skips WAL-specific GC here; WAL is
+        // a backend-specific concern and is re-wired in the WAL follow-up.
         #[cfg(feature = "wal")]
-        if self.gc_enabled {
-            let gc_s3 = self.s3.as_ref().expect("s3 required").clone();
-            let wal_prefix = format!("{}/wal/", gc_s3.prefix);
-            let version = change_counter;
-            let runtime = gc_s3.runtime.clone();
-            runtime.spawn(async move {
-                // List all WAL segment keys under the wal prefix
-                let keys = match gc_s3.list_all_keys_with_prefix(&wal_prefix).await {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("[wal-gc] ERROR listing WAL segments: {}", e);
-                        return;
-                    }
-                };
-                // Filter to .hadbp files with max_txid <= version
-                let to_delete: Vec<String> = keys.into_iter()
-                    .filter(|k| {
-                        k.ends_with(".hadbp")
-                            && k.rsplit('/').next()
-                                .and_then(|f| f.strip_suffix(".hadbp"))
-                                .and_then(|f| f.split('-').last())
-                                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                                .map(|max_txid| max_txid <= version)
-                                .unwrap_or(false)
-                    })
-                    .collect();
-                if !to_delete.is_empty() {
-                    turbolite_debug!("[wal-gc] deleting {} WAL segments with txid <= {}", to_delete.len(), version);
-                    gc_s3.delete_objects_async_owned(to_delete).await;
-                }
-            });
-        }
+        let _ = change_counter;
 
-        // Phase Stalingrad-e: evict data tier after successful checkpoint upload.
+        // Evict data tier after successful checkpoint upload.
         if self.evict_on_checkpoint {
             if let Some(cache) = &self.cache {
                 let mut tracker = cache.tracker.lock();
@@ -2868,18 +2404,20 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Phase Gallipoli: persist local manifest (no dirty groups in Durable mode)
+        // Persist local manifest (no dirty groups in Durable mode)
         if let Some(cache) = &self.cache {
             let m = (**self.manifest.load()).clone();
-            let local = manifest::LocalManifest { manifest: m, dirty_groups: Vec::new() };
-            local.persist(&cache.cache_dir).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other,
-                    format!("local manifest persist failed after S3 sync: {}", e))
+            manifest::persist_manifest_local(&cache.cache_dir, &m).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("local manifest persist failed after remote sync: {}", e),
+                )
             })?;
+            manifest::persist_dirty_groups(&cache.cache_dir, &[])?;
         }
 
         Ok(())
-        } // end #[cfg(feature = "cloud")] durable sync block
+        } // end durable sync block
     }
 
     fn set_len(&mut self, size: u64) -> Result<(), io::Error> {
@@ -2921,7 +2459,7 @@ impl DatabaseHandle for TurboliteHandle {
             return Ok(true);
         }
 
-        // Phase Zenith-c: detect transaction rollback.
+        // Detect transaction rollback.
         // If lock downgrades from EXCLUSIVE/RESERVED and we have unsynced dirty
         // pages, the transaction was rolled back. Clear dirty pages and evict
         // them from the disk cache so subsequent reads re-fetch from the source

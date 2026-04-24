@@ -9,7 +9,7 @@
 //!   cargo test --features tiered,zstd tiered
 //! ```
 
-#[cfg(feature = "cloud")]
+#[cfg(feature = "s3")]
 mod tiered {
     pub mod helpers;
     mod basic;
@@ -29,7 +29,6 @@ mod tiered {
     mod borodino;
     #[cfg(feature = "wal")]
     mod wal_integration;
-    mod zenith;
     mod drift;
     mod oracle_s3;
     mod crash_flush;

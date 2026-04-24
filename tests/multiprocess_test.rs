@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use turbolite::tiered::{StorageBackend, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// If this env var is set, we are a child process; run the child workload.
 const CHILD_MODE_ENV: &str = "TURBOLITE_TEST_CHILD_MODE";
@@ -15,11 +15,10 @@ const CHILD_DIR_ENV: &str = "TURBOLITE_TEST_DIR";
 
 fn register_local_vfs(name: &str, cache_dir: &Path) {
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: cache_dir.into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
     turbolite::tiered::register(name, vfs).expect("register VFS");
 }
 

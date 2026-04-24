@@ -1,9 +1,10 @@
-//! Append-only staging log for two-phase checkpoint (Phase Kursk).
+//! Append-only staging log for two-phase checkpoint (legacy recovery path).
 //!
-//! When `SyncMode::LocalThenFlush`, dirty pages are written to a staging log
-//! during `write_all_at()` (alongside the normal disk cache write). The staging
-//! log captures exact page contents at checkpoint time, immune to overwrite by
-//! subsequent checkpoints.
+//! turbolite is now always synchronous ("Durable"): checkpoints upload dirty
+//! pages to the backend inline. The staging-log writer is no longer invoked
+//! during writes, but the format + recovery reader are kept so a cache
+//! directory written by an older turbolite (with deferred flush) can still
+//! be recovered cleanly on reopen.
 //!
 //! Format: 4-byte header + fixed-size records:
 //! ```text
@@ -12,12 +13,12 @@
 //! [MANIFEST_MAGIC: u64 LE][manifest_len: u64 LE][manifest_data]*
 //! ```
 //!
-//! `flush_to_s3()` reads from staging logs instead of the live disk cache,
+//! `flush_to_storage()` reads from staging logs instead of the live disk cache,
 //! guaranteeing it uploads the exact state that was checkpointed.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Magic value to identify manifest trailer in staging log.

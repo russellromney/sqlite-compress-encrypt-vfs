@@ -2,6 +2,14 @@
 //!
 //! These tests invoke the compiled binary and check output/exit codes.
 //! They test local-mode commands (no S3 required).
+//!
+//! The `cli-s3` feature builds the binary with a concrete S3 backend
+//! (hadb-storage-s3). Without it, the binary target is not buildable and
+//! these tests are skipped via `#[ignore]`. They are skipped by default
+//! after Phase Anvil g while the CLI is rewired to construct S3Storage
+//! itself in checkpoint c5.
+
+#![cfg(feature = "cli-s3")]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,7 +28,7 @@ static BUILD_ONCE: Once = Once::new();
 fn build_bin() {
     BUILD_ONCE.call_once(|| {
         let status = Command::new("cargo")
-            .args(["build", "--bin", "turbolite", "--features", "cloud,zstd"])
+            .args(["build", "--bin", "turbolite", "--features", "cli-s3,zstd"])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()
             .expect("failed to build turbolite binary");

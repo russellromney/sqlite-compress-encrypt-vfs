@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use super::*;
 
-/// S3 manifest — updated atomically after all page group uploads.
+/// Remote manifest, updated atomically after all page group uploads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
@@ -40,7 +40,7 @@ pub struct Manifest {
     #[serde(default)]
     pub sub_pages_per_frame: u32,
 
-    /// Phase Drift: per-group subframe overrides. Indexed by group_id, keyed by frame_index.
+    /// Per-group subframe overrides. Indexed by group_id, keyed by frame_index.
     #[serde(default)]
     pub subframe_overrides: Vec<HashMap<usize, SubframeOverride>>,
 
@@ -49,7 +49,7 @@ pub struct Manifest {
     #[serde(default = "default_strategy")]
     pub strategy: GroupingStrategy,
 
-    // --- Phase Midway: B-tree-aware page groups ---
+    // B-tree-aware page groups
 
     /// Explicit page-to-group mapping. group_pages[gid] = ordered list of page numbers
     /// in that group. Empty for Positional strategy (computed on the fly).
@@ -69,12 +69,12 @@ pub struct Manifest {
     #[serde(skip)]
     pub btree_groups: HashMap<u64, Vec<u64>>,
 
-    /// Phase Verdun-i: reverse index page_num -> B-tree name (table/index name).
+    /// Reverse index page_num -> B-tree name (table/index name).
     /// Built on load from `btrees`, not serialized. Survives VACUUM (names stable).
     #[serde(skip)]
     pub page_to_tree_name: HashMap<u64, String>,
 
-    /// Phase Verdun-i: reverse index tree_name -> group IDs.
+    /// Reverse index tree_name -> group IDs.
     /// Built on load from `btrees`, not serialized.
     #[serde(skip)]
     pub tree_name_to_groups: HashMap<String, Vec<u64>>,
@@ -89,8 +89,28 @@ pub struct Manifest {
     /// giving SQLite the correct database header (page count, schema cookie)
     /// without fetching from S3 or reopening the connection.
     /// None for manifests created before this field was added.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Phase Strata note: this field intentionally has no `skip_serializing_if`.
+    /// Under rmp_serde's positional encoding, a conditionally-skipped field in
+    /// the middle of the struct shifts every subsequent field's array index,
+    /// which breaks deserialization whenever a new field is added after it.
+    /// Always-serialize keeps the positional layout stable; `None` is encoded
+    /// as a single nil byte in msgpack, so the cost is negligible.
+    #[serde(default)]
     pub db_header: Option<Vec<u8>>,
+
+    /// Discontinuity stamp. Bumped ONLY by out-of-band operations that make
+    /// the prior cache invalid (admin-driven fork/rollback/restore). Normal
+    /// checkpoints preserve it. Consumers that see a remote manifest whose
+    /// epoch differs from their cached manifest's epoch treat their local
+    /// cache as stale and cold-start from the remote.
+    ///
+    /// Placed at the end of the struct so adding it doesn't shift any prior
+    /// field's positional index — pre-Strata manifest.msgpack bytes already
+    /// on disk deserialize cleanly (missing trailing element → serde default
+    /// fills `epoch = 0`).
+    #[serde(default)]
+    pub epoch: u64,
 }
 
 fn default_strategy() -> GroupingStrategy {
@@ -108,7 +128,7 @@ pub struct FrameEntry {
     pub len: u32,
 }
 
-/// Phase Drift: a subframe override entry.
+/// A subframe override entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubframeOverride {
     /// S3 key for the override object
@@ -121,47 +141,120 @@ pub(crate) fn default_pages_per_group() -> u32 {
     DEFAULT_PAGES_PER_GROUP
 }
 
-// ── Phase Gallipoli: local manifest persistence ──
+// Local manifest cache + dirty-group recovery state
+//
+// Two files, two concerns.
+//
+//   {cache_dir}/manifest.msgpack        msgpack(Manifest)     -- warm cache of the
+//                                                                remote manifest
+//   {cache_dir}/dirty_groups.msgpack    msgpack(Vec<u64>)     -- groups staged for
+//                                                                upload, survives
+//                                                                process crash
+//
+// Splitting them means the backend's own `manifest.msgpack` object is a raw
+// Manifest (not a turbolite-specific wrapper), and dirty_groups stops leaking
+// into what the backend sees.
 
-/// Wrapper for local manifest persistence. Contains the full manifest
-/// plus dirty_groups that haven't been flushed to S3 yet.
-/// Persisted to cache_dir/manifest.msgpack on every checkpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LocalManifest {
-    /// The full manifest (same data as S3, or ahead of S3 if dirty_groups exist).
-    pub manifest: Manifest,
-    /// Group IDs with dirty pages not yet uploaded to S3.
-    /// Non-empty only in LocalThenFlush mode between checkpoint and flush.
-    #[serde(default)]
-    pub dirty_groups: Vec<u64>,
+/// Persist a `Manifest` to the local cache directory as a warm cache for cold
+/// reopens. Atomic write (tmp + rename). Used by local mode as the
+/// authoritative source and by remote mode as a hint for warm reconnect.
+pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> io::Result<()> {
+    let path = cache_dir.join("manifest.msgpack");
+    let tmp = cache_dir.join("manifest.msgpack.tmp");
+    let data = rmp_serde::to_vec(manifest).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("serialize manifest: {e}"))
+    })?;
+    fs::write(&tmp, &data)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
-impl LocalManifest {
-    /// Persist to cache_dir/manifest.msgpack (atomic write via tmp + rename).
-    pub fn persist(&self, cache_dir: &Path) -> io::Result<()> {
-        let path = cache_dir.join("manifest.msgpack");
-        let tmp = cache_dir.join("manifest.msgpack.tmp");
-        let data = rmp_serde::to_vec(self).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serialize local manifest: {}", e))
-        })?;
-        fs::write(&tmp, &data)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
+/// Pre-Anvil-g wrapper: the old on-disk / on-S3 layout bundled the manifest
+/// with the uploaded-but-unflushed dirty_groups into a single msgpack
+/// object under `manifest.msgpack`. We split them in Anvil g so the
+/// backend sees only the Manifest bytes and dirty_groups stays local, but
+/// upgrades from an older stack may still encounter wrapper-format files.
+/// `decode_manifest_bytes` handles both formats transparently.
+#[derive(serde::Deserialize)]
+struct LegacyLocalManifestWrapper {
+    manifest: Manifest,
+    #[serde(default)]
+    #[allow(dead_code)]
+    dirty_groups: Vec<u64>,
+}
 
-    /// Load from cache_dir/manifest.msgpack. Returns None if file doesn't exist.
-    pub fn load(cache_dir: &Path) -> io::Result<Option<Self>> {
-        let path = cache_dir.join("manifest.msgpack");
-        let data = match fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let local: LocalManifest = rmp_serde::from_slice(&data).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("deserialize local manifest: {}", e))
-        })?;
-        Ok(Some(local))
+/// Decode a raw manifest.msgpack byte blob. Tries the Anvil-g raw
+/// `Manifest` layout first; on failure, falls back to the pre-Anvil-g
+/// `LocalManifest { manifest, dirty_groups }` wrapper and extracts the
+/// inner manifest. Returns Err only if neither format decodes.
+///
+/// This is the single choke point for manifest deserialisation; every
+/// caller (local cache load, backend get, staging-log trailer) routes
+/// through here so the compat path exists exactly once.
+pub(crate) fn decode_manifest_bytes(data: &[u8]) -> io::Result<Manifest> {
+    if let Ok(m) = rmp_serde::from_slice::<Manifest>(data) {
+        return Ok(m);
     }
+    match rmp_serde::from_slice::<LegacyLocalManifestWrapper>(data) {
+        Ok(wrapper) => {
+            eprintln!(
+                "[turbolite] manifest.msgpack is in pre-Anvil-g LocalManifest wrapper format; \
+                 decoded and will be rewritten in the new format on next persist"
+            );
+            Ok(wrapper.manifest)
+        }
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("deserialize manifest (neither Anvil-g nor legacy format): {e}"),
+        )),
+    }
+}
+
+/// Load a locally-cached `Manifest`. `Ok(None)` if absent. Callers that need
+/// crash-recovery dirty groups read them from [`load_dirty_groups`] separately.
+pub(crate) fn load_manifest_local(cache_dir: &Path) -> io::Result<Option<Manifest>> {
+    let path = cache_dir.join("manifest.msgpack");
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(decode_manifest_bytes(&data)?))
+}
+
+/// Persist the set of page-group ids that have been checkpointed locally but
+/// not yet flushed to the remote backend. Empty list means "no pending work";
+/// file is removed in that case to keep the cache dir tidy.
+pub(crate) fn persist_dirty_groups(cache_dir: &Path, dirty: &[u64]) -> io::Result<()> {
+    let path = cache_dir.join("dirty_groups.msgpack");
+    if dirty.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    let tmp = cache_dir.join("dirty_groups.msgpack.tmp");
+    let data = rmp_serde::to_vec(&dirty.to_vec()).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("serialize dirty_groups: {e}"))
+    })?;
+    fs::write(&tmp, &data)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Load dirty-group recovery state. `Ok(Vec::new())` if no file exists.
+pub(crate) fn load_dirty_groups(cache_dir: &Path) -> io::Result<Vec<u64>> {
+    let path = cache_dir.join("dirty_groups.msgpack");
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let dirty: Vec<u64> = rmp_serde::from_slice(&data).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("deserialize dirty_groups: {e}"))
+    })?;
+    Ok(dirty)
 }
 
 impl Manifest {
@@ -187,6 +280,7 @@ impl Manifest {
             tree_name_to_groups: HashMap::new(),
             group_to_tree_name: HashMap::new(),
             db_header: None,
+            epoch: 0,
         }
     }
 
@@ -232,7 +326,7 @@ impl Manifest {
                 self.btree_groups.insert(gid, entry.group_ids.clone());
                 self.group_to_tree_name.insert(gid, entry.name.clone());
             }
-            // Phase Verdun-i: reverse index from pages -> tree name
+            // Reverse index from pages -> tree name
             for &gid in &entry.group_ids {
                 if let Some(pages) = self.group_pages.get(gid as usize) {
                     for &page_num in pages {
@@ -240,7 +334,7 @@ impl Manifest {
                     }
                 }
             }
-            // Phase Verdun-i: tree name -> group IDs
+            // Tree name -> group IDs
             self.tree_name_to_groups.insert(entry.name.clone(), entry.group_ids.clone());
         }
     }
@@ -304,7 +398,7 @@ impl Manifest {
         self.btree_groups.get(&gid).cloned().unwrap_or_default()
     }
 
-    /// Phase Drift: ensure subframe_overrides vec length matches page_group_keys.
+    /// Ensure subframe_overrides vec length matches page_group_keys.
     pub fn normalize_overrides(&mut self) {
         while self.subframe_overrides.len() < self.page_group_keys.len() {
             self.subframe_overrides.push(HashMap::new());
@@ -322,7 +416,7 @@ impl Manifest {
     }
 }
 
-/// Phase Drift: given dirty page numbers and a group's page list, return which
+/// Given dirty page numbers and a group's page list, return which
 /// frame indices contain at least one dirty page.
 pub(crate) fn dirty_frames_for_group(
     dirty_page_nums: &[u64],

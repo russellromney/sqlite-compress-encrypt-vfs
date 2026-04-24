@@ -15,7 +15,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../target/release -lturbolite
+#cgo LDFLAGS: -L${SRCDIR}/../../../cinch-target/release -lturbolite_ffi
 #include <stdlib.h>
 
 extern const char* turbolite_version();

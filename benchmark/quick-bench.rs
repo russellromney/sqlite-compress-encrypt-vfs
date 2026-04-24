@@ -5,7 +5,7 @@
 //! Measures basic read/write throughput with TurboliteVfs local storage.
 
 use rusqlite::Connection;
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -27,11 +27,10 @@ fn main() {
 
     // Register TurboliteVfs local
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("create VFS");
     turbolite::tiered::register("bench", vfs).expect("register VFS");
 
     let db_path = dir.path().join("bench.db");

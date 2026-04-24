@@ -193,7 +193,7 @@ pub(crate) struct DiskCache {
     #[cfg(feature = "zstd")]
     pub(crate) dictionary: Option<Arc<Vec<u8>>>,
 
-    // ── Phase Stalingrad-c: cache stats counters ──
+    // Cache stats counters
     /// Cache hits (page was in bitmap/cache, served from local disk).
     pub(crate) stat_hits: AtomicU64,
     /// Cache misses (page not cached, triggered S3 fetch).
@@ -806,7 +806,7 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Write pages to the cache at non-consecutive positions (Phase Midway: B-tree-packed groups).
+    /// Write pages to the cache at non-consecutive positions (B-tree-packed groups).
     /// `page_nums` maps position in `data` to actual page number.
     pub(crate) fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
         use std::os::unix::fs::FileExt;

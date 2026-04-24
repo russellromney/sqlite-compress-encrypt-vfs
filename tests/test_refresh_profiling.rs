@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 
 /// Simple test to verify refresh profiling works
 /// Creates data, then opens new connections that must scan the file
@@ -7,11 +7,10 @@ use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
 fn test_refresh_profiling_simple() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.path().into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("Failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
     turbolite::tiered::register("test_refresh_prof", vfs).expect("Failed to register VFS");
 
     let db_path = dir.path().join("test.db");

@@ -605,7 +605,7 @@ fn test_sub_chunk_tracker_no_encryption_stays_plaintext() {
     assert!(parse_result.is_ok(), "unencrypted tracker file must be valid JSON");
 }
 
-// ── Phase Stalingrad: cache byte tracking tests ──
+// Cache byte tracking tests
 
 #[test]
 fn test_current_cache_bytes_tracks_mark_present() {
@@ -816,7 +816,7 @@ fn test_v1_format_backward_compat() {
     assert_eq!(t.access_counts.get(&id).copied().unwrap_or(0), 0);
 }
 
-// ── Phase Stalingrad-b: weighted eviction tests ──
+// Weighted eviction tests
 
 #[test]
 fn test_touch_increments_access_count() {

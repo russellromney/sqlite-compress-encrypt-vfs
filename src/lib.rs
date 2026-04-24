@@ -18,47 +18,162 @@
 //!     cache_dir: "/data/mydb".into(),
 //!     ..Default::default()
 //! };
-//! let vfs = TurboliteVfs::new(config)?;
+//! let vfs = TurboliteVfs::new_local(config)?;
 //! turbolite::tiered::register("mydb", vfs)?;
 //! ```
 
-/// Debug logging macro, gated behind TURBOLITE_DEBUG=1 env var.
-/// Silent by default. Set TURBOLITE_DEBUG=1 to enable debug output to stderr.
-/// Error-level messages use eprintln! directly and are always visible.
+/// Debug logging macro. Emits a `tracing::debug!` event under the
+/// `turbolite` target. Users filter via `RUST_LOG=turbolite=debug` like any
+/// other tracing-instrumented library. Silent by default — no subscriber
+/// means no output, regardless of verbosity.
 #[macro_export]
 macro_rules! turbolite_debug {
     ($($arg:tt)*) => {
-        if $crate::debug_enabled() {
-            eprintln!($($arg)*);
-        }
+        ::tracing::debug!(target: "turbolite", $($arg)*);
     };
-}
-
-/// Check if debug logging is enabled (cached after first check).
-pub fn debug_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0 = unchecked, 1 = disabled, 2 = enabled
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let enabled = std::env::var("TURBOLITE_DEBUG").map_or(false, |v| v == "1" || v == "true");
-            STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-            enabled
-        }
-    }
 }
 
 pub mod compress;
 pub mod dict;
-#[cfg(not(feature = "loadable-extension"))]
-pub mod ffi;
-#[cfg(feature = "loadable-extension")]
-pub mod ext;
 pub mod tiered;
 pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
 pub mod btree_walker;
+
+#[cfg(feature = "bundled-sqlite")]
+mod install_hook;
+pub use tiered::{TurboliteVfs, TurboliteConfig, TurboliteHandle, SharedTurboliteVfs};
+pub use tiered::ManifestSource;
+pub use hadb_storage::StorageBackend;
+pub mod btree_walker;
+
+/// Open a turbolite-backed SQLite connection.
+///
+/// Registers the VFS, opens the connection, and disables SQLite's page cache
+/// (turbolite manages its own manifest-aware cache instead). This is the
+/// recommended way to open a turbolite connection from Rust.
+///
+/// Requires the `bundled-sqlite` feature.
+///
+/// ```no_run
+/// let config = turbolite::TurboliteConfig {
+///     read_only: true,
+///     ..Default::default()
+/// };
+/// let conn = turbolite::connect("my.db", config).unwrap();
+/// ```
+#[cfg(feature = "bundled-sqlite")]
+pub fn connect(path: &str, config: TurboliteConfig) -> Result<rusqlite::Connection, anyhow::Error> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let vfs_name = format!("turbolite_{:x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+    let read_only = config.read_only;
+
+    let vfs = TurboliteVfs::new_local(config)?;
+    let shared = SharedTurboliteVfs::new(vfs);
+    tiered::register_shared(&vfs_name, shared)?;
+
+    let flags = if read_only {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+    };
+    let conn = Connection::open_with_flags_and_vfs(path, flags, &vfs_name)?;
+
+    // turbolite manages its own manifest-aware page cache. Disable SQLite's
+    // built-in cache so all reads go through turbolite's VFS.
+    conn.execute_batch("PRAGMA cache_size=0;")?;
+
+    // `turbolite_config_set` is installed automatically via the
+    // `sqlite3_auto_extension` hook registered by `TurboliteVfs::new_local`
+    // above — SQLite fires the hook on this `sqlite3_open_v2` after xOpen
+    // has pushed the handle queue onto the thread-local stack, so the
+    // scalar binds to THIS connection's queue via pApp. See
+    // `install_hook.rs` for the mechanism.
+
+    Ok(conn)
+}
+
+/// Register the `turbolite_config_set(key, value)` SQL function on a
+/// rusqlite [`Connection`], bound to that connection's turbolite handle
+/// queue.
+///
+/// ```sql
+/// -- Tune prefetch for an aggressive scan batch, then run the queries.
+/// SELECT turbolite_config_set('prefetch_search', '0.5,0.5');
+/// SELECT * FROM logs WHERE day = '2026-04-20';
+/// ```
+///
+/// [`connect`] calls this automatically. Callers that open a turbolite
+/// connection via `rusqlite::Connection::open_with_flags_and_vfs` (rather
+/// than [`connect`]) should call this once per connection, **immediately
+/// after opening** — the helper snapshots the calling connection's handle
+/// queue at install time and the scalar-function closure pushes into that
+/// captured queue at call time. No thread-local lookup at call time means
+/// no ambiguity when multiple turbolite connections are open on the same
+/// thread: each connection's pushes land on its own queue regardless of
+/// which handle was opened most recently.
+///
+/// # Timing contract
+///
+/// Call immediately after `open_with_flags_and_vfs`, before opening any
+/// other turbolite connection on the same thread. Under the hood the
+/// helper reads the top of the thread-local active-handle stack; if
+/// another turbolite connection has opened in between, install will
+/// capture that other connection's queue — a misuse, not a runtime bug.
+///
+/// # Errors
+///
+/// - Returns a SQL error from the `PRAGMA schema_version` probe if the
+///   connection isn't backed by a turbolite VFS.
+/// - Returns `UserFunctionError` if no turbolite handle is active on this
+///   thread after the probe (misuse; shouldn't happen in normal flow).
+///
+/// # SQL function return codes
+///
+/// - `0` — update queued successfully; the handle applies it on the next
+///    slow-path read.
+/// - SQL error — validation failed (unknown key or bad value). The
+///   captured queue makes "no active handle" unreachable through this
+///   function: the closure holds an `Arc` to its queue for the function's
+///   lifetime.
+#[cfg(feature = "bundled-sqlite")]
+pub fn install_config_functions(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    use tiered::settings::{self, SettingUpdate};
+
+    // Force xOpen on the main-db file if it hasn't fired yet, so this
+    // connection's handle queue is on the thread-local stack.
+    // `PRAGMA schema_version` reads page 1 which is enough to trigger
+    // the VFS file open.
+    let _: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+
+    let queue = settings::top_queue().ok_or_else(|| {
+        rusqlite::Error::UserFunctionError(
+            "install_config_functions: no turbolite handle active on this thread. \
+             Call install_config_functions immediately after \
+             Connection::open_with_flags_and_vfs on a turbolite-backed connection."
+                .into(),
+        )
+    })?;
+
+    conn.create_scalar_function(
+        "turbolite_config_set",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        move |ctx| {
+            let key: String = ctx.get(0)?;
+            let value: String = ctx.get(1)?;
+            settings::validate(&key, &value)
+                .map_err(|msg| rusqlite::Error::UserFunctionError(msg.into()))?;
+            queue
+                .lock()
+                .expect("settings queue poisoned")
+                .push(SettingUpdate { key, value });
+            Ok(0i64)
+        },
+    )
+}
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -172,16 +287,8 @@ pub fn release_locks_for(path: &Path) {
 // Locks are at bytes 120-127 in the WAL-index header
 const WAL_LOCK_OFFSET: u64 = 120;
 
-/// Debug lock tracing, enabled via TURBOLITE_DEBUG_LOCKS=1
-static DEBUG_LOCKS: AtomicBool = AtomicBool::new(false);
-
-/// Initialize debug lock tracing from environment
-pub fn init_debug_locks() {
-    if std::env::var("TURBOLITE_DEBUG_LOCKS").map(|v| v == "1").unwrap_or(false) {
-        DEBUG_LOCKS.store(true, Ordering::Relaxed);
-        turbolite_debug!("[LOCK DEBUG] Lock tracing enabled");
-    }
-}
+/// Lock tracing events are emitted under the `turbolite::locks` tracing
+/// target. Filter with `RUST_LOG=turbolite::locks=trace`.
 
 // ── FileWalIndex (shared by TurboliteVfs) ─────────────────────────────
 
@@ -349,15 +456,14 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
                             let prev_offset = WAL_LOCK_OFFSET + prev_slot as u64;
                             unlock_inprocess(&self.path, prev_offset as usize, 1, conn_id);
                         }
-                        if DEBUG_LOCKS.load(Ordering::Relaxed) {
-                            turbolite_debug!(
-                                "[LOCK DEBUG] {:?} WAL_INDEX {} slot {} {:?} => BUSY (in-process)",
-                                std::thread::current().id(),
-                                self.path.display(),
-                                slot,
-                                lock
-                            );
-                        }
+                        ::tracing::trace!(
+                            target: "turbolite::locks",
+                            thread = ?std::thread::current().id(),
+                            path = %self.path.display(),
+                            slot = slot,
+                            lock = ?lock,
+                            "WAL_INDEX lock contested (in-process)"
+                        );
                         return Ok(false);
                     }
                 }
@@ -407,16 +513,15 @@ impl sqlite_vfs::wip::WalIndex for FileWalIndex {
             }
         }
 
-        if DEBUG_LOCKS.load(Ordering::Relaxed) {
-            turbolite_debug!(
-                "[LOCK DEBUG] {:?} WAL_INDEX {} locks {:?}..{:?} {:?} => OK",
-                std::thread::current().id(),
-                self.path.display(),
-                locks.start,
-                locks.end,
-                lock
-            );
-        }
+        ::tracing::trace!(
+            target: "turbolite::locks",
+            thread = ?std::thread::current().id(),
+            path = %self.path.display(),
+            start = locks.start,
+            end = locks.end,
+            lock = ?lock,
+            "WAL_INDEX lock acquired"
+        );
         Ok(true)
     }
 

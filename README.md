@@ -1,6 +1,10 @@
 # turbolite
 
-turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency. 
+turbolite is a SQLite VFS in Rust that serves point lookups and joins directly from S3 with sub-250ms cold latency.
+
+This repo is a Cargo workspace with two crates:
+- **`turbolite`** — Pure Rust library. SQLite VFS with page-level compression, encryption, and S3 tiering.
+- **`turbolite-ffi`** — C FFI / loadable extension + language bindings (Python, Node.js, Go).
 
 It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest, which can be used separately from S3.
 
@@ -142,7 +146,7 @@ Each consecutive miss advances through a **prefetch schedule** that controls wha
 - **Search schedule** `[0.3, 0.3, 0.4]`: for `SEARCH ... USING INDEX` queries that scan unknown portions of indexes. Aggressive from the first miss because we don't know how much of the index will be scanned.
 - **Lookup schedule** `[0.0, 0.0, 0.0]`: for point queries and index lookups that hit 1-2 pages per tree. Three free hops before any prefetch. Zero-heavy schedules outperform early-ramp on both S3 Express and Tigris.
 
-You can tune the prefetch schedule for *each query* via `SELECT turbolite_config_set(...)` - you know the query's storage needs, so the VFS doesn't have to guess. See [Runtime tuning](#runtime-tuning).
+You can tune the prefetch schedule at open time by setting `prefetch.search` / `prefetch.lookup` on `TurboliteConfig` - you know the expected workload shape, so the VFS doesn't have to guess. See [Configuring prefetch](#configuring-prefetch).
 
 Both schedules take advantage of B-tree introspection: every prefetched group is guaranteed to contain pages from the right tree. An example: if SQLite requests a page from the `users` table, then requests another from the same table, turbolite assumes a scan is coming and prefetches the rest of the `users` table in the background, and nothing else. Without B-tree introspection, it would accidentally fetch half the users table and half the posts table just because the data lives next to each other on disk.
 
@@ -163,11 +167,11 @@ SQLite (PRAGMA cache_size=0)
 ```
 
 **Configuration:**
-- `mem_cache_budget` in `TurboliteConfig` (bytes). Default: 64MB.
+- `cache.mem_budget` on `TurboliteConfig` (bytes). Default: 64MB.
 - `TURBOLITE_MEM_CACHE_BUDGET` env var (e.g., `128MB`, `1GB`).
 - Set to `0` to disable the in-memory cache entirely.
 
-> **Required for read replicas / HA followers:** set `PRAGMA cache_size=0` on the SQLite connection. SQLite's built-in page cache does not invalidate when turbolite receives new pages via replication. Without this pragma, follower reads return stale data. turbolite's own cache (configured above) handles caching correctly.
+`turbolite.connect()` (Python/Go/TypeScript) automatically disables SQLite's page cache and uses turbolite's instead. Rust consumers using `Connection::open_with_flags_and_vfs` directly should set `PRAGMA cache_size=0` to get the same behavior.
 
 ### Encryption & Compression
 
@@ -212,9 +216,9 @@ SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mo
 
 | Parameter | What it controls | Default |
 |-----------|-----------------|---------|
-| `prefetch_threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
-| `pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
-| `gc_enabled` | Delete old page group versions after checkpoint | true |
+| `prefetch.threads` | Worker threads for parallel S3 fetches | num_cpus + 1 |
+| `cache.pages_per_group` | Pages per S3 object, larger = fewer PUTs, more bytes per fetch | 256 |
+| `cache.gc_enabled` | Delete old page group versions after checkpoint | true |
 | `sync_mode` | Checkpoint durability: `Durable` (S3 upload in checkpoint) or `LocalThenFlush` (defer upload) | Durable |
 
 ### Prefetch schedules
@@ -231,28 +235,44 @@ Each element is the fraction of sibling groups to prefetch on the Nth consecutiv
 
 **Why two reactive schedules?** SEARCH queries scan unknown portions of indexes/tables and need aggressive warmup. Lookups hit 1-2 pages per tree and barely need prefetch. Per-tree miss counters ensure independent tracking: a profile query hitting users (miss 1) then posts (miss 1) tracks each tree separately.
 
-### Runtime tuning
+### Configuring prefetch
 
-Schedules can be changed per-connection without reopening via the `turbolite_config_set` SQL function:
+Set `prefetch.search` and `prefetch.lookup` on `TurboliteConfig` at VFS construction:
 
-```sql
-SELECT turbolite_config_set('prefetch_search', '0.4,0.3,0.3');
-SELECT turbolite_config_set('prefetch_lookup', '0,0,0.2');
-SELECT turbolite_config_set('prefetch', '0.5,0.5');     -- sets both
-SELECT turbolite_config_set('prefetch_reset', '');        -- reset to defaults
-SELECT turbolite_config_set('plan_aware', 'false');
+```rust
+use turbolite::tiered::{TurboliteConfig, PrefetchConfig};
+
+let config = TurboliteConfig {
+    prefetch: PrefetchConfig {
+        search: vec![0.4, 0.3, 0.3],
+        lookup: vec![0.0, 0.0, 0.2],
+        query_plan: true,
+        ..Default::default()
+    },
+    ..Default::default()
+};
 ```
 
-Changes take effect on the next query. Zero overhead when not used.
+For per-query retuning without reopening the connection, use the
+`turbolite_config_set` SQL function (Phase Cirrus c). Each push is
+scoped to the calling connection's handle:
+
+```sql
+SELECT turbolite_config_set('prefetch_search', '0.5,0.5,0.0');
+SELECT turbolite_config_set('prefetch_lookup', '0.0,0.0,0.0');
+SELECT * FROM posts WHERE created_at > ?;   -- runs with the new schedule
+```
+
+Rust callers can invoke the same path via `turbolite::tiered::settings::set`.
 
 ### Recommended configs
 
 | Workload | Config | Why |
 |----------|--------|-----|
 | Mixed OLTP | Defaults | Plan-aware handles scans, search schedule warms indexes, lookup schedule stays conservative. |
-| Point-heavy (agent DBs) | `prefetch_lookup=0,0,0` | Lookups almost never need prefetch. |
-| Scan-heavy analytics | `prefetch_search=0.5,0.5`, `plan_aware=true` | Aggressive search warmup plus plan-aware bulk prefetch. |
-| Conservative (bursty serverless) | `prefetch_search=0.1,0.2,0.3`, `prefetch_lookup=0,0,0.1` | Minimal prefetch noise. |
+| Point-heavy (agent DBs) | `prefetch.lookup: vec![0.0, 0.0, 0.0]` | Lookups almost never need prefetch. |
+| Scan-heavy analytics | `prefetch.search: vec![0.5, 0.5]`, `prefetch.query_plan: true` | Aggressive search warmup plus plan-aware bulk prefetch. |
+| Conservative (bursty serverless) | `prefetch.search: vec![0.1, 0.2, 0.3]`, `prefetch.lookup: vec![0.0, 0.0, 0.1]` | Minimal prefetch noise. |
 
 **Note**: prefetch is per-connection. Each new connection starts with cold per-tree miss counters. The cache is shared, so a second connection benefits from pages cached by the first.
 
@@ -292,7 +312,7 @@ cargo run --release --features cloud,zstd --bin tiered-tune -- \
   --iterations 10
 ```
 
-Output is a per-query comparison table (like `tiered-bench --matrix`) showing p50, p90, GET count, and bytes for each schedule pair. The tool recommends a schedule and prints the `turbolite_config_set` SQL to apply it.
+Output is a per-query comparison table (like `tiered-bench --matrix`) showing p50, p90, GET count, and bytes for each schedule pair. The tool recommends a schedule and prints the `TurboliteConfig` assignment to apply it.
 
 ## Durability
 
@@ -354,7 +374,9 @@ Page-level operation means most SQLite features still work: FTS, R-tree, JSON, W
 
 ## Installation
 
-**Python**: `pip install turbolite` — see [packages/python/](packages/python/)
+This repo is a Cargo workspace. The `turbolite` crate is the pure Rust library at the workspace root. Language bindings and the loadable extension live in `turbolite-ffi/`.
+
+**Python**: `pip install turbolite` — see [turbolite-ffi/packages/python/](turbolite-ffi/packages/python/)
 
 ```python
 import turbolite
@@ -374,7 +396,7 @@ conn = sqlite3.connect("file:my.db?vfs=turbolite", uri=True)       # local
 conn = sqlite3.connect("file:my.db?vfs=turbolite-s3", uri=True)    # S3 (needs TURBOLITE_BUCKET)
 ```
 
-**Node.js**: `npm install turbolite` — see [packages/node/](packages/node/)
+**Node.js**: `npm install turbolite` — see [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/)
 
 **Rust**:
 ```toml
@@ -434,15 +456,14 @@ const rows = db.query("SELECT * FROM users");
 db.close();
 ```
 
-Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [packages/node/](packages/node/) for full docs.
+Note: Node uses a wrapped `Database` class (not `load_extension`) because better-sqlite3 compiles with `SQLITE_USE_URI=0`. See [turbolite-ffi/packages/node/](turbolite-ffi/packages/node/) for full docs.
 
 ### Rust (local)
 
 ```rust
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
 
 let config = TurboliteConfig {
-    storage_backend: StorageBackend::Local,
     cache_dir: "/path/to/data".into(),
     ..Default::default()
 };
@@ -459,19 +480,15 @@ let conn = rusqlite::Connection::open_with_flags_and_vfs(
 ### Rust (S3 cloud)
 
 ```rust
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig, StorageBackend};
+use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
+use hadb_storage::StorageBackend;
 
 let config = TurboliteConfig {
-    storage_backend: StorageBackend::S3 {
-        bucket: "my-bucket".into(),
-        prefix: "my-database".into(),
-        endpoint_url: None,
-        region: None,
-    },
     cache_dir: "/tmp/cache".into(),
     ..Default::default()
 };
-let vfs = TurboliteVfs::new(config)?;
+let storage: Arc<dyn StorageBackend> = /* your S3 backend */;
+let vfs = TurboliteVfs::with_backend(config, storage, tokio::runtime::Handle::current())?;
 turbolite::tiered::register("turbolite", vfs)?;
 
 let conn = rusqlite::Connection::open_with_flags_and_vfs(

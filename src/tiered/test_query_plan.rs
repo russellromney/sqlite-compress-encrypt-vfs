@@ -200,7 +200,7 @@ SEARCH users USING INDEX idx_users_email (email=?)";
     assert_eq!(result[1].access_type, AccessType::Search);
 }
 
-// ── End-query signal tests (Phase Stalingrad) ──
+// ── End-query signal tests ──
 
 #[test]
 fn test_end_query_signal_default_false() {
@@ -226,13 +226,9 @@ fn test_end_query_signal_multiple_signals_collapse() {
     assert!(!check_and_clear_end_query());
 }
 
-#[test]
-fn test_end_query_ffi_entry_point() {
-    check_and_clear_end_query();
-    turbolite_trace_end_query();
-    assert!(check_and_clear_end_query());
-    assert!(!check_and_clear_end_query());
-}
+// The FFI entry-point smoke test (`turbolite_trace_end_query`) lives in
+// turbolite-ffi; the Rust-level `signal_end_query` path is covered by
+// `test_end_query_signal_*` above.
 
 #[test]
 fn test_end_query_signal_independent_of_plan_queue() {

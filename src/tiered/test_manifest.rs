@@ -159,7 +159,7 @@ fn test_seekable_manifest_backward_compat() {
     assert_eq!(m.sub_pages_per_frame, 0);
 }
 
-// ── Phase Midway regression tests ──
+// Regression tests
 
 #[test]
 fn test_assign_new_pages_to_groups_basic() {
@@ -302,7 +302,7 @@ fn test_build_page_index_roundtrip() {
     }
 }
 
-// ── Phase Midway: B-tree-aware page groups tests ──
+// B-tree-aware page groups tests
 
 #[test]
 fn test_total_groups_btree_vs_positional() {
@@ -424,7 +424,7 @@ fn test_manifest_serde_roundtrip_btree_groups() {
     assert_eq!(m2.btree_groups.get(&1).unwrap(), &vec![1u64]);
     // group 2 has no btree entry, so no btree_groups mapping
     assert!(m2.btree_groups.get(&2).is_none());
-    // Phase Verdun-i: page_to_tree_name reverse index rebuilt from btrees
+    // Page_to_tree_name reverse index rebuilt from btrees
     // B-tree root=0 ("users") owns group 0 with pages [0, 5, 10, 15]
     assert_eq!(m2.page_to_tree_name.get(&0).map(|s| s.as_str()), Some("users"));
     assert_eq!(m2.page_to_tree_name.get(&5).map(|s| s.as_str()), Some("users"));
@@ -715,7 +715,7 @@ fn test_positional_page_location_ppg_zero() {
 #[test]
 fn test_shared_dirty_groups_arc_semantics() {
     // Verify that Arc<Mutex<HashSet<u64>>> drains correctly (simulates
-    // handle writing + flush_to_s3 draining the same shared state).
+    // handle writing + flush_to_storage draining the same shared state).
     let shared = Arc::new(Mutex::new(HashSet::new()));
 
     // Simulate handle writing during local checkpoint
@@ -726,7 +726,7 @@ fn test_shared_dirty_groups_arc_semantics() {
         pending.insert(7);
     }
 
-    // Simulate flush_to_s3 draining
+    // Simulate flush_to_storage draining
     let drained: HashSet<u64> = {
         let mut pending = shared.lock().unwrap();
         std::mem::take(&mut *pending)
@@ -741,7 +741,7 @@ fn test_shared_dirty_groups_arc_semantics() {
 
 #[test]
 fn test_shared_manifest_arc_write_visible_to_readers() {
-    // Verify that manifest updates from the handle are visible to flush_to_s3
+    // Verify that manifest updates from the handle are visible to flush_to_storage
     let shared = Arc::new(RwLock::new(Manifest::empty()));
     let reader = Arc::clone(&shared);
 
@@ -763,7 +763,7 @@ fn test_shared_manifest_arc_write_visible_to_readers() {
 }
 
 // =========================================================================
-// Phase Drift: dirty_frames_for_group tests
+// Dirty_frames_for_group tests
 // =========================================================================
 
 use crate::tiered::manifest::{dirty_frames_for_group, SubframeOverride};
@@ -867,7 +867,7 @@ fn test_dirty_frames_all_beyond_frame_table() {
 }
 
 // =========================================================================
-// Phase Drift: SubframeOverride serde tests
+// SubframeOverride serde tests
 // =========================================================================
 
 #[test]

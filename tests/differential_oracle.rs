@@ -6,7 +6,7 @@
 use proptest::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::atomic::{AtomicU64, Ordering};
-use turbolite::tiered::{StorageBackend, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 static VFS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -15,11 +15,10 @@ fn register_fresh_vfs(dir: &std::path::Path) -> String {
     let id = VFS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = format!("oracle_{}", id);
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
         cache_dir: dir.into(),
         ..Default::default()
     };
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
+    let vfs = TurboliteVfs::new_local(config).expect("failed to create VFS");
     turbolite::tiered::register(&name, vfs).expect("failed to register VFS");
     name
 }

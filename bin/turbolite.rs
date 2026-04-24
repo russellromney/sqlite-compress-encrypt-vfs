@@ -2,9 +2,15 @@
 //!
 //! Management commands for turbolite databases: inspect manifests,
 //! import/export, interactive shell, and cache download.
+//!
+//! The CLI is the embedder of turbolite here; it picks the concrete
+//! `StorageBackend` (local filesystem or S3 via hadb_storage_s3) and
+//! injects it via `TurboliteVfs::with_backend`. turbolite itself
+//! has no S3 deps.
 
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -208,47 +214,65 @@ enum Commands {
     },
 }
 
-/// Build a TurboliteConfig from common CLI args.
-fn build_config(
+/// Owned tokio runtime for commands that talk to S3. Kept alive for the
+/// lifetime of the VFS so background prefetch workers can drive async
+/// calls. Local-mode commands return `None`.
+type RuntimeGuard = Option<tokio::runtime::Runtime>;
+
+/// Build a TurboliteConfig + concrete backend + runtime guard from CLI args.
+///
+/// When `bucket` is `None`, returns a local-only VFS (no runtime needed).
+/// When `bucket` is `Some`, builds an `S3Storage` rooted at that bucket
+/// and returns an owned tokio runtime that outlives the returned VFS.
+fn build_vfs(
     cache_dir: PathBuf,
     bucket: Option<String>,
     prefix: Option<String>,
     endpoint: Option<String>,
-    region: Option<String>,
+    _region: Option<String>,
     read_only: bool,
-) -> turbolite::tiered::TurboliteConfig {
-    use turbolite::tiered::{StorageBackend, TurboliteConfig};
+) -> Result<(turbolite::tiered::TurboliteVfs, RuntimeGuard)> {
+    use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-    let storage_backend = match bucket {
-        Some(ref b) => StorageBackend::S3 {
-            bucket: b.clone(),
-            prefix: prefix.clone().unwrap_or_default(),
-            endpoint_url: endpoint.clone(),
-            region: region.clone(),
-        },
-        None => StorageBackend::Local,
-    };
-
-    TurboliteConfig {
-        storage_backend,
-        bucket: bucket.unwrap_or_default(),
-        prefix: prefix.unwrap_or_default(),
-        endpoint_url: endpoint,
-        region,
+    let config = TurboliteConfig {
         cache_dir,
         read_only,
         ..Default::default()
+    };
+    match bucket {
+        None => Ok((
+            TurboliteVfs::new_local(config).context("failed to create local VFS")?,
+            None,
+        )),
+        Some(b) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("tokio runtime")?;
+            let handle = runtime.handle().clone();
+            let prefix_for_s3 = prefix.unwrap_or_default();
+            let endpoint_clone = endpoint.clone();
+            let s3 = runtime
+                .block_on(async move {
+                    hadb_storage_s3::S3Storage::from_env(b, endpoint_clone.as_deref()).await
+                })
+                .map(|s| s.with_prefix(prefix_for_s3))
+                .context("build S3Storage")?;
+            let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
+            let vfs = TurboliteVfs::with_backend(config, backend, handle)
+                .context("failed to create S3-backed VFS")?;
+            Ok((vfs, Some(runtime)))
+        }
     }
 }
 
 /// Register a VFS and open a rusqlite connection.
 fn open_connection(
     db: &std::path::Path,
-    config: turbolite::tiered::TurboliteConfig,
+    vfs: turbolite::tiered::TurboliteVfs,
     vfs_name: &str,
 ) -> Result<rusqlite::Connection> {
-    let vfs = turbolite::tiered::TurboliteVfs::new(config)
-        .context("failed to create VFS")?;
     turbolite::tiered::register(vfs_name, vfs)
         .context("failed to register VFS")?;
 
@@ -261,11 +285,9 @@ fn open_connection(
 /// Register a shared VFS and return (SharedTurboliteVfs, Connection).
 fn open_shared(
     db: &std::path::Path,
-    config: turbolite::tiered::TurboliteConfig,
+    vfs: turbolite::tiered::TurboliteVfs,
     vfs_name: &str,
 ) -> Result<(turbolite::tiered::SharedTurboliteVfs, rusqlite::Connection)> {
-    let vfs = turbolite::tiered::TurboliteVfs::new(config)
-        .context("failed to create VFS")?;
     let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(vfs_name, shared.clone())
         .context("failed to register shared VFS")?;
@@ -284,10 +306,8 @@ fn cmd_info(
     region: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let config = build_config(cache_dir, bucket, prefix, endpoint, region, true);
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true)?;
     let vfs_name = format!("turbolite-info-{}", std::process::id());
-    let vfs = turbolite::tiered::TurboliteVfs::new(config)
-        .context("failed to create VFS")?;
     let shared = turbolite::tiered::SharedTurboliteVfs::new(vfs);
     turbolite::tiered::register_shared(&vfs_name, shared.clone())
         .context("failed to register VFS")?;
@@ -486,9 +506,9 @@ fn cmd_shell(
     cache_dir: PathBuf,
     read_only: bool,
 ) -> Result<()> {
-    let config = build_config(cache_dir, bucket, prefix, endpoint, region, read_only);
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, read_only)?;
     let vfs_name = format!("turbolite-shell-{}", std::process::id());
-    let conn = open_connection(&db, config, &vfs_name)?;
+    let conn = open_connection(&db, vfs, &vfs_name)?;
 
     let mode_str = if read_only { " (read-only)" } else { "" };
     println!("turbolite shell{} -- {}", mode_str, db.display());
@@ -653,11 +673,11 @@ fn cmd_download(
     cache_dir: PathBuf,
     threads: u32,
 ) -> Result<()> {
-    let mut config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, true);
-    config.prefetch_threads = threads;
-
+    let (vfs, _runtime) = build_with_prefetch_threads(
+        cache_dir, Some(bucket), prefix, endpoint, region, true, threads,
+    )?;
     let vfs_name = format!("turbolite-download-{}", std::process::id());
-    let (shared, conn) = open_shared(&db, config, &vfs_name)?;
+    let (shared, conn) = open_shared(&db, vfs, &vfs_name)?;
 
     let manifest = shared.manifest();
     let total_groups = manifest.page_group_keys.len();
@@ -681,16 +701,53 @@ fn cmd_download(
             .unwrap_or(0);
     }
 
-    let (fetches, bytes) = shared.s3_counters();
-    println!(
-        "download: {} tables, {} groups, {} S3 GETs, {:.1} MB",
-        tables.len(),
-        total_groups,
-        fetches,
-        bytes as f64 / (1024.0 * 1024.0),
-    );
+    println!("download: {} tables, {} groups", tables.len(), total_groups);
 
     Ok(())
+}
+
+fn build_with_prefetch_threads(
+    cache_dir: PathBuf,
+    bucket: Option<String>,
+    prefix: Option<String>,
+    endpoint: Option<String>,
+    _region: Option<String>,
+    read_only: bool,
+    prefetch_threads: u32,
+) -> Result<(turbolite::tiered::TurboliteVfs, RuntimeGuard)> {
+    use turbolite::tiered::{PrefetchConfig, TurboliteConfig, TurboliteVfs};
+    let config = TurboliteConfig {
+        cache_dir,
+        read_only,
+        prefetch: PrefetchConfig { threads: prefetch_threads, ..Default::default() },
+        ..Default::default()
+    };
+    match bucket {
+        None => Ok((
+            TurboliteVfs::new_local(config).context("failed to create local VFS")?,
+            None,
+        )),
+        Some(b) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .context("tokio runtime")?;
+            let handle = runtime.handle().clone();
+            let prefix_for_s3 = prefix.unwrap_or_default();
+            let endpoint_clone = endpoint.clone();
+            let s3 = runtime
+                .block_on(async move {
+                    hadb_storage_s3::S3Storage::from_env(b, endpoint_clone.as_deref()).await
+                })
+                .map(|s| s.with_prefix(prefix_for_s3))
+                .context("build S3Storage")?;
+            let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
+            let vfs = TurboliteVfs::with_backend(config, backend, handle)
+                .context("failed to create S3-backed VFS")?;
+            Ok((vfs, Some(runtime)))
+        }
+    }
 }
 
 fn cmd_validate(
@@ -701,9 +758,9 @@ fn cmd_validate(
     region: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let config = build_config(cache_dir, Some(bucket), prefix, endpoint, region, true);
+    let (vfs, _runtime) = build_vfs(cache_dir, Some(bucket), prefix, endpoint, region, true)?;
     let vfs_name = format!("turbolite-validate-{}", std::process::id());
-    let (shared, conn) = open_shared(&db, config, &vfs_name)?;
+    let (shared, conn) = open_shared(&db, vfs, &vfs_name)?;
 
     println!("validating manifest...");
     let result = shared.validate()
@@ -774,9 +831,9 @@ fn cmd_export(
     region: Option<String>,
     cache_dir: PathBuf,
 ) -> Result<()> {
-    let config = build_config(cache_dir, bucket, prefix, endpoint, region, true);
+    let (vfs, _runtime) = build_vfs(cache_dir, bucket, prefix, endpoint, region, true)?;
     let vfs_name = format!("turbolite-export-{}", std::process::id());
-    let src_conn = open_connection(&db, config, &vfs_name)?;
+    let src_conn = open_connection(&db, vfs, &vfs_name)?;
 
     // Open a plain SQLite destination (no VFS) and use the backup API
     // to copy all pages. This produces a standard SQLite file.
@@ -815,43 +872,49 @@ fn cmd_export(
     Ok(())
 }
 
-#[cfg(feature = "cloud")]
 fn cmd_import(
     input: PathBuf,
     bucket: String,
     prefix: Option<String>,
     endpoint: Option<String>,
-    region: Option<String>,
+    _region: Option<String>,
     pages_per_group: u32,
     compression_level: i32,
 ) -> Result<()> {
-    use turbolite::tiered::{StorageBackend, TurboliteConfig};
+    use turbolite::tiered::{CacheConfig, CompressionConfig, TurboliteConfig};
 
     let prefix_str = prefix.unwrap_or_default();
     let config = TurboliteConfig {
-        storage_backend: StorageBackend::S3 {
-            bucket: bucket.clone(),
-            prefix: prefix_str.clone(),
-            endpoint_url: endpoint.clone(),
-            region: region.clone(),
-        },
-        bucket: bucket.clone(),
-        prefix: prefix_str,
-        endpoint_url: endpoint,
-        region,
-        pages_per_group,
-        compression_level,
+        cache: CacheConfig { pages_per_group, ..Default::default() },
+        compression: CompressionConfig { level: compression_level, ..Default::default() },
         ..Default::default()
     };
 
-    let manifest = turbolite::tiered::import_sqlite_file(&config, &input)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    let handle = runtime.handle().clone();
+    let prefix_for_s3 = prefix_str.clone();
+    let endpoint_clone = endpoint.clone();
+    let bucket_clone = bucket.clone();
+    let s3 = runtime
+        .block_on(async move {
+            hadb_storage_s3::S3Storage::from_env(bucket_clone, endpoint_clone.as_deref()).await
+        })
+        .map(|s| s.with_prefix(prefix_for_s3))
+        .context("build S3Storage")?;
+    let backend: Arc<dyn hadb_storage::StorageBackend> = Arc::new(s3);
+
+    let manifest = turbolite::tiered::import_sqlite_file(&config, backend, handle, &input)
         .map_err(|e| anyhow!("import failed: {}", e))?;
 
     println!(
         "import: {} -> s3://{}/{} ({} pages, {} groups, manifest v{})",
         input.display(),
-        config.bucket,
-        config.prefix,
+        bucket,
+        prefix_str,
         manifest.page_count,
         manifest.page_group_keys.len(),
         manifest.version,
@@ -902,11 +965,7 @@ fn main() -> Result<()> {
             input, bucket, prefix, endpoint, region,
             pages_per_group, compression_level,
         } => {
-            #[cfg(feature = "cloud")]
             cmd_import(input, bucket, prefix, endpoint, region, pages_per_group, compression_level)?;
-
-            #[cfg(not(feature = "cloud"))]
-            return Err(anyhow!("import requires the 'cloud' feature. Rebuild with: cargo build --features cloud,zstd"));
         }
     }
 

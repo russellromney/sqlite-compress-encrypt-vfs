@@ -18,12 +18,78 @@
 
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses, push_setting};
-use std::sync::atomic::{AtomicU32, Ordering};
+use turbolite::tiered::{TurboliteSharedState, TurboliteConfig, TurboliteVfs, CacheConfig, CompressionConfig, PrefetchConfig, set_local_checkpoint_only, parse_eqp_output, push_planned_accesses};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// =========================================================================
+// Post-Phase-Anvil-g storage wiring
+//
+// The VFS no longer owns an S3Client and no longer exposes byte counters.
+// Benchmarks that want counters hold an Arc<S3Storage> themselves and read
+// the backend's own counters. `BenchCtx` pairs the SharedState (cache
+// control) with the S3Storage (counters) and exposes the same
+// `clear_cache_*`, `reset_s3_counters`, `s3_counters` method names the
+// pre-Anvil-g bench code called on `TurboliteSharedState`. Baseline
+// subtraction is used for "reset" because S3Storage is cumulative.
+// =========================================================================
+
+/// Build an S3 backend from env. Shared by every site that used to build a
+/// TurboliteConfig with `bucket`/`prefix`/`endpoint_url`/`region`.
+fn build_s3_backend(
+    runtime: &tokio::runtime::Handle,
+    prefix: &str,
+) -> Arc<hadb_storage_s3::S3Storage> {
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let storage = runtime.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+            .await
+            .expect("build S3Storage")
+    });
+    Arc::new(storage.with_prefix(prefix.to_string()))
+}
+
+/// Wrapper that pairs shared-state cache control with an S3Storage counter
+/// reader. Baseline subtraction gives the illusion of `reset_s3_counters`.
+struct BenchCtx<'a> {
+    state: &'a TurboliteSharedState,
+    s3: Arc<hadb_storage_s3::S3Storage>,
+    fetch_count_base: AtomicU64,
+    bytes_fetched_base: AtomicU64,
+}
+
+impl<'a> BenchCtx<'a> {
+    fn new(state: &'a TurboliteSharedState, s3: Arc<hadb_storage_s3::S3Storage>) -> Self {
+        Self {
+            fetch_count_base: AtomicU64::new(s3.fetch_count()),
+            bytes_fetched_base: AtomicU64::new(s3.bytes_fetched()),
+            state,
+            s3,
+        }
+    }
+
+    fn clear_cache_data_only(&self) { self.state.clear_cache_data_only(); }
+    fn clear_cache_interior_only(&self) { self.state.clear_cache_interior_only(); }
+    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+
+    /// Snapshot the current S3 counters as a new baseline. Subsequent
+    /// `s3_counters()` calls report deltas from this moment.
+    fn reset_s3_counters(&self) {
+        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+    }
+
+    fn s3_counters(&self) -> (u64, u64) {
+        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        (fc, fb)
+    }
+}
 
 // =========================================================================
 // Data constants
@@ -350,7 +416,7 @@ fn parse_prefetch_hops(s: &str) -> Vec<f32> {
 }
 
 fn make_config(
-    prefix: &str,
+    _prefix: &str,
     cache_dir: &std::path::Path,
     ppg: u32,
     prefetch_threads: u32,
@@ -358,22 +424,21 @@ fn make_config(
     prefetch_lookup: Vec<f32>,
 ) -> TurboliteConfig {
     TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
-        endpoint_url: endpoint_url(),
-        region: std::env::var("AWS_REGION").ok(),
-        pages_per_group: ppg,
-        prefetch_threads,
-        prefetch_search,
-        prefetch_lookup,
+        compression: CompressionConfig { level: 1, ..Default::default() },
+        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: prefetch_threads,
+            search: prefetch_search,
+            lookup: prefetch_lookup,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
 
 fn make_reader_config(
-    prefix: &str,
+    _prefix: &str,
     cache_dir: &std::path::Path,
     ppg: u32,
     prefetch_threads: u32,
@@ -381,17 +446,16 @@ fn make_reader_config(
     prefetch_lookup: Vec<f32>,
 ) -> TurboliteConfig {
     TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
-        compression_level: 1,
-        endpoint_url: endpoint_url(),
+        compression: CompressionConfig { level: 1, ..Default::default() },
         read_only: true,
-        region: std::env::var("AWS_REGION").ok(),
-        pages_per_group: ppg,
-        prefetch_threads,
-        prefetch_search,
-        prefetch_lookup,
+        cache: CacheConfig { pages_per_group: ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: prefetch_threads,
+            search: prefetch_search,
+            lookup: prefetch_lookup,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -750,16 +814,26 @@ impl SchedulePair {
         Self { search, lookup }
     }
 
+    /// Push this pair's prefetch schedules onto the current connection's
+    /// turbolite handle via the per-handle settings queue restored in
+    /// Phase Cirrus c. The next slow-path read on the handle drains and
+    /// applies the update, so each pair in matrix mode is actually
+    /// measured with its own schedule.
     fn push(&self) {
-        let zeros = "0,0,0,0,0,0,0,0,0,0".to_string();
-        let search_str = self.search.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or_else(|| zeros.clone());
-        let lookup_str = self.lookup.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or(zeros);
-        push_setting("prefetch_search".to_string(), search_str);
-        push_setting("prefetch_lookup".to_string(), lookup_str);
+        let search_val = match &self.search {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        let lookup_val = match &self.lookup {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        // `set` returns Err only if no active handle or the value fails
+        // validation; both are programmer errors in this bench, so panic.
+        turbolite::tiered::settings::set("prefetch_search", &search_val)
+            .expect("settings::set prefetch_search");
+        turbolite::tiered::settings::set("prefetch_lookup", &lookup_val)
+            .expect("settings::set prefetch_lookup");
     }
 
     fn label(&self) -> String {
@@ -804,7 +878,7 @@ fn run_query_pair(
 /// Cache level: data — everything cached, reuse connection. Measures pread latency.
 fn bench_data(
     conn: &Connection,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -843,7 +917,7 @@ fn bench_data(
 fn bench_index(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -898,7 +972,7 @@ fn bench_index(
 fn bench_interior(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -953,7 +1027,7 @@ fn bench_interior(
 fn bench_none(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1007,7 +1081,7 @@ fn bench_none(
 fn bench_none_pair(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     label: &str,
     sql: &str,
     param_fn: &dyn Fn(usize) -> Vec<rusqlite::types::Value>,
@@ -1119,18 +1193,25 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // 2. --force: generate through VFS (legacy path)
     // 3. Default: reuse existing S3 data at social_{n_posts}
     let s3_prefix = format!("social_{}_btree", n_posts);
+
+    // Each benchmark run owns its own multi-threaded tokio runtime; every
+    // S3Storage built below shares this handle so block_on calls from sync
+    // code work.
+    let bench_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build bench runtime");
+    let rt_handle = bench_runtime.handle().clone();
+
     if cli.import.is_some() {
         // Fast path: generate plain SQLite DB locally, then import to S3.
         // When --import auto and data already exists on S3, skip generation and import.
-        let check_config = turbolite::tiered::TurboliteConfig {
-            bucket: test_bucket(),
-            prefix: s3_prefix.clone(),
-            endpoint_url: endpoint_url(),
-            region: std::env::var("AWS_REGION").ok(),
-            ..Default::default()
-        };
-        let existing_manifest = turbolite::tiered::get_manifest(&check_config)
-            .expect("failed to check S3 manifest");
+        let check_backend = build_s3_backend(&rt_handle, &s3_prefix);
+        let existing_manifest = turbolite::tiered::get_manifest(
+            check_backend.as_ref(),
+            &rt_handle,
+        ).expect("failed to check S3 manifest");
 
         let is_auto = cli.import.as_deref() == Some("auto");
         if is_auto && existing_manifest.is_some() {
@@ -1158,16 +1239,15 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
 
             let import_start = Instant::now();
             let config = turbolite::tiered::TurboliteConfig {
-                bucket: test_bucket(),
-                prefix: s3_prefix.clone(),
-                endpoint_url: endpoint_url(),
-                region: std::env::var("AWS_REGION").ok(),
-                pages_per_group: cli.ppg,
-                compression_level: 1,
+                cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+                compression: CompressionConfig { level: 1, ..Default::default() },
                 ..Default::default()
             };
+            let import_backend = build_s3_backend(&rt_handle, &s3_prefix);
             let manifest = turbolite::tiered::import_sqlite_file(
                 &config,
+                import_backend as Arc<dyn hadb_storage::StorageBackend>,
+                rt_handle.clone(),
                 std::path::Path::new(&local_path),
             ).expect("import failed");
             println!("  S3 import:   {:.2}s ({} pages, {} groups, {} interior chunks)",
@@ -1181,7 +1261,12 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         // Legacy VFS generation path
         let config = make_config(&s3_prefix, cache_dir.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
         let vfs_name = unique_vfs_name("write");
-        let vfs = TurboliteVfs::new(config).expect("failed to create TurboliteVfs");
+        let writer_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+        let vfs = TurboliteVfs::with_backend(
+            config,
+            writer_s3 as Arc<dyn hadb_storage::StorageBackend>,
+            rt_handle.clone(),
+        ).expect("failed to create TurboliteVfs");
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
         let conn = Connection::open_with_flags_and_vfs(
@@ -1230,15 +1315,19 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // Create reader VFS + bench handle
     eprintln!("[bench] creating reader VFS...");
     let reader_cache = TempDir::new().expect("reader temp dir");
-    let mut reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
-    if std::env::var("BENCH_NO_EAGER_INDEX").is_ok() {
-        reader_config.eager_index_load = false;
-        eprintln!("[bench] eager index loading DISABLED (BENCH_NO_EAGER_INDEX set)");
-    }
-    eprintln!("[bench] calling TurboliteVfs::new()...");
-    let reader_vfs = TurboliteVfs::new(reader_config).expect("reader VFS");
-    eprintln!("[bench] TurboliteVfs::new() returned OK");
+    let reader_config = make_reader_config(&s3_prefix, reader_cache.path(), cli.ppg, cli.prefetch_threads, prefetch_search.clone(), prefetch_lookup.clone());
+    // Phase Cirrus d removed eager interior/index prefetch entirely; those
+    // pages now come in on first-query miss. BENCH_NO_EAGER_INDEX is a no-op.
+    eprintln!("[bench] calling TurboliteVfs::with_backend()...");
+    let reader_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+    let reader_vfs = TurboliteVfs::with_backend(
+        reader_config,
+        reader_s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rt_handle.clone(),
+    ).expect("reader VFS");
+    eprintln!("[bench] TurboliteVfs::with_backend() returned OK");
     let shared_state = reader_vfs.shared_state();
+    let ctx = BenchCtx::new(&shared_state, reader_s3.clone());
     let reader_vfs_name = unique_vfs_name("reader");
     eprintln!("[bench] registering VFS '{}'", reader_vfs_name);
     turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
@@ -1397,7 +1486,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: DATA (everything cached, reuse connection) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_data(&warm_conn, &shared_state, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_data(&warm_conn, &ctx, q.label, q.sql, &q.param_fn, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1408,7 +1497,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_index(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_index(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1417,7 +1506,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: INTERIOR (interior cached, index + data from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_interior(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_interior(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1426,7 +1515,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         println!("=== CACHE LEVEL: NONE (everything from S3) ===");
         print_header();
         for q in &queries {
-            print_result(&bench_none(&reader_vfs_name, &db_name, &shared_state, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
+            print_result(&bench_none(&reader_vfs_name, &db_name, &ctx, q.label, q.sql, &q.param_fn, cli.warmup, cli.iterations, plan_aware, &q.schedule));
         }
     }
 
@@ -1475,7 +1564,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
                 let r = bench_none_pair(
                     &reader_vfs_name,
                     &db_name,
-                    &shared_state,
+                    &ctx,
                     q.label,
                     q.sql,
                     &q.param_fn,
@@ -1504,16 +1593,17 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         eprint!("  Cleaning up S3... ");
         let cleanup_cache = TempDir::new().expect("cleanup temp dir");
         let cleanup_config = TurboliteConfig {
-            bucket: test_bucket(),
-            prefix: s3_prefix,
             cache_dir: cleanup_cache.path().to_path_buf(),
-            compression_level: 1,
-            endpoint_url: endpoint_url(),
-            region: std::env::var("AWS_REGION").ok(),
+            compression: CompressionConfig { level: 1, ..Default::default() },
             ..Default::default()
         };
-        let cleanup_vfs = TurboliteVfs::new(cleanup_config).expect("cleanup VFS");
-        cleanup_vfs.destroy_s3().expect("S3 cleanup failed");
+        let cleanup_s3 = build_s3_backend(&rt_handle, &s3_prefix);
+        let cleanup_vfs = TurboliteVfs::with_backend(
+            cleanup_config,
+            cleanup_s3 as Arc<dyn hadb_storage::StorageBackend>,
+            rt_handle.clone(),
+        ).expect("cleanup VFS");
+        cleanup_vfs.destroy_remote().expect("remote cleanup failed");
         eprintln!("done");
     }
 }

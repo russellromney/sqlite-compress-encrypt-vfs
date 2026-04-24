@@ -3,16 +3,16 @@ use std::collections::{HashMap, HashSet};
 
 #[test]
 fn test_local_checkpoint_flag_default_false() {
-    set_local_checkpoint_only(false);
-    assert!(!is_local_checkpoint_only());
+    crate::tiered::set_local_checkpoint_only(false);
+    assert!(!crate::tiered::is_local_checkpoint_only());
 }
 
 #[test]
 fn test_local_checkpoint_flag_set_and_clear() {
-    set_local_checkpoint_only(true);
-    assert!(is_local_checkpoint_only());
-    set_local_checkpoint_only(false);
-    assert!(!is_local_checkpoint_only());
+    crate::tiered::set_local_checkpoint_only(true);
+    assert!(crate::tiered::is_local_checkpoint_only());
+    crate::tiered::set_local_checkpoint_only(false);
+    assert!(!crate::tiered::is_local_checkpoint_only());
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn test_flush_empty_dirty_groups_is_noop() {
 }
 
 // =========================================================================
-// Phase Drift: override threshold tests
+// Override threshold tests
 // =========================================================================
 
 #[test]
@@ -107,14 +107,12 @@ fn test_override_threshold_boundary() {
 
 #[test]
 fn test_override_key_format() {
-    use crate::tiered::StorageClient;
-    let key = StorageClient::override_frame_key(5, 3, 10);
+    let key = super::keys::override_frame_key(5, 3, 10);
     assert_eq!(key, "p/d/5_f3_v10");
 }
 
 #[test]
 fn test_override_key_format_zero_indices() {
-    use crate::tiered::StorageClient;
-    let key = StorageClient::override_frame_key(0, 0, 1);
+    let key = super::keys::override_frame_key(0, 0, 1);
     assert_eq!(key, "p/d/0_f0_v1");
 }

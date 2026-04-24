@@ -1,40 +1,36 @@
-//! Bulk import: read a local SQLite file and upload to S3 as tiered page groups.
+//! Bulk import: read a local SQLite file and upload to a turbolite backend
+//! as tiered page groups.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
+use hadb_storage::StorageBackend;
+
+use super::storage as storage_helpers;
 use super::*;
 
-/// Import a local SQLite database file directly to S3 as tiered page groups.
+/// Import a local SQLite database file directly into a turbolite backend as
+/// tiered page groups.
 ///
-/// Reads the file page-by-page, encodes page groups, detects interior B-tree pages,
-/// and uploads everything to S3 with a manifest. This is much faster than writing
-/// through the VFS because it avoids WAL overhead and checkpoint cycles.
+/// Reads the file page-by-page, encodes page groups, detects interior B-tree
+/// pages, and uploads everything to `backend` with a manifest. Much faster
+/// than writing through the VFS because it avoids WAL overhead and
+/// checkpoint cycles.
 ///
-/// Returns the manifest that was uploaded.
+/// The caller owns the backend + tokio runtime handle; the function never
+/// constructs its own runtime.
 pub fn import_sqlite_file(
     config: &TurboliteConfig,
+    backend: Arc<dyn StorageBackend>,
+    runtime: tokio::runtime::Handle,
     file_path: &Path,
 ) -> io::Result<Manifest> {
     use std::os::unix::fs::FileExt;
-
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let handle = runtime.handle().clone();
-
-    // Build a minimal config for S3Client
-    let s3_cfg = TurboliteConfig {
-        bucket: config.bucket.clone(),
-        prefix: config.prefix.clone(),
-        endpoint_url: config.endpoint_url.clone(),
-        region: config.region.clone(),
-        runtime_handle: Some(handle.clone()),
-        ..Default::default()
-    };
-
-    let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
+    let backend_ref = backend.as_ref();
+    let runtime_ref = &runtime;
 
     // Open the file and read SQLite header to get page size and page count
     let file = File::open(file_path)?;
@@ -46,7 +42,7 @@ pub fn import_sqlite_file(
     let raw_page_size = u16::from_be_bytes([header[16], header[17]]);
     let page_size: u32 = if raw_page_size == 1 { 65536 } else { raw_page_size as u32 };
     let page_count = (file_len / page_size as u64) as u64;
-    let ppg = config.pages_per_group;
+    let ppg = config.cache.pages_per_group;
     let total_groups = (page_count + ppg as u64 - 1) / ppg as u64;
 
     eprintln!(
@@ -58,10 +54,10 @@ pub fn import_sqlite_file(
         total_groups,
     );
 
-    let compression_level = config.compression_level;
-    let sub_ppf = config.sub_pages_per_frame;
+    let compression_level = config.compression.level;
+    let sub_ppf = config.cache.sub_pages_per_frame;
     let use_seekable = sub_ppf > 0;
-    // Phase Somme: use SQLite's file change counter as manifest version.
+    // Use SQLite's file change counter as manifest version.
     let version = read_file_change_counter(&header);
     assert!(version > 0, "file change counter must be > 0 for import (is this a valid SQLite DB with committed data?)");
     eprintln!(
@@ -180,7 +176,7 @@ pub fn import_sqlite_file(
             pages[idx] = Some(buf);
         }
 
-        let key = s3.page_group_key(gid as u64, version);
+        let key = keys::page_group_key(gid as u64, version);
         if use_seekable {
             let (encoded, ft) = encode_page_group_seekable(
                 &pages,
@@ -189,7 +185,7 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
-                config.encryption_key.as_ref(),
+                config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(ft);
@@ -200,46 +196,12 @@ pub fn import_sqlite_file(
                 compression_level,
                 #[cfg(feature = "zstd")]
                 None,
-                config.encryption_key.as_ref(),
+                config.encryption.key.as_ref(),
             )?;
             uploads.push((key.clone(), encoded));
             frame_tables.push(Vec::new());
         }
         page_group_keys.push(key);
-
-        // DEBUG: verify encode/decode roundtrip for every group
-        if std::env::var("IMPORT_VERIFY").is_ok() {
-            let encoded_data = &uploads.last().unwrap().1;
-            let ft = frame_tables.last().unwrap();
-            if use_seekable && !ft.is_empty() {
-                let (dec_count, _dec_size, decoded) = decode_page_group_seekable_full(
-                    encoded_data,
-                    ft,
-                    page_size,
-                    page_nums.len() as u32,
-                    page_count,
-                    0,
-                    #[cfg(feature = "zstd")]
-                    None,
-                    config.encryption_key.as_ref(),
-                ).expect("decode roundtrip failed");
-                assert_eq!(dec_count as usize, page_nums.len(), "gid={} page count mismatch", gid);
-                for (idx, &pnum) in page_nums.iter().enumerate() {
-                    let start = idx * page_size as usize;
-                    let end = start + page_size as usize;
-                    let decoded_page = &decoded[start..end];
-                    let original = pages[idx].as_ref().unwrap();
-                    assert_eq!(decoded_page, original.as_slice(),
-                        "gid={} page {} (idx={}) roundtrip mismatch: first differing byte at {}",
-                        gid, pnum, idx,
-                        decoded_page.iter().zip(original.iter()).position(|(a, b)| a != b).unwrap_or(0),
-                    );
-                }
-            }
-            if gid == 0 {
-                eprintln!("[import] IMPORT_VERIFY: roundtrip checks enabled");
-            }
-        }
 
         if (gid + 1) % 50 == 0 || gid + 1 == actual_groups {
             eprintln!(
@@ -253,7 +215,7 @@ pub fn import_sqlite_file(
     let batch_size = 50;
     let total_uploads = uploads.len();
     for (batch_idx, batch) in uploads.chunks(batch_size).enumerate() {
-        s3.put_page_groups(batch)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, batch)?;
         let done = std::cmp::min((batch_idx + 1) * batch_size, total_uploads);
         eprintln!("[import] uploaded {}/{} page groups", done, total_uploads);
     }
@@ -278,9 +240,9 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
-            config.encryption_key.as_ref(),
+            config.encryption.key.as_ref(),
         )?;
-        let key = s3.interior_chunk_key(chunk_id, version);
+        let key = keys::interior_chunk_key(chunk_id, version);
         eprintln!(
             "[import] interior chunk {}: {} pages, {:.1}KB",
             chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -290,7 +252,7 @@ pub fn import_sqlite_file(
     }
 
     if !chunk_uploads.is_empty() {
-        s3.put_page_groups(&chunk_uploads)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, &chunk_uploads)?;
         eprintln!("[import] uploaded {} interior chunks", chunk_uploads.len());
     }
 
@@ -314,9 +276,9 @@ pub fn import_sqlite_file(
             compression_level,
             #[cfg(feature = "zstd")]
             None,
-            config.encryption_key.as_ref(),
+            config.encryption.key.as_ref(),
         )?;
-        let key = s3.index_chunk_key(chunk_id, version);
+        let key = keys::index_chunk_key(chunk_id, version);
         eprintln!(
             "[import] index chunk {}: {} pages, {:.1}KB",
             chunk_id, pages.len(), encoded.len() as f64 / 1024.0,
@@ -326,14 +288,15 @@ pub fn import_sqlite_file(
     }
 
     if !ix_chunk_uploads.is_empty() {
-        s3.put_page_groups(&ix_chunk_uploads)?;
+        storage_helpers::put_page_groups(backend_ref, runtime_ref, &ix_chunk_uploads)?;
         eprintln!("[import] uploaded {} index leaf chunks", ix_chunk_uploads.len());
     }
 
-    // Build and upload manifest (Phase Midway: explicit B-tree-aware groups)
+    // Build and upload manifest (explicit B-tree-aware groups)
     let mut manifest = Manifest {
         version,
         change_counter: version, // import uses the same value; walrust not relevant for import
+        epoch: 0,
         page_count,
         page_size,
         pages_per_group: ppg,
@@ -354,7 +317,7 @@ pub fn import_sqlite_file(
         db_header: None, // import doesn't need db_header (fresh import)
     };
     manifest.build_page_index();
-    s3.put_manifest(&manifest)?;
+    storage_helpers::put_manifest(backend_ref, runtime_ref, &manifest)?;
     eprintln!(
         "[import] manifest uploaded: version={} pages={} groups={} interior_chunks={} seekable={}",
         manifest.version, manifest.page_count, manifest.page_group_keys.len(),

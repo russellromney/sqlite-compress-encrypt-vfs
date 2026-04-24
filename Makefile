@@ -1,8 +1,9 @@
 # turbolite build targets
 #
-# Shared library (.so / .dylib) for C FFI consumers.
-# Cargo.toml declares crate-type = ["lib", "cdylib"] so both rlib and
-# shared library are produced on every build.
+# The cdylib + C FFI + loadable-extension surface now lives in the sibling
+# `turbolite-ffi` crate. This Makefile only builds turbolite's pure-Rust
+# library / bins / examples. For .dylib/.so / turbolite.h, run
+# `make -C ../turbolite-ffi {lib,ext,header}`.
 
 UNAME := $(shell uname -s)
 ifeq ($(UNAME),Darwin)
@@ -13,68 +14,32 @@ else
   LIB_PREFIX := lib
 endif
 
-LIB_NAME := turbolite
-LIB_FILE := $(LIB_PREFIX)$(LIB_NAME).$(LIB_EXT)
-TARGET_DIR := target/release
+# The turbolite-ffi cdylib is `libturbolite_ffi.<ext>`; make ext also
+# copies it to `turbolite.<ext>` for SQLite's `.load turbolite` path.
+FFI_LIB_NAME := turbolite_ffi
+FFI_LIB_FILE := $(LIB_PREFIX)$(FFI_LIB_NAME).$(LIB_EXT)
+CARGO_TARGET_DIR ?= ../cinch-target
+TARGET_DIR := $(CARGO_TARGET_DIR)/release
+# turbolite-ffi is a workspace member (nested subdirectory), not a sibling.
+FFI_DIR := turbolite-ffi
 
-# Features to include in the shared library build.
-# Override with: make lib FEATURES="zstd,encryption,tiered"
+# Features forwarded to cargo.
 FEATURES ?= zstd
 
-# ── Shared library ─────────────────────────────────────────────────
+# ── FFI build passthrough ─────────────────────────────────────────
 
-.PHONY: lib
-lib: ## Build shared library (.so / .dylib) linking system SQLite
-	cargo build --release --lib --no-default-features --features $(FEATURES)
-	@echo ""
-	@echo "Built: $(TARGET_DIR)/$(LIB_FILE)"
-	@ls -lh $(TARGET_DIR)/$(LIB_FILE)
+.PHONY: lib lib-bundled ext ext-local header
+lib lib-bundled: ## Build standalone cdylib (delegates to ../turbolite-ffi)
+	$(MAKE) -C $(FFI_DIR) lib FEATURES="$(FEATURES)"
 
-.PHONY: lib-bundled
-lib-bundled: ## Build shared library with bundled SQLite (self-contained)
-	cargo build --release --lib --features $(FEATURES),bundled-sqlite
-	@echo ""
-	@echo "Built (bundled SQLite): $(TARGET_DIR)/$(LIB_FILE)"
-	@ls -lh $(TARGET_DIR)/$(LIB_FILE)
+ext: ## Build loadable extension (delegates to ../turbolite-ffi)
+	$(MAKE) -C $(FFI_DIR) ext
 
-# ── Loadable extension ────────────────────────────────────────────
+ext-local: ## Build loadable extension, local-only (delegates)
+	$(MAKE) -C $(FFI_DIR) ext-local
 
-EXT_FEATURES ?= zstd,tiered
-
-.PHONY: ext
-ext: ## Build loadable extension with S3 tiered support (default)
-	cargo build --release --lib --no-default-features --features loadable-extension,$(EXT_FEATURES)
-	@cp $(TARGET_DIR)/$(LIB_FILE) $(TARGET_DIR)/turbolite.$(LIB_EXT)
-	@echo ""
-	@echo "Built loadable extension: $(TARGET_DIR)/turbolite.$(LIB_EXT)"
-	@ls -lh $(TARGET_DIR)/turbolite.$(LIB_EXT)
-
-.PHONY: ext-local
-ext-local: ## Build loadable extension (local compression only, no S3)
-	cargo build --release --lib --no-default-features --features loadable-extension,zstd
-	@cp $(TARGET_DIR)/$(LIB_FILE) $(TARGET_DIR)/turbolite.$(LIB_EXT)
-	@echo ""
-	@echo "Built loadable extension (local only): $(TARGET_DIR)/turbolite.$(LIB_EXT)"
-	@ls -lh $(TARGET_DIR)/turbolite.$(LIB_EXT)
-
-# ── C header ───────────────────────────────────────────────────────
-
-.PHONY: header
-header: ## Generate turbolite.h C header via cbindgen
-	cbindgen --config cbindgen.toml --crate turbolite --output turbolite.h
-	@echo "Generated: turbolite.h"
-
-# ── Install ────────────────────────────────────────────────────────
-
-PREFIX ?= /usr/local
-
-.PHONY: install
-install: lib header ## Install shared library + header to PREFIX (default /usr/local)
-	install -d $(PREFIX)/lib $(PREFIX)/include
-	install -m 755 $(TARGET_DIR)/$(LIB_FILE) $(PREFIX)/lib/
-	install -m 644 turbolite.h $(PREFIX)/include/
-	@echo ""
-	@echo "Installed to $(PREFIX)/lib/$(LIB_FILE) and $(PREFIX)/include/turbolite.h"
+header: ## Generate turbolite.h (delegates)
+	$(MAKE) -C $(FFI_DIR) header
 
 # ── CLI + binaries (bundled SQLite) ────────────────────────────────
 
@@ -92,48 +57,9 @@ test: ## Run all tests (Rust unit + FFI)
 test-all: ## Run all tests including tiered/S3
 	cargo test --features zstd,tiered,bundled-sqlite
 
-.PHONY: test-ext
-test-ext: ext ## Run loadable extension tests (requires Homebrew Python)
-	/opt/homebrew/bin/python3 tests/test_loadable_ext.py
-
-.PHONY: test-ffi
-test-ffi: test-ffi-python test-ffi-c test-ffi-go test-ffi-node ## Run all FFI integration tests (Python, C, Go, Node)
-
-.PHONY: test-ffi-tiered
-test-ffi-tiered: ## Run FFI integration tests with tiered/S3 (needs S3 creds)
-	$(MAKE) test-ffi FEATURES="zstd,tiered"
-
-.PHONY: test-ffi-python
-test-ffi-python: lib-bundled ## FFI test: Python (ctypes)
-	python3 tests/test_ffi_python.py
-
-# Build CFLAGS that mirror Cargo features for the C test.
-FFI_C_DEFINES :=
-ifneq (,$(findstring tiered,$(FEATURES)))
-  FFI_C_DEFINES += -DTURBOLITE_TIERED
-endif
-ifneq (,$(findstring encryption,$(FEATURES)))
-  FFI_C_DEFINES += -DTURBOLITE_ENCRYPTION
-endif
-
-.PHONY: test-ffi-c
-test-ffi-c: lib-bundled header ## FFI test: C (proves turbolite.h works)
-	cc -o $(TARGET_DIR)/test_ffi_c tests/test_ffi_c.c \
-		$(FFI_C_DEFINES) \
-		-L$(TARGET_DIR) -lturbolite \
-		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
-	$(TARGET_DIR)/test_ffi_c
-
-.PHONY: test-ffi-go
-test-ffi-go: lib-bundled ## FFI test: Go (cgo)
-	cd tests/test_ffi_go && \
-		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
-		go run .
-
-.PHONY: test-ffi-node
-test-ffi-node: lib-bundled ## FFI test: Node.js (koffi)
-	cd tests/test_ffi_node && npm install --silent 2>/dev/null && node test.mjs
+.PHONY: test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node
+test-ext test-ffi test-ffi-tiered test-ffi-python test-ffi-c test-ffi-go test-ffi-node: ## FFI / loadable-ext tests live in turbolite-ffi now
+	$(MAKE) -C $(FFI_DIR) $@
 
 # ── Examples ──────────────────────────────────────────────────────
 
@@ -156,14 +82,14 @@ example-python-tiered: lib-bundled ## Run Python S3 tiered example
 .PHONY: example-c
 example-c: lib-bundled header ## Build and run C local example (sensor logger)
 	cc -o $(TARGET_DIR)/example_c examples/c/local.c \
-		-L$(TARGET_DIR) -lturbolite \
+		-L$(TARGET_DIR) -lturbolite_ffi \
 		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
 	$(TARGET_DIR)/example_c
 
 .PHONY: example-c-tiered
 example-c-tiered: lib-bundled header ## Build and run C S3 tiered example
 	cc -o $(TARGET_DIR)/example_c_tiered examples/c/tiered.c \
-		-L$(TARGET_DIR) -lturbolite \
+		-L$(TARGET_DIR) -lturbolite_ffi \
 		-Wl,-rpath,$(CURDIR)/$(TARGET_DIR)
 	$(TARGET_DIR)/example_c_tiered
 
@@ -171,14 +97,14 @@ example-c-tiered: lib-bundled header ## Build and run C S3 tiered example
 example-go: lib-bundled ## Run Go local example (HTTP server)
 	cd examples/go && \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
 		go run local.go
 
 .PHONY: example-go-tiered
 example-go-tiered: lib-bundled ## Run Go S3 tiered example (HTTP server)
 	cd examples/go && \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
-		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite" \
+		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
 		go run tiered.go
 
 .PHONY: example-node
@@ -191,19 +117,11 @@ example-node-tiered: lib-bundled ## Run Node.js S3 tiered example (HTTP server)
 
 # ── Packages ─────────────────────────────────────────────────────
 
-.PHONY: pkg-python
-pkg-python: ext ## Build Python package (builds ext, bundles binary, creates wheel)
-	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
-	cd packages/python && pip wheel . --no-deps -w dist/
-
-.PHONY: pkg-python-dev
-pkg-python-dev: ext ## Install Python package in dev mode (builds ext first)
-	cp $(TARGET_DIR)/turbolite.$(LIB_EXT) packages/python/turbolite/
-	cd packages/python && pip install -e .
-
-.PHONY: pkg-node
-pkg-node: ## Build Node.js package (napi-rs native addon)
-	cd packages/node && npm install && npx @napi-rs/cli build --release --platform
+.PHONY: pkg-python pkg-python-dev pkg-node
+pkg-python pkg-python-dev pkg-node: ## Packages live in ../turbolite-ffi now
+	@echo "Language packages moved to ../turbolite-ffi/packages as of Phase Cirrus h3."
+	@echo "Run: make -C ../turbolite-ffi $@"
+	@exit 1
 
 # ── Cleanup ────────────────────────────────────────────────────────
 

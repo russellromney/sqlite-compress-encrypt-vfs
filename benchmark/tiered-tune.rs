@@ -17,13 +17,60 @@ use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
 use turbolite::tiered::{
     TurboliteSharedState, TurboliteConfig, TurboliteVfs,
-    parse_eqp_output, push_planned_accesses, push_setting,
+    CacheConfig, CompressionConfig, PrefetchConfig,
+    parse_eqp_output, push_planned_accesses,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
 
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+// Post-Phase-Anvil-g: build an S3 backend + wrap the VFS's SharedState with
+// baseline-subtraction counters (see tiered-bench for the same pattern).
+fn build_s3_backend(
+    runtime: &tokio::runtime::Handle,
+    prefix: &str,
+) -> Arc<hadb_storage_s3::S3Storage> {
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let storage = runtime.block_on(async {
+        hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref())
+            .await
+            .expect("build S3Storage")
+    });
+    Arc::new(storage.with_prefix(prefix.to_string()))
+}
+
+struct BenchCtx<'a> {
+    state: &'a TurboliteSharedState,
+    s3: Arc<hadb_storage_s3::S3Storage>,
+    fetch_count_base: AtomicU64,
+    bytes_fetched_base: AtomicU64,
+}
+
+impl<'a> BenchCtx<'a> {
+    fn new(state: &'a TurboliteSharedState, s3: Arc<hadb_storage_s3::S3Storage>) -> Self {
+        Self {
+            fetch_count_base: AtomicU64::new(s3.fetch_count()),
+            bytes_fetched_base: AtomicU64::new(s3.bytes_fetched()),
+            state,
+            s3,
+        }
+    }
+    fn clear_cache_data_only(&self) { self.state.clear_cache_data_only(); }
+    fn clear_cache_all(&self) { self.state.clear_cache_all(); }
+    fn reset_s3_counters(&self) {
+        self.fetch_count_base.store(self.s3.fetch_count(), Ordering::Relaxed);
+        self.bytes_fetched_base.store(self.s3.bytes_fetched(), Ordering::Relaxed);
+    }
+    fn s3_counters(&self) -> (u64, u64) {
+        let fc = self.s3.fetch_count().saturating_sub(self.fetch_count_base.load(Ordering::Relaxed));
+        let fb = self.s3.bytes_fetched().saturating_sub(self.bytes_fetched_base.load(Ordering::Relaxed));
+        (fc, fb)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tiered-tune")]
@@ -105,16 +152,24 @@ impl SchedulePair {
         Self { search: None, lookup: None }
     }
 
+    /// Push this pair's prefetch schedules onto the current connection's
+    /// turbolite handle via the per-handle settings queue restored in
+    /// Phase Cirrus c. The next slow-path read on the handle drains and
+    /// applies the update, so each pair in the sweep is measured with
+    /// its own schedule.
     fn push(&self) {
-        let zeros = "0,0,0,0,0,0,0,0,0,0".to_string();
-        let search_str = self.search.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or_else(|| zeros.clone());
-        let lookup_str = self.lookup.as_ref()
-            .map(|s| s.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
-            .unwrap_or(zeros);
-        push_setting("prefetch_search".to_string(), search_str);
-        push_setting("prefetch_lookup".to_string(), lookup_str);
+        let search_val = match &self.search {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        let lookup_val = match &self.lookup {
+            Some(v) => v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","),
+            None => "0,0,0".to_string(),
+        };
+        turbolite::tiered::settings::set("prefetch_search", &search_val)
+            .expect("settings::set prefetch_search");
+        turbolite::tiered::settings::set("prefetch_lookup", &lookup_val)
+            .expect("settings::set prefetch_lookup");
     }
 
     fn label(&self) -> String {
@@ -274,7 +329,7 @@ fn run_query_pair(
 fn bench_cold(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -332,7 +387,7 @@ fn bench_cold(
 fn bench_index_level(
     vfs_name: &str,
     db_name: &str,
-    handle: &TurboliteSharedState,
+    handle: &BenchCtx,
     sql: &str,
     params: &[rusqlite::types::Value],
     warmup: usize,
@@ -447,21 +502,32 @@ fn main() {
     let cache_dir = TempDir::new().expect("failed to create temp dir");
     let vfs_name = unique_vfs_name();
     let config = TurboliteConfig {
-        bucket: test_bucket(),
-        prefix: cli.prefix.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
-        compression_level: 1,
-        endpoint_url: endpoint_url(),
+        compression: CompressionConfig { level: 1, ..Default::default() },
         read_only: true,
-        region: std::env::var("AWS_REGION").ok(),
-        pages_per_group: cli.ppg,
-        prefetch_threads: cli.prefetch_threads,
-        query_plan_prefetch: cli.plan_aware,
+        cache: CacheConfig { pages_per_group: cli.ppg, ..Default::default() },
+        prefetch: PrefetchConfig {
+            threads: cli.prefetch_threads,
+            query_plan: cli.plan_aware,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
-    let vfs = TurboliteVfs::new(config).expect("failed to create VFS");
-    let handle = vfs.shared_state();
+    let owned_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build bench runtime");
+    let rt_handle = owned_runtime.handle().clone();
+    let s3 = build_s3_backend(&rt_handle, &cli.prefix);
+    let vfs = TurboliteVfs::with_backend(
+        config,
+        s3.clone() as Arc<dyn hadb_storage::StorageBackend>,
+        rt_handle.clone(),
+    ).expect("failed to create VFS");
+    let shared_state = vfs.shared_state();
+    let handle = BenchCtx::new(&shared_state, s3.clone());
     turbolite::tiered::register(&vfs_name, vfs).expect("failed to register VFS");
 
     let db_name = "tune.db";
@@ -537,18 +603,18 @@ fn main() {
         println!();
         println!("  Best: {} (p50 = {})", best_label, format_ms(best_p50));
 
-        // Print recommended SQL
+        // Print recommended TurboliteConfig values (set at construction time).
         let best = &pairs[best_pair_idx];
         if let Some(ref search) = best.search {
-            let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-            println!("  SELECT turbolite_config_set('prefetch_search', '{}');", s);
+            let s = search.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            println!("  TurboliteConfig.prefetch.search = vec![{}];", s);
         }
         if let Some(ref lookup) = best.lookup {
-            let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",");
-            println!("  SELECT turbolite_config_set('prefetch_lookup', '{}');", s);
+            let s = lookup.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+            println!("  TurboliteConfig.prefetch.lookup = vec![{}];", s);
         }
         if best.search.is_none() && best.lookup.is_none() {
-            println!("  -- No prefetch recommended (off/off was fastest)");
+            println!("  // No prefetch recommended (off/off was fastest)");
         }
         println!();
     }
