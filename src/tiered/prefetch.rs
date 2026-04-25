@@ -40,8 +40,12 @@ pub(crate) struct PrefetchJob {
 /// Fixed thread pool for background page group prefetching.
 pub(crate) struct PrefetchPool {
     job_tx: flume::Sender<PrefetchJob>,
+    /// Wake-up signal for `wait_idle`. Worker may drop sends when full —
+    /// `in_flight` is the source of truth, the channel is just a doorbell.
     done_rx: flume::Receiver<u64>,
-    in_flight: AtomicU64,
+    /// Outstanding jobs: incremented by `submit`, decremented by the worker
+    /// at the end of each job (on every code path). `wait_idle` polls this.
+    in_flight: Arc<AtomicU64>,
     workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Set to true when the pool is shutting down; suppresses noisy
     /// fetch/decode/write error logs during teardown.
@@ -61,7 +65,13 @@ impl PrefetchPool {
         shared_manifest: Arc<ArcSwap<Manifest>>,
     ) -> Self {
         let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
-        let (done_tx, done_rx) = flume::unbounded::<u64>();
+        // Bounded so the completion signal can't grow without limit if no one
+        // is calling `wait_idle`. Sized to comfortably absorb a wake-up backlog
+        // (`num_workers * 4`); workers `try_send` and drop on full because
+        // `in_flight` (atomic) is the authoritative outstanding-job count.
+        let (done_tx, done_rx) =
+            flume::bounded::<u64>(num_workers as usize * 4);
+        let in_flight = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(num_workers as usize);
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -82,22 +92,32 @@ impl PrefetchPool {
             let encryption_key = Arc::clone(&encryption_key);
             let shared_manifest = Arc::clone(&shared_manifest);
             let shutdown = Arc::clone(&shutdown);
+            let in_flight = Arc::clone(&in_flight);
 
             workers.push(std::thread::spawn(move || {
+                // Mark a job as finished: drop the in-flight counter (so
+                // wait_idle can observe completion) and best-effort wake any
+                // waiter via the bounded done channel. Dropped wake-ups are
+                // fine — the next call to wait_idle reads the atomic directly.
+                let finish = |gid: u64| {
+                    in_flight.fetch_sub(1, Ordering::Release);
+                    let _ = done_tx.try_send(gid);
+                };
+
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
 
                     let current = cache.group_state(gid);
                     if current == GroupState::None {
                         if !cache.try_claim_group(gid) {
-                            let _ = done_tx.send(gid);
+                            finish(gid);
                             continue;
                         }
                     } else if current != GroupState::Fetching {
                         if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
-                        let _ = done_tx.send(gid);
+                        finish(gid);
                         continue;
                     }
 
@@ -111,7 +131,7 @@ impl PrefetchPool {
                                 eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
                             }
                             cache.unclaim_group(gid);
-                            let _ = done_tx.send(gid);
+                            finish(gid);
                             continue;
                         }
                     };
@@ -119,7 +139,7 @@ impl PrefetchPool {
 
                     let Some(pg_data) = pg_data else {
                         cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        finish(gid);
                         continue;
                     };
 
@@ -157,7 +177,7 @@ impl PrefetchPool {
                                 eprintln!("[prefetch] gid={} decode error: {}", gid, e);
                             }
                             cache.unclaim_group(gid);
-                            let _ = done_tx.send(gid);
+                            finish(gid);
                             continue;
                         }
                     };
@@ -170,7 +190,7 @@ impl PrefetchPool {
                             gid, job.manifest_version, current_version,
                         );
                         cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        finish(gid);
                         continue;
                     }
 
@@ -196,7 +216,7 @@ impl PrefetchPool {
                             eprintln!("[prefetch] gid={} write error: {}", gid, e);
                         }
                         cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        finish(gid);
                         continue;
                     }
                     let write_ms = write_start.elapsed().as_millis();
@@ -278,7 +298,7 @@ impl PrefetchPool {
                             worker_start.elapsed().as_millis(),
                         );
                     }
-                    let _ = done_tx.send(gid);
+                    finish(gid);
                 }
             }));
         }
@@ -286,7 +306,7 @@ impl PrefetchPool {
         Self {
             job_tx,
             done_rx,
-            in_flight: AtomicU64::new(0),
+            in_flight,
             workers: parking_lot::Mutex::new(workers),
             shutdown,
         }
@@ -324,17 +344,26 @@ impl PrefetchPool {
     }
 
     /// Wait until all in-flight prefetch jobs complete.
+    ///
+    /// Workers decrement `in_flight` when they finish a job, so the atomic
+    /// is the source of truth. The done channel is best-effort wake-up: if
+    /// a wake-up was dropped because the channel was full, we still make
+    /// progress via the short timeout.
     pub(crate) fn wait_idle(&self) {
         loop {
             let remaining = self.in_flight.load(Ordering::Acquire);
             if remaining == 0 {
                 break;
             }
-            match self.done_rx.recv() {
-                Ok(_gid) => {
-                    self.in_flight.fetch_sub(1, Ordering::Release);
-                }
-                Err(_) => break,
+            // Sleep until a worker rings the bell, or 50ms — whichever first.
+            // Either way we re-check in_flight on the next iteration.
+            match self
+                .done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(_gid) => {}
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -344,7 +373,7 @@ impl Drop for PrefetchPool {
     fn drop(&mut self) {
         // Signal shutdown so workers suppress spurious fetch/decode/write
         // error logs while the runtime/storage is torn down.
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
         // Drain all in-flight work before shutting down the channel.
         self.wait_idle();
 
