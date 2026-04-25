@@ -1161,6 +1161,18 @@ impl Vfs for TurboliteVfs {
     }
 }
 
+impl Drop for TurboliteVfs {
+    fn drop(&mut self) {
+        // Drop prefetch pool first so worker threads join before the
+        // tokio runtime is shut down. Then pause briefly to let reqwest's
+        // background connection-pool tasks finish gracefully. Without the
+        // sleep, aborted in-flight connections log noisy hyper
+        // IncompleteMessage errors during teardown (harmless but distracting).
+        self.prefetch_pool = None;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 #[cfg(test)]
 #[path = "test_local_vfs.rs"]
 mod local_vfs_tests;

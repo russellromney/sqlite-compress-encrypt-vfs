@@ -192,7 +192,7 @@ impl PrefetchPool {
                         Ok(())
                     };
                     if let Err(e) = write_result {
-                        if !shutdown.load(Ordering::Relaxed) {
+                        if !shutdown.load(Ordering::Acquire) {
                             eprintln!("[prefetch] gid={} write error: {}", gid, e);
                         }
                         cache.unclaim_group(gid);
@@ -234,7 +234,7 @@ impl PrefetchPool {
                                     continue;
                                 }
                                 Err(e) => {
-                                    if !shutdown.load(Ordering::Relaxed) {
+                                    if !shutdown.load(Ordering::Acquire) {
                                         eprintln!(
                                             "[prefetch] gid={} override frame {} fetch error: {}",
                                             gid, frame_idx, e,
