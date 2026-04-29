@@ -5,9 +5,9 @@
 //! manifest during import. Tests use import_sqlite_file to bootstrap data in seekable format,
 //! then LocalThenFlush + flush_to_s3 to exercise the override path.
 
-use turbolite::tiered::{import_sqlite_file, ManifestSource, TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{import_sqlite_file, ManifestSource, TurboliteConfig, TurboliteVfs};
 
 // ===== Helpers =====
 
@@ -68,8 +68,7 @@ fn open_vfs_conn(vfs_name: &str, db_name: &str) -> rusqlite::Connection {
     let db_path = format!("file:{}.db?vfs={}", db_name, vfs_name);
     let conn = rusqlite::Connection::open_with_flags(
         &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .expect("open VFS connection");
     conn.execute_batch("PRAGMA journal_mode=WAL;").expect("WAL");
@@ -81,8 +80,7 @@ fn open_cold_conn(vfs_name: &str, db_name: &str) -> rusqlite::Connection {
     let db_path = format!("file:{}.db?vfs={}", db_name, vfs_name);
     rusqlite::Connection::open_with_flags(
         &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .expect("open cold VFS connection")
 }
@@ -148,11 +146,8 @@ fn drift_sanity_import_write_cold_read() {
     assert_eq!(count, 20, "should see 20 imported rows");
 
     // Add a new row, checkpoint (Durable mode uploads directly)
-    conn.execute(
-        "INSERT INTO data VALUES (999, 'new_row')",
-        [],
-    )
-    .expect("insert new row");
+    conn.execute("INSERT INTO data VALUES (999, 'new_row')", [])
+        .expect("insert new row");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("checkpoint");
 
@@ -168,7 +163,10 @@ fn drift_sanity_import_write_cold_read() {
     let cold_count: i64 = cold_conn
         .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
         .expect("cold count");
-    assert_eq!(cold_count, 21, "cold reader should see 21 rows (20 imported + 1 new)");
+    assert_eq!(
+        cold_count, 21,
+        "cold reader should see 21 rows (20 imported + 1 new)"
+    );
 
     let new_val: String = cold_conn
         .query_row("SELECT value FROM data WHERE id = 999", [], |r| r.get(0))
@@ -234,7 +232,10 @@ fn drift_override_write_and_cold_read() {
     let local_v5: String = conn
         .query_row("SELECT value FROM data WHERE id = 5", [], |r| r.get(0))
         .expect("local read id=5");
-    assert_eq!(local_v5, "updated_5", "writer should see its own update locally");
+    assert_eq!(
+        local_v5, "updated_5",
+        "writer should see its own update locally"
+    );
 
     // Step 3: cold read from S3 with empty cache
     let cold_dir = TempDir::new().expect("cold dir");
@@ -265,12 +266,20 @@ fn drift_override_write_and_cold_read() {
     let v0: String = cold_conn
         .query_row("SELECT value FROM data WHERE id = 0", [], |r| r.get(0))
         .expect("read id=0");
-    assert_eq!(v0, padded_value("base", 0), "non-updated row should retain base value");
+    assert_eq!(
+        v0,
+        padded_value("base", 0),
+        "non-updated row should retain base value"
+    );
 
     let v199: String = cold_conn
         .query_row("SELECT value FROM data WHERE id = 199", [], |r| r.get(0))
         .expect("read id=199");
-    assert_eq!(v199, padded_value("base", 199), "non-updated row should retain base value");
+    assert_eq!(
+        v199,
+        padded_value("base", 199),
+        "non-updated row should retain base value"
+    );
 
     // Total row count must be unchanged
     let count: i64 = cold_conn
@@ -322,7 +331,9 @@ fn drift_override_compaction_and_cold_read() {
         .expect("round 3 update");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("round 3 checkpoint");
-    shared.flush_to_s3().expect("round 3 flush (should trigger compaction)");
+    shared
+        .flush_to_s3()
+        .expect("round 3 flush (should trigger compaction)");
 
     // Round 4: one more update to verify post-compaction overrides work
     conn.execute("UPDATE data SET value = 'r4_40' WHERE id = 40", [])
@@ -557,7 +568,10 @@ fn drift_override_with_encryption() {
     let v42: String = cold_conn
         .query_row("SELECT value FROM data WHERE id = 42", [], |r| r.get(0))
         .expect("read id=42");
-    assert_eq!(v42, "enc_updated_42", "encrypted override should be readable");
+    assert_eq!(
+        v42, "enc_updated_42",
+        "encrypted override should be readable"
+    );
 
     // Non-updated rows should have padded base values
     let v0: String = cold_conn
@@ -590,15 +604,11 @@ fn drift_override_with_encryption() {
     let bad_db = format!("file:drift_enc.db?vfs={}", bad_vfs_name);
     let bad_result = rusqlite::Connection::open_with_flags(
         &bad_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     );
     if let Ok(bad_conn) = bad_result {
-        let query_result: Result<String, _> = bad_conn.query_row(
-            "SELECT value FROM data WHERE id = 0",
-            [],
-            |r| r.get(0),
-        );
+        let query_result: Result<String, _> =
+            bad_conn.query_row("SELECT value FROM data WHERE id = 0", [], |r| r.get(0));
         assert!(
             query_result.is_err(),
             "wrong encryption key must not return data from encrypted overrides"

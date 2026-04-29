@@ -11,26 +11,26 @@
 
 #[cfg(feature = "s3")]
 mod tiered {
-    pub mod helpers;
+    mod advanced;
     mod basic;
+    mod borodino;
     mod btree_grouping;
     mod compact;
+    mod concurrent_eviction;
+    mod crash_flush;
     mod data_ops;
-    mod indexes;
-    mod gc;
-    mod snapshot_gc;
+    mod drift;
     #[cfg(feature = "encryption")]
     mod encryption;
-    mod advanced;
     mod eviction;
+    mod gc;
+    pub mod helpers;
+    mod indexes;
     mod manifest_persistence;
     mod materialize;
+    mod oracle_s3;
+    mod snapshot_gc;
     mod staging;
-    mod borodino;
     #[cfg(feature = "wal")]
     mod wal_integration;
-    mod drift;
-    mod oracle_s3;
-    mod crash_flush;
-    mod concurrent_eviction;
 }

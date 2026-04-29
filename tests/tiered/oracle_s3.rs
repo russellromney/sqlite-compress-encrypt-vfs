@@ -67,11 +67,7 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     let writer_dir = TempDir::new().expect("tempdir");
     let reader_dir = TempDir::new().expect("tempdir");
 
-    let config = test_config_mode(
-        &format!("oracle_{}", mode.name()),
-        writer_dir.path(),
-        mode,
-    );
+    let config = test_config_mode(&format!("oracle_{}", mode.name()), writer_dir.path(), mode);
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
@@ -81,10 +77,7 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let v = open_vanilla(&vanilla_dir.path().join("vanilla.db"));
-    let t = open_turbolite(
-        &format!("oracle_{}_test.db", mode.name()),
-        &vfs_name,
-    );
+    let t = open_turbolite(&format!("oracle_{}_test.db", mode.name()), &vfs_name);
 
     v.execute_batch("PRAGMA page_size=65536; PRAGMA journal_mode=WAL;")
         .expect("pragma vanilla");
@@ -145,7 +138,12 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     // Compare hot read
     let v_users = snapshot_table(&v, "users", "id, name, score");
     let t_users = snapshot_table(&t, "users", "id, name, score");
-    assert_eq!(v_users, t_users, "[{}] users diverged (hot read)", mode.name());
+    assert_eq!(
+        v_users,
+        t_users,
+        "[{}] users diverged (hot read)",
+        mode.name()
+    );
 
     let v_logs = snapshot_table(&v, "logs", "id, hex(data)");
     let t_logs = snapshot_table(&t, "logs", "id, hex(data)");
@@ -155,9 +153,8 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
     if !skip_cold_read {
         drop(t);
 
-        let cold_config = cold_reader_config_mode(
-            &bucket, &prefix, &endpoint, reader_dir.path(), mode,
-        );
+        let cold_config =
+            cold_reader_config_mode(&bucket, &prefix, &endpoint, reader_dir.path(), mode);
         let cold_vfs_name = unique_vfs_name(&format!("oracle_{}_cold", mode.name()));
         let cold_vfs = TurboliteVfs::new_local(cold_config).expect("cold vfs");
         turbolite::tiered::register(&cold_vfs_name, cold_vfs).expect("register cold");
@@ -171,14 +168,16 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
 
         let cold_users = snapshot_table(&cold, "users", "id, name, score");
         assert_eq!(
-            v_users, cold_users,
+            v_users,
+            cold_users,
             "[{}] users diverged after cold read",
             mode.name()
         );
 
         let cold_logs = snapshot_table(&cold, "logs", "id, hex(data)");
         assert_eq!(
-            v_logs, cold_logs,
+            v_logs,
+            cold_logs,
             "[{}] logs diverged after cold read",
             mode.name()
         );
@@ -187,7 +186,8 @@ fn run_oracle_write_checkpoint_cold_read(mode: TestMode) {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .expect("integrity");
         assert_eq!(
-            integrity, "ok",
+            integrity,
+            "ok",
             "[{}] cold read integrity check failed",
             mode.name()
         );
@@ -210,10 +210,7 @@ fn run_oracle_incremental(mode: TestMode) {
     turbolite::tiered::register(&vfs_name, vfs).expect("register");
 
     let v = open_vanilla(&vanilla_dir.path().join("vanilla.db"));
-    let t = open_turbolite(
-        &format!("oracle_incr_{}.db", mode.name()),
-        &vfs_name,
-    );
+    let t = open_turbolite(&format!("oracle_incr_{}.db", mode.name()), &vfs_name);
 
     v.execute_batch("PRAGMA page_size=65536; PRAGMA journal_mode=WAL;")
         .expect("pragma");
@@ -233,7 +230,8 @@ fn run_oracle_incremental(mode: TestMode) {
         t.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val])
             .expect("insert t");
     }
-    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp1");
+    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp1");
 
     let v1 = snapshot_table(&v, "kv", "key, value");
     let t1 = snapshot_table(&t, "kv", "key, value");
@@ -243,21 +241,34 @@ fn run_oracle_incremental(mode: TestMode) {
     for i in 0..50 {
         let k = format!("key_{}", i);
         let val = format!("updated_{}", i);
-        v.execute("UPDATE kv SET value = ?2 WHERE key = ?1", rusqlite::params![k, val]).expect("upd v");
-        t.execute("UPDATE kv SET value = ?2 WHERE key = ?1", rusqlite::params![k, val]).expect("upd t");
+        v.execute(
+            "UPDATE kv SET value = ?2 WHERE key = ?1",
+            rusqlite::params![k, val],
+        )
+        .expect("upd v");
+        t.execute(
+            "UPDATE kv SET value = ?2 WHERE key = ?1",
+            rusqlite::params![k, val],
+        )
+        .expect("upd t");
     }
     for i in 50..75 {
         let k = format!("key_{}", i);
-        v.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![k]).expect("del v");
-        t.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![k]).expect("del t");
+        v.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![k])
+            .expect("del v");
+        t.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![k])
+            .expect("del t");
     }
     for i in 100..150 {
         let k = format!("key_{}", i);
         let val = format!("new_{}", i);
-        v.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val]).expect("ins v");
-        t.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val]).expect("ins t");
+        v.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val])
+            .expect("ins v");
+        t.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val])
+            .expect("ins t");
     }
-    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp2");
+    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp2");
 
     let v2 = snapshot_table(&v, "kv", "key, value");
     let t2 = snapshot_table(&t, "kv", "key, value");
@@ -266,15 +277,19 @@ fn run_oracle_incremental(mode: TestMode) {
     // Batch 3: vacuum + more writes
     v.execute_batch("VACUUM").expect("vacuum v");
     t.execute_batch("VACUUM").expect("vacuum t");
-    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp3");
+    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp3");
 
     for i in 150..200 {
         let k = format!("key_{}", i);
         let val = format!("post_vacuum_{}", i);
-        v.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val]).expect("ins v");
-        t.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val]).expect("ins t");
+        v.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val])
+            .expect("ins v");
+        t.execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, val])
+            .expect("ins t");
     }
-    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp4");
+    t.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp4");
 
     let vf = snapshot_table(&v, "kv", "key, value");
     let tf = snapshot_table(&t, "kv", "key, value");

@@ -1,8 +1,8 @@
 //! Index bundle and index integrity tests.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_index_bundles_checkpoint_and_cold_read() {
@@ -19,8 +19,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "ixb_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -40,18 +39,15 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         for i in 0..500 {
             tx.execute(
                 "INSERT INTO items VALUES (?1, ?2, ?3)",
-                rusqlite::params![
-                    i,
-                    format!("item_{:04}", i),
-                    format!("cat_{}", i % 20),
-                ],
+                rusqlite::params![i, format!("item_{:04}", i), format!("cat_{}", i % 20),],
             )
             .unwrap();
         }
         tx.commit().unwrap();
     }
 
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     drop(conn);
 
     // Verify manifest has index_chunk_keys
@@ -95,7 +91,8 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         read_only: true,
         region: region.clone(),
         eager_index_load: true,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_cold");
     let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
@@ -111,12 +108,20 @@ fn test_index_bundles_checkpoint_and_cold_read() {
 
     // Query using the index -- should work on cold cache
     let count: i64 = cold_conn
-        .query_row("SELECT COUNT(*) FROM items WHERE name = 'item_0123'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE name = 'item_0123'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(count, 1, "indexed query should find the row");
 
     let cat_count: i64 = cold_conn
-        .query_row("SELECT COUNT(*) FROM items WHERE category = 'cat_5'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE category = 'cat_5'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(cat_count, 25, "category index query should find 25 rows");
 
@@ -131,7 +136,8 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -152,8 +158,7 @@ fn test_index_bundles_eager_load_disabled() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "ixb_ne.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -177,7 +182,8 @@ fn test_index_bundles_eager_load_disabled() {
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     drop(conn);
 
     // Open cold reader with eager_index_load=false
@@ -191,7 +197,8 @@ fn test_index_bundles_eager_load_disabled() {
         read_only: true,
         region: region.clone(),
         eager_index_load: false,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let cold_vfs_name = unique_vfs_name("ixb_ne_cold");
     let cold_vfs = TurboliteVfs::new_local(cold_config).unwrap();
@@ -206,7 +213,11 @@ fn test_index_bundles_eager_load_disabled() {
 
     // Index query should still work (fetched on demand from data page groups)
     let count: i64 = cold_conn
-        .query_row("SELECT COUNT(*) FROM products WHERE sku = 'SKU-00050'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM products WHERE sku = 'SKU-00050'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(count, 1);
 
@@ -219,7 +230,8 @@ fn test_index_bundles_eager_load_disabled() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -241,8 +253,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "warm_profile.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -286,7 +297,10 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
                     format!("Last_{}", i),
                     format!("School_{}", i % 20),
                     format!("City_{}", i % 50),
-                    format!("Bio for user {} with some padding text to make pages bigger", i),
+                    format!(
+                        "Bio for user {} with some padding text to make pages bigger",
+                        i
+                    ),
                 ],
             )
             .unwrap();
@@ -297,7 +311,10 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
                 rusqlite::params![
                     i,
                     i % 200, // user_id
-                    format!("Post content {} with some text to take up space in the page", i),
+                    format!(
+                        "Post content {} with some text to take up space in the page",
+                        i
+                    ),
                     format!("2024-01-{:02}T12:00:00Z", (i % 28) + 1),
                     i % 100,
                 ],
@@ -308,7 +325,8 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
     }
 
     // Checkpoint to S3
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     drop(conn);
 
     // -- Phase 2: Fresh reader VFS (simulates benchmark reader) --
@@ -322,7 +340,8 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         read_only: true,
         region: region.clone(),
         eager_index_load: true,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("warm_prof_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -377,19 +396,22 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
     // -- Phase 5: Run additional queries to stress test --
     // who-liked pattern (different index path)
     let user_count: i64 = warm_conn
-        .query_row("SELECT COUNT(*) FROM users WHERE id < 100", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM users WHERE id < 100", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(user_count, 100);
 
     // Verify all index paths work
     let post_by_user: i64 = warm_conn
-        .query_row(
-            "SELECT COUNT(*) FROM posts WHERE user_id = 42",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM posts WHERE user_id = 42", [], |r| {
+            r.get(0)
+        })
         .unwrap();
-    assert_eq!(post_by_user, 10, "index scan on idx_posts_user should find 10 posts");
+    assert_eq!(
+        post_by_user, 10,
+        "index scan on idx_posts_user should find 10 posts"
+    );
 
     drop(warm_conn);
 
@@ -401,7 +423,8 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         compression_level: 3,
         endpoint_url: endpoint,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
     cleanup_vfs.destroy_s3().unwrap();
@@ -430,7 +453,8 @@ fn test_small_ppg_index_integrity() {
         endpoint_url: endpoint.clone(),
         region: region.clone(),
         pages_per_group: 8,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
 
     let vfs_name = unique_vfs_name("small_ppg_write");
@@ -481,7 +505,8 @@ fn test_small_ppg_index_integrity() {
         read_only: true,
         region: region.clone(),
         pages_per_group: 8,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
 
     let reader_vfs_name = unique_vfs_name("small_ppg_reader");
@@ -539,7 +564,8 @@ fn test_small_ppg_index_integrity() {
             endpoint_url: endpoint,
             region,
             pages_per_group: 8,
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();

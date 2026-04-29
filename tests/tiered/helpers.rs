@@ -1,8 +1,8 @@
 //! Shared helpers for tiered integration tests.
 
-use turbolite::tiered::{Manifest, TurboliteConfig};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use turbolite::tiered::{Manifest, TurboliteConfig};
 
 /// Shared tokio runtime for all integration tests.
 /// Prevents 100+ runtime creation when tests run in parallel.
@@ -43,8 +43,7 @@ pub fn test_bucket() -> String {
 
 /// Get S3 endpoint URL (default: Tigris).
 pub fn endpoint_url() -> String {
-    std::env::var("AWS_ENDPOINT_URL")
-        .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
+    std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
 /// Storage tier: local-only (no S3) or S3-backed.
@@ -69,20 +68,26 @@ pub struct TestMode {
 
 /// Deterministic test encryption key (NOT for production).
 const TEST_ENCRYPTION_KEY: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
 impl TestMode {
     /// All 12 combinations.
     pub fn all() -> Vec<TestMode> {
         let mut modes = Vec::new();
-        for &storage in &[StorageTier::Local, StorageTier::S3Durable, StorageTier::S3LocalThenFlush] {
+        for &storage in &[
+            StorageTier::Local,
+            StorageTier::S3Durable,
+            StorageTier::S3LocalThenFlush,
+        ] {
             for &compressed in &[false, true] {
                 for &encrypted in &[false, true] {
-                    modes.push(TestMode { storage, compressed, encrypted });
+                    modes.push(TestMode {
+                        storage,
+                        compressed,
+                        encrypted,
+                    });
                 }
             }
         }
@@ -91,12 +96,18 @@ impl TestMode {
 
     /// S3 modes only (Durable + LTF). For tests that need S3.
     pub fn s3_modes() -> Vec<TestMode> {
-        Self::all().into_iter().filter(|m| m.storage != StorageTier::Local).collect()
+        Self::all()
+            .into_iter()
+            .filter(|m| m.storage != StorageTier::Local)
+            .collect()
     }
 
     /// S3 Durable modes only. For tests that need cold-read from S3.
     pub fn s3_durable_modes() -> Vec<TestMode> {
-        Self::all().into_iter().filter(|m| m.storage == StorageTier::S3Durable).collect()
+        Self::all()
+            .into_iter()
+            .filter(|m| m.storage == StorageTier::S3Durable)
+            .collect()
     }
 
     /// Short name for test output and unique prefixes.
@@ -161,7 +172,11 @@ pub fn run_across_all_s3(f: impl Fn(TestMode)) {
 }
 
 /// Create a TurboliteConfig for a specific test mode with a unique prefix.
-pub fn test_config_mode(prefix: &str, cache_dir: &std::path::Path, mode: TestMode) -> TurboliteConfig {
+pub fn test_config_mode(
+    prefix: &str,
+    cache_dir: &std::path::Path,
+    mode: TestMode,
+) -> TurboliteConfig {
     let mut config = test_config(prefix, cache_dir);
     mode.apply(&mut config);
     config
@@ -169,8 +184,11 @@ pub fn test_config_mode(prefix: &str, cache_dir: &std::path::Path, mode: TestMod
 
 /// Create a cold reader config that inherits encryption from the writer mode.
 pub fn cold_reader_config_mode(
-    bucket: &str, prefix: &str, endpoint: &Option<String>,
-    cache_dir: &std::path::Path, mode: TestMode,
+    bucket: &str,
+    prefix: &str,
+    endpoint: &Option<String>,
+    cache_dir: &std::path::Path,
+    mode: TestMode,
 ) -> TurboliteConfig {
     let mut config = cold_reader_config(bucket, prefix, endpoint, cache_dir);
     mode.apply(&mut config);
@@ -203,7 +221,12 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig
 
 /// Create a read-only TurboliteConfig for cold reader tests.
 /// Uses the shared runtime to prevent tokio contention.
-pub fn cold_reader_config(bucket: &str, prefix: &str, endpoint: &Option<String>, cache_dir: &std::path::Path) -> TurboliteConfig {
+pub fn cold_reader_config(
+    bucket: &str,
+    prefix: &str,
+    endpoint: &Option<String>,
+    cache_dir: &std::path::Path,
+) -> TurboliteConfig {
     TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
@@ -245,12 +268,7 @@ pub fn verify_s3_manifest(
             .await
             .expect("manifest should exist in S3 after checkpoint");
 
-        resp.body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes()
-            .to_vec()
+        resp.body.collect().await.unwrap().into_bytes().to_vec()
     });
 
     let manifest: serde_json::Value = manifest_from_msgpack(&manifest_data);
@@ -259,16 +277,18 @@ pub fn verify_s3_manifest(
     let page_size = manifest["page_size"].as_u64().unwrap();
     let pages_per_group = manifest["pages_per_group"].as_u64().unwrap_or(2048);
 
-    assert!(version >= 1, "manifest version should be >= 1, got {}", version);
+    assert!(
+        version >= 1,
+        "manifest version should be >= 1, got {}",
+        version
+    );
     assert!(
         page_count >= expected_page_count_min,
         "manifest page_count should be >= {}, got {}",
-        expected_page_count_min, page_count
+        expected_page_count_min,
+        page_count
     );
-    assert_eq!(
-        page_size, expected_page_size,
-        "manifest page_size mismatch"
-    );
+    assert_eq!(page_size, expected_page_size, "manifest page_size mismatch");
     assert!(
         pages_per_group > 0,
         "manifest pages_per_group should be > 0, got {}",
@@ -277,11 +297,7 @@ pub fn verify_s3_manifest(
 }
 
 /// Verify that S3 has page group objects under the prefix.
-pub fn verify_s3_has_page_groups(
-    bucket: &str,
-    prefix: &str,
-    endpoint: &Option<String>,
-) -> usize {
+pub fn verify_s3_has_page_groups(bucket: &str, prefix: &str, endpoint: &Option<String>) -> usize {
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
@@ -325,10 +341,7 @@ pub fn count_s3_objects(bucket: &str, prefix: &str, endpoint: &Option<String>) -
         let mut count = 0;
         let mut token: Option<String> = None;
         loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(prefix);
+            let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
             if let Some(t) = &token {
                 req = req.continuation_token(t);
             }

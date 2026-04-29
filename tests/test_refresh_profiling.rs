@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// Simple test to verify refresh profiling works
 /// Creates data, then opens new connections that must scan the file
@@ -21,15 +21,22 @@ fn test_refresh_profiling_simple() {
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_refresh_prof",
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", [])
+            .unwrap();
 
         for i in 0..1000 {
-            conn.execute("INSERT INTO test (data) VALUES (?)", (format!("data_{}", i),)).unwrap();
+            conn.execute(
+                "INSERT INTO test (data) VALUES (?)",
+                (format!("data_{}", i),),
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Initial data created: 1000 rows");
     }
 
@@ -39,10 +46,13 @@ fn test_refresh_profiling_simple() {
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             "test_refresh_prof",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Read a page to trigger refresh
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))
+            .unwrap();
         println!("Connection {} read count: {}", conn_id, count);
 
         // Connection drops here, should print profiling summary

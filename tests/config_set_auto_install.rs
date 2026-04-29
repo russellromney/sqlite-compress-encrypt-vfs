@@ -72,8 +72,7 @@ fn turbolite_connect_returns_connection_with_config_set_bound() {
     assert_eq!(rc, 0);
 
     // Settable value lands on THIS connection's queue.
-    let peeked = settings::peek_top_for_key("prefetch_search")
-        .expect("queue has pending update");
+    let peeked = settings::peek_top_for_key("prefetch_search").expect("queue has pending update");
     assert_eq!(peeked, "0.2,0.8");
 }
 
@@ -102,8 +101,8 @@ fn auto_install_hook_registers_turbolite_config_set_without_explicit_call() {
         .expect("turbolite_config_set should exist via auto-extension");
     assert_eq!(rc, 0, "expected 0 from turbolite_config_set");
 
-    let peeked = settings::peek_top_for_key("prefetch_search")
-        .expect("queue should have pending update");
+    let peeked =
+        settings::peek_top_for_key("prefetch_search").expect("queue should have pending update");
     assert_eq!(peeked, "0.4,0.6");
 }
 

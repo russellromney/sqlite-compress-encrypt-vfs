@@ -32,12 +32,8 @@ fn open_db(db_path: &Path, vfs_name: &str) -> Connection {
 }
 
 fn open_db_readonly(db_path: &Path, vfs_name: &str) -> Connection {
-    Connection::open_with_flags_and_vfs(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-        vfs_name,
-    )
-    .expect("open db readonly")
+    Connection::open_with_flags_and_vfs(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY, vfs_name)
+        .expect("open db readonly")
 }
 
 /// Spawn a child process that runs the same test binary with child mode env vars.
@@ -97,8 +93,10 @@ fn child_writer(dir: &Path) {
 
     let db_path = dir.join("test.db");
     let conn = open_db(&db_path, &vfs_name);
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")
-        .expect("writer pragmas");
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+    )
+    .expect("writer pragmas");
 
     for i in 0..50 {
         conn.execute(
@@ -121,11 +119,9 @@ fn child_point_reader(dir: &Path) {
     for i in 0..100 {
         let rowid = (i % 1000) + 1;
         let data: String = conn
-            .query_row(
-                "SELECT data FROM test WHERE id = ?",
-                [rowid],
-                |row| row.get(0),
-            )
+            .query_row("SELECT data FROM test WHERE id = ?", [rowid], |row| {
+                row.get(0)
+            })
             .unwrap_or_else(|e| panic!("point_reader: row {} failed: {}", rowid, e));
         assert!(
             data.starts_with("row_"),
@@ -147,16 +143,16 @@ fn child_verify_reader(dir: &Path) {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))
         .expect("verify_reader: COUNT(*)");
-    assert_eq!(count, 200, "verify_reader: expected 200 rows, got {}", count);
+    assert_eq!(
+        count, 200,
+        "verify_reader: expected 200 rows, got {}",
+        count
+    );
 
     // Spot-check a few rows.
     for id in [1, 50, 100, 150, 200] {
         let data: String = conn
-            .query_row(
-                "SELECT data FROM test WHERE id = ?",
-                [id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT data FROM test WHERE id = ?", [id], |row| row.get(0))
             .unwrap_or_else(|e| panic!("verify_reader: id {} failed: {}", id, e));
         assert!(!data.is_empty(), "verify_reader: empty data for id {}", id);
     }
@@ -203,10 +199,8 @@ fn test_multiprocess_reader_writer() {
     // Create DB and insert 100 rows.
     {
         let conn = open_db(&db_path, &vfs_name);
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )
-        .expect("pragmas");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .expect("pragmas");
         conn.execute(
             "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
             [],
@@ -265,10 +259,8 @@ fn test_multiprocess_two_readers() {
 
     {
         let conn = open_db(&db_path, &vfs_name);
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )
-        .expect("pragmas");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .expect("pragmas");
         conn.execute(
             "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
             [],
@@ -317,10 +309,8 @@ fn test_multiprocess_write_then_read() {
 
     {
         let conn = open_db(&db_path, &vfs_name);
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-        )
-        .expect("pragmas");
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .expect("pragmas");
         conn.execute(
             "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
             [],

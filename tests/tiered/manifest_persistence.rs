@@ -2,9 +2,9 @@
 //! Tests that manifest is persisted locally, survives reconnection,
 //! and dirty groups are recovered after simulated crash.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// After checkpoint, a local manifest.msgpack should exist in cache_dir.
 #[test]
@@ -21,22 +21,27 @@ fn test_local_manifest_persisted_on_checkpoint() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "manifest_persist.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA page_size=4096;
          PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);
          INSERT INTO data VALUES (1, 'hello');",
-    ).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Verify local manifest exists
     let manifest_path = cache_dir.path().join("manifest.msgpack");
-    assert!(manifest_path.exists(), "local manifest should exist after checkpoint");
+    assert!(
+        manifest_path.exists(),
+        "local manifest should exist after checkpoint"
+    );
 
     // Verify it's valid msgpack
     let bytes = std::fs::read(&manifest_path).unwrap();
@@ -44,12 +49,18 @@ fn test_local_manifest_persisted_on_checkpoint() {
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 /// Second connection open with Auto manifest source should NOT hit S3.
@@ -70,17 +81,19 @@ fn test_warm_reconnect_skips_s3() {
     {
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "warm_reconnect.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch(
             "PRAGMA page_size=4096;
              PRAGMA journal_mode=WAL;
              CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);
              INSERT INTO data VALUES (1, 'hello');",
-        ).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Record S3 GET count
@@ -92,8 +105,11 @@ fn test_warm_reconnect_skips_s3() {
             "warm_reconnect.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
             &vfs_name,
-        ).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -106,12 +122,18 @@ fn test_warm_reconnect_skips_s3() {
 
     drop(state);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 /// LocalThenFlush dirty groups survive in local manifest and are recovered.
@@ -134,29 +156,37 @@ fn test_dirty_groups_recovered_from_local_manifest() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "dirty_recovery.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).unwrap();
+        )
+        .unwrap();
 
         turbolite::tiered::set_local_checkpoint_only(true);
         conn.execute_batch(
             "PRAGMA page_size=4096;
              PRAGMA journal_mode=WAL;
              CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);",
-        ).unwrap();
+        )
+        .unwrap();
         {
             let tx = conn.unchecked_transaction().unwrap();
             for i in 0..100 {
-                tx.execute("INSERT INTO data VALUES (?1, ?2)",
-                    rusqlite::params![i, format!("val_{}", i)]).unwrap();
+                tx.execute(
+                    "INSERT INTO data VALUES (?1, ?2)",
+                    rusqlite::params![i, format!("val_{}", i)],
+                )
+                .unwrap();
             }
             tx.commit().unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         turbolite::tiered::set_local_checkpoint_only(false);
 
-        assert!(state.has_pending_flush(), "should have pending dirty groups");
+        assert!(
+            state.has_pending_flush(),
+            "should have pending dirty groups"
+        );
 
         // Verify local manifest has dirty_groups
         let manifest_path = cache_dir.path().join("manifest.msgpack");
@@ -180,28 +210,46 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         "dirty_recovery.db",
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         &vfs_name2,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Dirty groups should have been recovered
-    assert!(state2.has_pending_flush(), "dirty groups should be recovered from local manifest");
+    assert!(
+        state2.has_pending_flush(),
+        "dirty groups should be recovered from local manifest"
+    );
 
     // Flush to S3 - should upload the recovered dirty groups
     state2.flush_to_s3().unwrap();
-    assert!(!state2.has_pending_flush(), "flush should clear pending groups");
+    assert!(
+        !state2.has_pending_flush(),
+        "flush should clear pending groups"
+    );
 
     // Verify data is readable
-    let count: i64 = conn2.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 100, "all data should be readable after recovery + flush");
+    let count: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 100,
+        "all data should be readable after recovery + flush"
+    );
 
     drop(conn2);
     drop(state2);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint.clone(),
+        bucket,
+        prefix,
+        endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 /// Durable mode local manifest has no dirty groups.
@@ -219,30 +267,41 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "durable_no_dirty.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA page_size=4096;
          PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);
          INSERT INTO data VALUES (1, 'hello');",
-    ).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Verify local manifest exists and is valid msgpack
     let manifest_path = cache_dir.path().join("manifest.msgpack");
     let bytes = std::fs::read(&manifest_path).unwrap();
-    assert!(!bytes.is_empty(), "local manifest should be non-empty after Durable checkpoint");
+    assert!(
+        !bytes.is_empty(),
+        "local manifest should be non-empty after Durable checkpoint"
+    );
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }

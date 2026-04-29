@@ -27,18 +27,20 @@ fn test_compact_reclaims_dead_space() {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE compact_test (id INTEGER PRIMARY KEY, data TEXT);",
-        ).unwrap();
+        conn.execute_batch("CREATE TABLE compact_test (id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
         for i in 0..500 {
             conn.execute(
                 "INSERT INTO compact_test VALUES (?1, ?2)",
                 rusqlite::params![i, format!("row_{:04}_padding_to_fill_pages", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Delete 400 rows (80%), checkpoint
@@ -46,10 +48,13 @@ fn test_compact_reclaims_dead_space() {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute("DELETE FROM compact_test WHERE id >= 100", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute("DELETE FROM compact_test WHERE id >= 100", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Run compaction
@@ -62,7 +67,8 @@ fn test_compact_reclaims_dead_space() {
 
     // After deleting 80% of rows, we should have significant dead space
     assert!(
-        pages_freed > 0 || parsed["compacted"].as_u64().unwrap_or(0) > 0
+        pages_freed > 0
+            || parsed["compacted"].as_u64().unwrap_or(0) > 0
             || parsed.get("message").is_some(),
         "compaction should either free pages or report no candidates: {}",
         result,
@@ -78,7 +84,8 @@ fn test_compact_reclaims_dead_space() {
             region: Some("auto".to_string()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true,
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("compact_reader");
         let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -88,7 +95,8 @@ fn test_compact_reclaims_dead_space() {
         let conn = rusqlite::Connection::open_with_flags(
             &reader_db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM compact_test", [], |row| row.get(0))
             .unwrap();
@@ -116,18 +124,20 @@ fn test_compact_noop_when_no_dead_space() {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE noop_test (id INTEGER PRIMARY KEY, data TEXT);",
-        ).unwrap();
+        conn.execute_batch("CREATE TABLE noop_test (id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
         for i in 0..100 {
             conn.execute(
                 "INSERT INTO noop_test VALUES (?1, ?2)",
                 rusqlite::params![i, format!("data_{}", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Compact should be a no-op
@@ -136,7 +146,8 @@ fn test_compact_noop_when_no_dead_space() {
 
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["compacted"].as_u64().unwrap_or(0), 0,
+        parsed["compacted"].as_u64().unwrap_or(0),
+        0,
         "should not compact anything when no dead space"
     );
 }
@@ -161,28 +172,33 @@ fn test_compact_respects_threshold() {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
                 | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch(
-            "CREATE TABLE thresh_test (id INTEGER PRIMARY KEY, data TEXT);",
-        ).unwrap();
+        conn.execute_batch("CREATE TABLE thresh_test (id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
         for i in 0..200 {
             conn.execute(
                 "INSERT INTO thresh_test VALUES (?1, ?2)",
                 rusqlite::params![i, format!("row_{:04}_padding_data_here", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
 
-        conn.execute("DELETE FROM thresh_test WHERE id >= 140", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute("DELETE FROM thresh_test WHERE id >= 140", [])
+            .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // With 80% threshold, should skip (30% dead < 80% threshold)
     let result = bench.compact(0.8).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["compacted"].as_u64().unwrap_or(0), 0,
+        parsed["compacted"].as_u64().unwrap_or(0),
+        0,
         "should not compact at 80% threshold with ~30% dead space"
     );
 }

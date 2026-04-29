@@ -9,8 +9,8 @@
 //! path (rusqlite -> scalar function -> FFI -> thread-local -> per-handle
 //! queue) to prove that no such cross-connection leak can happen.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use rusqlite::{Connection, OpenFlags};
@@ -69,8 +69,8 @@ fn turbolite_config_set_returns_ok_on_live_connection() {
     assert_eq!(rc, 0, "expected 0 from turbolite_config_set");
 
     // Peek confirms the push landed on THIS thread's active queue.
-    let peeked = settings::peek_top_for_key("prefetch_search")
-        .expect("queue should have a pending update");
+    let peeked =
+        settings::peek_top_for_key("prefetch_search").expect("queue should have a pending update");
     assert_eq!(peeked, "0.5,0.5");
 
     // A subsequent real query drains the queue (handle's xRead applies it).
@@ -105,11 +105,9 @@ fn turbolite_config_set_rejects_bad_input() {
 
     // Unknown key.
     let err = conn
-        .query_row(
-            "SELECT turbolite_config_set('nope', 'x')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT turbolite_config_set('nope', 'x')", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .unwrap_err();
     assert!(
         format!("{err:?}").contains("unknown key"),
@@ -174,8 +172,7 @@ fn two_threads_isolated_via_sql_function() {
         assert_eq!(rc, 0);
 
         // A must see A's own value on its queue.
-        settings::peek_top_for_key("prefetch_search")
-            .expect("A queue has pending")
+        settings::peek_top_for_key("prefetch_search").expect("A queue has pending")
     });
 
     let t_b = thread::spawn(move || {
@@ -199,8 +196,7 @@ fn two_threads_isolated_via_sql_function() {
             .expect("B set");
         assert_eq!(rc, 0);
 
-        settings::peek_top_for_key("prefetch_search")
-            .expect("B queue has pending")
+        settings::peek_top_for_key("prefetch_search").expect("B queue has pending")
     });
 
     let a_value = t_a.join().expect("thread A panicked");
@@ -269,8 +265,12 @@ fn multi_connection_same_thread_routes_per_connection() {
     // Verify by draining each connection's next xRead. Force a real
     // page read on each; after the drain, peek should show no pending
     // update for that connection's queue (drain removed it).
-    conn_a.execute("INSERT INTO _bootstrap VALUES (1)", []).unwrap();
-    conn_b.execute("INSERT INTO _bootstrap VALUES (2)", []).unwrap();
+    conn_a
+        .execute("INSERT INTO _bootstrap VALUES (1)", [])
+        .unwrap();
+    conn_b
+        .execute("INSERT INTO _bootstrap VALUES (2)", [])
+        .unwrap();
 
     // The real proof: push again on A, without touching B. Then peek
     // the top of the stack (which is queue_b since B was opened most
@@ -319,8 +319,7 @@ fn sequential_connections_dont_share_queue() {
             )
             .expect("A set");
         assert_eq!(rc, 0);
-        let a_val = settings::peek_top_for_key("prefetch_search")
-            .expect("A queue has pending");
+        let a_val = settings::peek_top_for_key("prefetch_search").expect("A queue has pending");
         assert_eq!(a_val, "0.11,0.22");
         // conn (and its TurboliteHandle) drop here → leave_handle fires
     }
@@ -342,7 +341,6 @@ fn sequential_connections_dont_share_queue() {
         )
         .expect("B set");
     assert_eq!(rc, 0);
-    let b_val = settings::peek_top_for_key("prefetch_search")
-        .expect("B queue has pending");
+    let b_val = settings::peek_top_for_key("prefetch_search").expect("B queue has pending");
     assert_eq!(b_val, "0.33,0.44");
 }

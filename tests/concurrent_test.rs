@@ -1,9 +1,9 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_concurrent_read_write() {
@@ -24,15 +24,23 @@ fn test_concurrent_read_write() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_concurrent",
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", [])
+            .unwrap();
 
         for i in 0..1000 {
-            conn.execute("INSERT INTO test (id, data) VALUES (?, ?)", (i, format!("initial_{}", i))).unwrap();
+            conn.execute(
+                "INSERT INTO test (id, data) VALUES (?, ?)",
+                (i, format!("initial_{}", i)),
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Initial data inserted");
     }
 
@@ -45,15 +53,14 @@ fn test_concurrent_read_write() {
             &*db_path_reader,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             "test_concurrent",
-        ).unwrap();
+        )
+        .unwrap();
 
         for i in 0..100 {
             let rowid = (i % 1000) + 1;
-            match conn.query_row(
-                "SELECT data FROM test WHERE id = ?",
-                [rowid],
-                |row| row.get::<_, String>(0),
-            ) {
+            match conn.query_row("SELECT data FROM test WHERE id = ?", [rowid], |row| {
+                row.get::<_, String>(0)
+            }) {
                 Ok(data) => {
                     if i % 20 == 0 {
                         println!("Reader: row {} = {}", rowid, &data[..20.min(data.len())]);
@@ -75,9 +82,11 @@ fn test_concurrent_read_write() {
             &*db_path_writer,
             OpenFlags::SQLITE_OPEN_READ_WRITE,
             "test_concurrent",
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
 
         for i in 0..50 {
             match conn.execute(
@@ -133,17 +142,24 @@ fn test_concurrent_no_wal() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_no_wal",
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;").unwrap();
-        conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+            [],
+        )
+        .unwrap();
 
         conn.execute("BEGIN", []).unwrap();
         for i in 0..num_docs {
             conn.execute(
                 "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
                 (format!("Author_{}", i), format!("Title_{}", i), &large_text),
-            ).unwrap();
+            )
+            .unwrap();
         }
         conn.execute("COMMIT", []).unwrap();
         println!("Initial data inserted: {} documents", num_docs);
@@ -154,7 +170,8 @@ fn test_concurrent_no_wal() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             "test_no_wal",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut stmt = conn.prepare("SELECT rowid FROM articles").unwrap();
         let rows = stmt.query_map([], |row| row.get(0)).unwrap();
@@ -184,7 +201,8 @@ fn test_concurrent_no_wal() {
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
                 "test_no_wal",
-            ).unwrap();
+            )
+            .unwrap();
 
             let mut i = 0usize;
             while !stop_flag.load(Ordering::Relaxed) {
@@ -205,7 +223,13 @@ fn test_concurrent_no_wal() {
                         read_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        eprintln!("Reader {} ERROR at row {}: {} (code: {:?})", reader_id, rowid, e, e.sqlite_error_code());
+                        eprintln!(
+                            "Reader {} ERROR at row {}: {} (code: {:?})",
+                            reader_id,
+                            rowid,
+                            e,
+                            e.sqlite_error_code()
+                        );
                         read_errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -228,7 +252,11 @@ fn test_concurrent_no_wal() {
     let r_errors = read_errors.load(Ordering::Relaxed);
 
     println!("\nResults:");
-    println!("  Reads: {} ({}/sec)", reads, reads / duration_secs as usize);
+    println!(
+        "  Reads: {} ({}/sec)",
+        reads,
+        reads / duration_secs as usize
+    );
     println!("  Read errors: {}", r_errors);
 
     assert_eq!(r_errors, 0, "Had {} read errors", r_errors);
@@ -261,20 +289,28 @@ fn test_concurrent_high_throughput() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_high_throughput",
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
-        conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+            [],
+        )
+        .unwrap();
 
         conn.execute("BEGIN", []).unwrap();
         for i in 0..num_docs {
             conn.execute(
                 "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
                 (format!("Author_{}", i), format!("Title_{}", i), &large_text),
-            ).unwrap();
+            )
+            .unwrap();
         }
         conn.execute("COMMIT", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Initial data inserted: {} documents", num_docs);
     }
 
@@ -284,7 +320,8 @@ fn test_concurrent_high_throughput() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             "test_high_throughput",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut stmt = conn.prepare("SELECT rowid FROM articles").unwrap();
         let rows = stmt.query_map([], |row| row.get(0)).unwrap();
@@ -317,7 +354,8 @@ fn test_concurrent_high_throughput() {
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
                 "test_high_throughput",
-            ).unwrap();
+            )
+            .unwrap();
 
             let mut i = 0usize;
             while !stop_flag.load(Ordering::Relaxed) {
@@ -338,7 +376,13 @@ fn test_concurrent_high_throughput() {
                         read_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        eprintln!("Reader {} ERROR at row {}: {} (code: {:?})", reader_id, rowid, e, e.sqlite_error_code());
+                        eprintln!(
+                            "Reader {} ERROR at row {}: {} (code: {:?})",
+                            reader_id,
+                            rowid,
+                            e,
+                            e.sqlite_error_code()
+                        );
                         read_errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -360,9 +404,11 @@ fn test_concurrent_high_throughput() {
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE,
                 "test_high_throughput",
-            ).unwrap();
+            )
+            .unwrap();
 
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+                .unwrap();
 
             let body = "y".repeat(1000);
             let mut i = 0usize;
@@ -370,13 +416,22 @@ fn test_concurrent_high_throughput() {
             while !stop_flag.load(Ordering::Relaxed) {
                 match conn.execute(
                     "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
-                    (format!("NewAuthor_{}_{}", writer_id, i), format!("NewTitle_{}_{}", writer_id, i), &body),
+                    (
+                        format!("NewAuthor_{}_{}", writer_id, i),
+                        format!("NewTitle_{}_{}", writer_id, i),
+                        &body,
+                    ),
                 ) {
                     Ok(_) => {
                         write_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        eprintln!("Writer {} ERROR: {} (code: {:?})", writer_id, e, e.sqlite_error_code());
+                        eprintln!(
+                            "Writer {} ERROR: {} (code: {:?})",
+                            writer_id,
+                            e,
+                            e.sqlite_error_code()
+                        );
                         write_errors.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -401,8 +456,16 @@ fn test_concurrent_high_throughput() {
     let w_errors = write_errors.load(Ordering::Relaxed);
 
     println!("\nResults:");
-    println!("  Reads: {} ({}/sec)", reads, reads / duration_secs as usize);
-    println!("  Writes: {} ({}/sec)", writes, writes / duration_secs as usize);
+    println!(
+        "  Reads: {} ({}/sec)",
+        reads,
+        reads / duration_secs as usize
+    );
+    println!(
+        "  Writes: {} ({}/sec)",
+        writes,
+        writes / duration_secs as usize
+    );
     println!("  Read errors: {}", r_errors);
     println!("  Write errors: {}", w_errors);
 

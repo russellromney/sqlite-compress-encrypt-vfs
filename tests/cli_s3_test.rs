@@ -39,8 +39,7 @@ fn test_bucket() -> String {
 }
 
 fn endpoint_url() -> String {
-    std::env::var("AWS_ENDPOINT_URL")
-        .unwrap_or_else(|_| "https://t3.storage.dev".to_string())
+    std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "https://t3.storage.dev".to_string())
 }
 
 fn unique_prefix() -> String {
@@ -179,7 +178,10 @@ fn test_import_info_export_roundtrip() {
         stdout,
         stderr
     );
-    assert!(stdout.contains("integrity ok"), "should pass integrity check");
+    assert!(
+        stdout.contains("integrity ok"),
+        "should pass integrity check"
+    );
 
     // 4. Verify exported data matches original
     let conn = rusqlite::Connection::open(&exported_db).expect("open exported db");
@@ -195,11 +197,9 @@ fn test_import_info_export_roundtrip() {
     assert_eq!(post_count, 3, "should have 3 posts");
 
     let alice_email: String = conn
-        .query_row(
-            "SELECT email FROM users WHERE name = 'alice'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT email FROM users WHERE name = 'alice'", [], |row| {
+            row.get(0)
+        })
         .expect("query alice");
     assert_eq!(alice_email, "alice@example.com");
 
@@ -340,9 +340,15 @@ fn test_validate_clean_database() {
         stdout,
         stderr
     );
-    assert!(stdout.contains("validate: passed"), "should pass validation");
+    assert!(
+        stdout.contains("validate: passed"),
+        "should pass validation"
+    );
     assert!(stdout.contains("present"), "should show present counts");
-    assert!(stdout.contains("integrity_check"), "should run integrity check");
+    assert!(
+        stdout.contains("integrity_check"),
+        "should run integrity check"
+    );
     assert!(stdout.contains("ok"), "integrity check should be ok");
 }
 
@@ -438,4 +444,3 @@ fn test_download_s3_database() {
         stdout,
     );
 }
-

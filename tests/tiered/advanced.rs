@@ -1,8 +1,8 @@
 //! Advanced tests: PPG config, TTL eviction, compression/dictionary, cache management, autovacuum.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 
@@ -23,8 +23,7 @@ fn test_ttl_eviction() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "ttl_evict_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -63,12 +62,12 @@ fn test_ttl_eviction() {
         endpoint_url: endpoint.clone(),
         read_only: true,
         region: region.clone(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ttl_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "ttl_evict_test.db",
@@ -85,9 +84,7 @@ fn test_ttl_eviction() {
 
     // Verify data integrity — specific row lookup
     let data: Vec<u8> = reader
-        .query_row("SELECT data FROM ttl WHERE id = 100", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT data FROM ttl WHERE id = 100", [], |row| row.get(0))
         .unwrap();
     assert_eq!(data.len(), 8192);
     assert!(data.iter().all(|&b| b == 0x42));
@@ -100,8 +97,7 @@ fn test_dictionary_mismatch_errors() {
     let samples: Vec<Vec<u8>> = (0..100)
         .map(|i| format!("dict_sample_row_{}_with_repeated_structure", i).into_bytes())
         .collect();
-    let dict_bytes =
-        turbolite::dict::train_dictionary(&samples, 4096).unwrap();
+    let dict_bytes = turbolite::dict::train_dictionary(&samples, 4096).unwrap();
 
     // Write with dictionary
     let write_cache = TempDir::new().unwrap();
@@ -118,8 +114,7 @@ fn test_dictionary_mismatch_errors() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "dict_mismatch_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -157,12 +152,12 @@ fn test_dictionary_mismatch_errors() {
         read_only: true,
         region,
         // dictionary: None (default) — intentional mismatch
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_dict_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     // Opening the connection reads page 0 (schema). With dict-compressed pages
     // and no dict, decompression fails immediately — SQLite reports disk I/O error.
@@ -196,8 +191,7 @@ fn test_dictionary_roundtrip() {
     let samples: Vec<Vec<u8>> = (0..100)
         .map(|i| format!("roundtrip_sample_{}_with_padding", i).into_bytes())
         .collect();
-    let dict_bytes =
-        turbolite::dict::train_dictionary(&samples, 4096).unwrap();
+    let dict_bytes = turbolite::dict::train_dictionary(&samples, 4096).unwrap();
 
     // Write with dict
     let write_cache = TempDir::new().unwrap();
@@ -214,8 +208,7 @@ fn test_dictionary_roundtrip() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "dict_rt_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -251,13 +244,13 @@ fn test_dictionary_roundtrip() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     reader_config.dictionary = Some(dict_bytes);
     let reader_vfs_name = unique_vfs_name("tiered_drt_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "dict_rt_test.db",
@@ -272,11 +265,7 @@ fn test_dictionary_roundtrip() {
     assert_eq!(count, 50, "dict roundtrip should preserve all data");
 
     let val: String = reader
-        .query_row(
-            "SELECT val FROM drt WHERE id = 25",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT val FROM drt WHERE id = 25", [], |row| row.get(0))
         .unwrap();
     assert_eq!(val, "dict_roundtrip_25");
 }
@@ -298,8 +287,7 @@ fn test_custom_pages_per_group() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "custom_ppg_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -372,12 +360,12 @@ fn test_custom_pages_per_group() {
         read_only: true,
         pages_per_group: 8,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppg8_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "custom_ppg_test.db",
@@ -409,8 +397,7 @@ fn test_ppg_mismatch_uses_manifest() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "ppg_mismatch_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -451,12 +438,12 @@ fn test_ppg_mismatch_uses_manifest() {
         read_only: true,
         pages_per_group: 64, // DIFFERENT from writer's 2048
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_ppgmm_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "ppg_mismatch_test.db",
@@ -468,16 +455,18 @@ fn test_ppg_mismatch_uses_manifest() {
     let count: i64 = reader
         .query_row("SELECT COUNT(*) FROM csm", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count, 200, "reader with mismatched pages_per_group should use manifest's");
+    assert_eq!(
+        count, 200,
+        "reader with mismatched pages_per_group should use manifest's"
+    );
 
     let val: String = reader
-        .query_row(
-            "SELECT val FROM csm WHERE id = 199",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT val FROM csm WHERE id = 199", [], |row| row.get(0))
         .unwrap();
-    assert!(val.starts_with("mismatch_data_"), "data integrity with mismatched pages_per_group");
+    assert!(
+        val.starts_with("mismatch_data_"),
+        "data integrity with mismatched pages_per_group"
+    );
 }
 
 #[test]
@@ -496,15 +485,33 @@ fn test_evict_tree_by_name() {
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, bio TEXT);
              CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT);
              CREATE INDEX idx_posts_user ON posts(user_id);",
-        ).unwrap();
+        )
+        .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..500 {
-            tx.execute("INSERT INTO users VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, format!("user_{}", i), format!("Bio for user {} with some padding text to fill pages", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO users VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i,
+                    format!("user_{}", i),
+                    format!("Bio for user {} with some padding text to fill pages", i)
+                ],
+            )
+            .unwrap();
         }
         for i in 0..2000 {
-            tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, i % 500, format!("Post body {} with enough text to fill up multiple pages in the database", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO posts VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i,
+                    i % 500,
+                    format!(
+                        "Post body {} with enough text to fill up multiple pages in the database",
+                        i
+                    )
+                ],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
         conn.execute_batch("VACUUM;").unwrap();
@@ -517,10 +524,12 @@ fn test_evict_tree_by_name() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let manifest = turbolite::tiered::import_sqlite_file(&config, &local_db)
-        .expect("import failed");
-    assert!(!manifest.tree_name_to_groups.is_empty(),
-        "import must populate tree_name_to_groups");
+    let manifest =
+        turbolite::tiered::import_sqlite_file(&config, &local_db).expect("import failed");
+    assert!(
+        !manifest.tree_name_to_groups.is_empty(),
+        "import must populate tree_name_to_groups"
+    );
 
     // Step 3: Open via tiered VFS (cold read from S3)
     let vfs_name = unique_vfs_name("tiered_evict_tree");
@@ -530,19 +539,24 @@ fn test_evict_tree_by_name() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "evict_tree_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
     // Warm cache by reading
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2000);
 
     // Evict posts tree
     let evicted = bench.evict_tree("posts");
-    assert!(evicted > 0, "expected at least one group evicted for 'posts'");
+    assert!(
+        evicted > 0,
+        "expected at least one group evicted for 'posts'"
+    );
 
     // Nonexistent tree returns 0
     assert_eq!(bench.evict_tree("nonexistent_table"), 0);
@@ -555,18 +569,26 @@ fn test_evict_tree_by_name() {
     assert_eq!(bench.evict_tree("  ,  , "), 0);
 
     // Data still readable after eviction (re-fetched from S3)
-    let count2: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+    let count2: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count2, 2000);
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 #[test]
@@ -584,59 +606,115 @@ fn test_cache_info_returns_valid_json() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cache_info_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA page_size=65536;
          PRAGMA journal_mode=WAL;
          CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
-    ).unwrap();
+    )
+    .unwrap();
 
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..100 {
-            tx.execute("INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("val_{}", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("val_{}", i)],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
 
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Warm cache
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+        .unwrap();
 
     // Get cache info
     let info = bench.cache_info();
-    assert!(info.contains("\"size_bytes\":"), "JSON should contain size_bytes: {}", info);
-    assert!(info.contains("\"groups_cached\":"), "JSON should contain groups_cached: {}", info);
-    assert!(info.contains("\"groups_total\":"), "JSON should contain groups_total: {}", info);
-    assert!(info.contains("\"tiers\":"), "JSON should contain tiers: {}", info);
-    assert!(info.contains("\"pinned\":"), "JSON should contain pinned tier: {}", info);
-    assert!(info.contains("\"s3_gets_total\":"), "JSON should contain s3_gets_total: {}", info);
+    assert!(
+        info.contains("\"size_bytes\":"),
+        "JSON should contain size_bytes: {}",
+        info
+    );
+    assert!(
+        info.contains("\"groups_cached\":"),
+        "JSON should contain groups_cached: {}",
+        info
+    );
+    assert!(
+        info.contains("\"groups_total\":"),
+        "JSON should contain groups_total: {}",
+        info
+    );
+    assert!(
+        info.contains("\"tiers\":"),
+        "JSON should contain tiers: {}",
+        info
+    );
+    assert!(
+        info.contains("\"pinned\":"),
+        "JSON should contain pinned tier: {}",
+        info
+    );
+    assert!(
+        info.contains("\"s3_gets_total\":"),
+        "JSON should contain s3_gets_total: {}",
+        info
+    );
 
     // After clearing cache, size should drop
     bench.clear_cache_data_only();
     let info_after = bench.cache_info();
     // Parse size_bytes from both
-    let size_before: u64 = info.split("\"size_bytes\":").nth(1).unwrap()
-        .split(',').next().unwrap().parse().unwrap();
-    let size_after: u64 = info_after.split("\"size_bytes\":").nth(1).unwrap()
-        .split(',').next().unwrap().parse().unwrap();
-    assert!(size_after <= size_before, "cache should shrink after clear: before={}, after={}", size_before, size_after);
+    let size_before: u64 = info
+        .split("\"size_bytes\":")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let size_after: u64 = info_after
+        .split("\"size_bytes\":")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        size_after <= size_before,
+        "cache should shrink after clear: before={}, after={}",
+        size_before,
+        size_after
+    );
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 #[test]
@@ -655,11 +733,19 @@ fn test_evict_tree_skips_pending_flush_groups() {
              PRAGMA journal_mode=DELETE;
              CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT);
              CREATE INDEX idx_posts_user ON posts(user_id);",
-        ).unwrap();
+        )
+        .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..2000 {
-            tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, i % 100, format!("Post body {} with padding text to fill pages", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO posts VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i,
+                    i % 100,
+                    format!("Post body {} with padding text to fill pages", i)
+                ],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
         conn.execute_batch("VACUUM;").unwrap();
@@ -672,11 +758,16 @@ fn test_evict_tree_skips_pending_flush_groups() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let manifest = turbolite::tiered::import_sqlite_file(&config, &local_db)
-        .expect("import failed");
-    let posts_groups = manifest.tree_name_to_groups.get("posts")
+    let manifest =
+        turbolite::tiered::import_sqlite_file(&config, &local_db).expect("import failed");
+    let posts_groups = manifest
+        .tree_name_to_groups
+        .get("posts")
         .expect("import must map 'posts' to groups");
-    assert!(!posts_groups.is_empty(), "posts must have at least one group");
+    assert!(
+        !posts_groups.is_empty(),
+        "posts must have at least one group"
+    );
 
     // Step 3: Open via tiered VFS, write new data, local-checkpoint to create pending groups
     let vfs_name = unique_vfs_name("tiered_evict_pending");
@@ -686,35 +777,46 @@ fn test_evict_tree_skips_pending_flush_groups() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "evict_tree_pending.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
     // Warm cache by reading (so groups are cached)
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2000);
 
     // Verify evict_tree works when nothing is pending
     assert!(!bench.has_pending_flush());
     let evicted_before = bench.evict_tree("posts");
-    assert!(evicted_before > 0, "should evict posts groups when no pending flush");
+    assert!(
+        evicted_before > 0,
+        "should evict posts groups when no pending flush"
+    );
 
     // Re-warm cache
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
 
     // Write new data and local-checkpoint to create pending groups
     turbolite::tiered::set_local_checkpoint_only(true);
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 2000..2500 {
-            tx.execute("INSERT INTO posts VALUES (?1, ?2, ?3)",
-                rusqlite::params![i, i % 100, format!("new post {}", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO posts VALUES (?1, ?2, ?3)",
+                rusqlite::params![i, i % 100, format!("new post {}", i)],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Now groups are pending: evict_tree should skip pending ones
     assert!(bench.has_pending_flush());
@@ -722,9 +824,12 @@ fn test_evict_tree_skips_pending_flush_groups() {
     // Some groups may still be evictable (not all posts groups are dirty),
     // but pending ones must be skipped. The key assertion is that we evict
     // fewer groups than when nothing was pending.
-    assert!(evicted_pending < evicted_before,
+    assert!(
+        evicted_pending < evicted_before,
         "pending flush must reduce evictable groups: before={}, during_pending={}",
-        evicted_before, evicted_pending);
+        evicted_before,
+        evicted_pending
+    );
 
     // Flush, then evict should work fully again
     turbolite::tiered::set_local_checkpoint_only(false);
@@ -732,18 +837,26 @@ fn test_evict_tree_skips_pending_flush_groups() {
     assert!(!bench.has_pending_flush());
 
     // Data still readable after flush
-    let count2: i64 = conn.query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0)).unwrap();
+    let count2: i64 = conn
+        .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count2, 2500);
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }
 
 /// Phase Thermopylae-c: verify autovacuum works through the tiered VFS.
@@ -764,62 +877,82 @@ fn test_autovacuum_with_gc() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "autovacuum_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Enable incremental autovacuum BEFORE creating tables
     conn.execute_batch(
         "PRAGMA auto_vacuum=INCREMENTAL;
          PRAGMA journal_mode=WAL;
          PRAGMA page_size=4096;",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify autovacuum is set
-    let av: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+    let av: i64 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(av, 2, "auto_vacuum should be INCREMENTAL (2)");
 
     // Insert a bunch of data
-    conn.execute_batch("CREATE TABLE avtest (id INTEGER PRIMARY KEY, data TEXT);").unwrap();
+    conn.execute_batch("CREATE TABLE avtest (id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..500 {
             tx.execute(
                 "INSERT INTO avtest VALUES (?1, ?2)",
                 rusqlite::params![i, format!("{:0>200}", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     let objects_after_insert = count_s3_objects(&bucket, &prefix, &endpoint);
 
     // Delete most data
-    conn.execute("DELETE FROM avtest WHERE id >= 50", []).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute("DELETE FROM avtest WHERE id >= 50", [])
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     let objects_after_delete = count_s3_objects(&bucket, &prefix, &endpoint);
     // After delete + checkpoint with gc_enabled=false, old versions accumulate
     assert!(
         objects_after_delete >= objects_after_insert,
         "with GC off, objects should not decrease after delete: insert={} delete={}",
-        objects_after_insert, objects_after_delete,
+        objects_after_insert,
+        objects_after_delete,
     );
 
     // Run incremental vacuum to free pages
-    conn.execute_batch("PRAGMA incremental_vacuum(100);").unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA incremental_vacuum(100);")
+        .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Verify remaining data is intact
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM avtest", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM avtest", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 50, "50 rows should survive after delete + vacuum");
 
     // Verify page count decreased
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
-    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)).unwrap();
-    eprintln!("After vacuum: page_count={}, freelist={}", page_count, freelist);
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    let freelist: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    eprintln!(
+        "After vacuum: page_count={}, freelist={}",
+        page_count, freelist
+    );
 
     // Now run full GC scan to clean up orphans
     drop(conn);
@@ -830,7 +963,8 @@ fn test_autovacuum_with_gc() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
@@ -846,7 +980,8 @@ fn test_autovacuum_with_gc() {
     assert!(
         objects_after_gc <= objects_after_insert,
         "GC should stabilize object count: after_gc={} <= after_insert={}",
-        objects_after_gc, objects_after_insert,
+        objects_after_gc,
+        objects_after_insert,
     );
 
     // Verify data still readable after GC
@@ -878,16 +1013,17 @@ fn test_cache_truncation_after_vacuum() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cache_trunc_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA page_size=4096;
          CREATE TABLE trunc_test (id INTEGER PRIMARY KEY, data TEXT);",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Insert data to grow the database
     {
@@ -896,58 +1032,84 @@ fn test_cache_truncation_after_vacuum() {
             tx.execute(
                 "INSERT INTO trunc_test VALUES (?1, ?2)",
                 rusqlite::params![i, format!("{:0>500}", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Find the cache file and measure its size
-    let cache_files: Vec<_> = std::fs::read_dir(&cache_path).unwrap()
+    let cache_files: Vec<_> = std::fs::read_dir(&cache_path)
+        .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map_or(false, |ext| ext == "cache"))
         .collect();
     assert!(!cache_files.is_empty(), "cache file should exist");
     let cache_file_path = cache_files[0].path();
     let size_before = std::fs::metadata(&cache_file_path).unwrap().len();
-    let pages_before: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
-    eprintln!("Before VACUUM: cache_size={}, page_count={}", size_before, pages_before);
+    let pages_before: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    eprintln!(
+        "Before VACUUM: cache_size={}, page_count={}",
+        size_before, pages_before
+    );
 
     // Delete most data and VACUUM
-    conn.execute("DELETE FROM trunc_test WHERE id >= 100", []).unwrap();
+    conn.execute("DELETE FROM trunc_test WHERE id >= 100", [])
+        .unwrap();
     conn.execute_batch("VACUUM;").unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     let size_after = std::fs::metadata(&cache_file_path).unwrap().len();
-    let pages_after: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
-    eprintln!("After VACUUM: cache_size={}, page_count={}", size_after, pages_after);
+    let pages_after: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    eprintln!(
+        "After VACUUM: cache_size={}, page_count={}",
+        size_after, pages_after
+    );
 
     assert!(
         pages_after < pages_before,
         "VACUUM should reduce page_count: before={} after={}",
-        pages_before, pages_after,
+        pages_before,
+        pages_after,
     );
     assert!(
         size_after < size_before,
         "cache file should shrink after VACUUM + checkpoint: before={} after={}",
-        size_before, size_after,
+        size_before,
+        size_after,
     );
     assert_eq!(
-        size_after, pages_after as u64 * 4096,
+        size_after,
+        pages_after as u64 * 4096,
         "cache file size should equal page_count * page_size",
     );
 
     // Verify data integrity
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM trunc_test", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM trunc_test", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 100, "100 rows should survive after delete + vacuum");
 
     // Cleanup
     drop(conn);
     let cleanup_config = TurboliteConfig {
-        bucket, prefix, endpoint_url: endpoint,
+        bucket,
+        prefix,
+        endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
-    TurboliteVfs::new_local(cleanup_config).unwrap().destroy_s3().unwrap();
+    TurboliteVfs::new_local(cleanup_config)
+        .unwrap()
+        .destroy_s3()
+        .unwrap();
 }

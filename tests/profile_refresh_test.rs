@@ -1,9 +1,9 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// Test that triggers frequent checkpoints to force index refreshes
 /// This helps profile refresh performance between encrypted and compressed modes
@@ -29,20 +29,28 @@ fn test_checkpoint_refresh_performance() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_checkpoint",
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
-        conn.execute("CREATE TABLE articles (author TEXT, title TEXT, body TEXT)", []).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE articles (author TEXT, title TEXT, body TEXT)",
+            [],
+        )
+        .unwrap();
 
         conn.execute("BEGIN", []).unwrap();
         for i in 0..num_docs {
             conn.execute(
                 "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
                 (format!("Author_{}", i), format!("Title_{}", i), &large_text),
-            ).unwrap();
+            )
+            .unwrap();
         }
         conn.execute("COMMIT", []).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Initial data inserted: {} documents", num_docs);
     }
 
@@ -52,7 +60,8 @@ fn test_checkpoint_refresh_performance() {
             &*db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY,
             "test_checkpoint",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut stmt = conn.prepare("SELECT rowid FROM articles").unwrap();
         let rows = stmt.query_map([], |row| row.get(0)).unwrap();
@@ -82,7 +91,8 @@ fn test_checkpoint_refresh_performance() {
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY,
                 "test_checkpoint",
-            ).unwrap();
+            )
+            .unwrap();
 
             let mut i = 0usize;
             while !stop_flag.load(Ordering::Relaxed) {
@@ -123,9 +133,11 @@ fn test_checkpoint_refresh_performance() {
                 &*db_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE,
                 "test_checkpoint",
-            ).unwrap();
+            )
+            .unwrap();
 
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;").unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+                .unwrap();
 
             let body = "y".repeat(1000);
             let mut i = 0usize;
@@ -133,7 +145,11 @@ fn test_checkpoint_refresh_performance() {
             while !stop_flag.load(Ordering::Relaxed) {
                 match conn.execute(
                     "INSERT INTO articles (author, title, body) VALUES (?, ?, ?)",
-                    (format!("NewAuthor_{}_{}", writer_id, i), format!("NewTitle_{}_{}", writer_id, i), &body),
+                    (
+                        format!("NewAuthor_{}_{}", writer_id, i),
+                        format!("NewTitle_{}_{}", writer_id, i),
+                        &body,
+                    ),
                 ) {
                     Ok(_) => {
                         write_count.fetch_add(1, Ordering::Relaxed);
@@ -156,7 +172,8 @@ fn test_checkpoint_refresh_performance() {
             &*db_path_checkpoint,
             OpenFlags::SQLITE_OPEN_READ_WRITE,
             "test_checkpoint",
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut checkpoint_count = 0;
         while !stop_flag_checkpoint.load(Ordering::Relaxed) {
@@ -184,6 +201,14 @@ fn test_checkpoint_refresh_performance() {
     let total_writes = write_count.load(Ordering::Relaxed);
 
     println!("\nResults:");
-    println!("  Reads: {} ({}/sec)", total_reads, total_reads / duration_secs as usize);
-    println!("  Writes: {} ({}/sec)", total_writes, total_writes / duration_secs as usize);
+    println!(
+        "  Reads: {} ({}/sec)",
+        total_reads,
+        total_reads / duration_secs as usize
+    );
+    println!(
+        "  Writes: {} ({}/sec)",
+        total_writes,
+        total_writes / duration_secs as usize
+    );
 }

@@ -1,8 +1,8 @@
 //! Basic tiered VFS tests: core I/O, checkpoint, manifest, cold read, caching.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_basic_write_read() {
@@ -19,8 +19,7 @@ fn test_basic_write_read() {
     let db_path = format!("basic_test.db");
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("failed to open connection");
@@ -61,11 +60,7 @@ fn test_basic_write_read() {
 
     // Verify specific row
     let value: String = conn
-        .query_row(
-            "SELECT value FROM data WHERE id = 42",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM data WHERE id = 42", [], |row| row.get(0))
         .unwrap();
     assert_eq!(value, "value_42");
 }
@@ -84,8 +79,7 @@ fn test_checkpoint_uploads() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "checkpoint_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -134,16 +128,10 @@ fn test_checkpoint_uploads() {
             .await
             .expect("manifest should exist in S3");
 
-        resp.body
-            .collect()
-            .await
-            .unwrap()
-            .into_bytes()
-            .to_vec()
+        resp.body.collect().await.unwrap().into_bytes().to_vec()
     });
 
-    let manifest: serde_json::Value =
-        manifest_from_msgpack(&manifest_data);
+    let manifest: serde_json::Value = manifest_from_msgpack(&manifest_data);
     assert!(
         manifest["version"].as_u64().unwrap() >= 1,
         "manifest version should be >= 1"
@@ -175,8 +163,7 @@ fn test_reader_from_s3() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "reader_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &writer_vfs_name,
     )
     .unwrap();
@@ -218,13 +205,12 @@ fn test_reader_from_s3() {
         endpoint_url: reader_endpoint,
         read_only: true,
         region: reader_region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_reader");
-    let reader_vfs =
-        TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "reader_test.db",
@@ -239,11 +225,7 @@ fn test_reader_from_s3() {
     assert_eq!(count, 200, "reader should see all 200 rows from S3");
 
     let msg: String = reader_conn
-        .query_row(
-            "SELECT msg FROM logs WHERE id = 199",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT msg FROM logs WHERE id = 199", [], |row| row.get(0))
         .unwrap();
     assert_eq!(msg, "log message 199");
 }
@@ -262,8 +244,7 @@ fn test_64kb_pages() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "pages64k_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -314,9 +295,7 @@ fn test_64kb_pages() {
 
     // Verify data integrity
     let data: Vec<u8> = conn2
-        .query_row("SELECT data FROM big WHERE id = 25", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT data FROM big WHERE id = 25", [], |row| row.get(0))
         .unwrap();
     assert_eq!(data.len(), 8192);
     assert!(data.iter().all(|&b| b == 0x42));
@@ -337,8 +316,7 @@ fn test_large_cold_scan() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "coldscan_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -351,9 +329,7 @@ fn test_large_cold_scan() {
     .unwrap();
 
     // Insert 10K rows (no indexes beyond PK)
-    let tx = conn
-        .unchecked_transaction()
-        .unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
     for i in 0..10_000 {
         tx.execute(
             "INSERT INTO events (id, ts, payload) VALUES (?1, ?2, ?3)",
@@ -377,13 +353,12 @@ fn test_large_cold_scan() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_coldscan_reader");
-    let reader_vfs =
-        TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    let reader_vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "coldscan_test.db",
@@ -426,8 +401,7 @@ fn test_no_index_append_pattern() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "append_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -516,8 +490,7 @@ fn test_read_only_rejects_writes() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "readonly_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &writer_vfs,
     )
     .unwrap();
@@ -540,7 +513,8 @@ fn test_read_only_rejects_writes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let ro_vfs_name = unique_vfs_name("tiered_ro_reader");
     let ro_vfs = TurboliteVfs::new_local(ro_config).unwrap();
@@ -576,8 +550,7 @@ fn test_cache_clear_survival() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cacheclr_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -617,12 +590,12 @@ fn test_cache_clear_survival() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let fresh_vfs_name = unique_vfs_name("tiered_cacheclr2");
     let fresh_vfs = TurboliteVfs::new_local(fresh_config).unwrap();
-    turbolite::tiered::register(&fresh_vfs_name, fresh_vfs)
-        .unwrap();
+    turbolite::tiered::register(&fresh_vfs_name, fresh_vfs).unwrap();
 
     let fresh_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cacheclr_test.db",
@@ -637,11 +610,9 @@ fn test_cache_clear_survival() {
     assert_eq!(count, 50, "all data should survive cache deletion");
 
     let val: String = fresh_conn
-        .query_row(
-            "SELECT val FROM survive WHERE id = 49",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT val FROM survive WHERE id = 49", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(val, "survivor_49");
 }
@@ -663,8 +634,7 @@ fn test_page_group_cache_populates() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "pgcache_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -707,12 +677,12 @@ fn test_page_group_cache_populates() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_pgcache_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "pgcache_test.db",
@@ -761,8 +731,7 @@ fn test_destroy_s3() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "destroy_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -806,7 +775,8 @@ fn test_destroy_s3() {
         cache_dir: cache_dir.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let destroy_vfs = TurboliteVfs::new_local(destroy_config).unwrap();
     destroy_vfs.destroy_s3().unwrap();
@@ -849,8 +819,7 @@ fn test_1k_rows_checkpoint_cold_read() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "1k_rows_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -887,12 +856,12 @@ fn test_1k_rows_checkpoint_cold_read() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_1k_reader");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "1k_rows_test.db",
@@ -910,11 +879,9 @@ fn test_1k_rows_checkpoint_cold_read() {
     assert_eq!(count, 1000);
 
     let payload: String = reader
-        .query_row(
-            "SELECT payload FROM events WHERE id = 999",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT payload FROM events WHERE id = 999", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(payload, "event_999");
 }
@@ -936,8 +903,7 @@ fn test_manifest_version_increments() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "versions_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -973,8 +939,7 @@ fn test_manifest_version_increments() {
                 .await
                 .unwrap();
             let bytes = resp.body.collect().await.unwrap().into_bytes();
-            let manifest: serde_json::Value =
-                manifest_from_msgpack(&bytes);
+            let manifest: serde_json::Value = manifest_from_msgpack(&bytes);
             manifest["version"].as_u64().unwrap()
         })
     };
@@ -1028,7 +993,12 @@ fn test_manifest_version_increments() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
     let v3 = get_version(&rt, &bucket, &prefix, &endpoint);
-    assert!(v3 > v2, "version should increase monotonically: v2={}, v3={}", v2, v3);
+    assert!(
+        v3 > v2,
+        "version should increase monotonically: v2={}, v3={}",
+        v2,
+        v3
+    );
 
     // Verify all data accessible
     let count: i64 = conn
@@ -1053,8 +1023,7 @@ fn test_default_4096_page_size() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "pages4k_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -1095,12 +1064,12 @@ fn test_default_4096_page_size() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_4k_reader");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "pages4k_test.db",
