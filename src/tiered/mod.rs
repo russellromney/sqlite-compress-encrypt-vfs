@@ -75,6 +75,7 @@ mod manifest;
 mod prediction;
 mod prefetch;
 mod query_plan;
+mod replay;
 mod rotation;
 pub mod settings;
 #[cfg(feature = "wal")]
@@ -97,6 +98,7 @@ pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfi
 pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
+pub use replay::{FinalizeReport, ReplayHandle};
 pub use vfs::TurboliteVfs;
 // SharedTurboliteVfs and register_shared are exported from mod.rs directly (defined below)
 pub use query_plan::{

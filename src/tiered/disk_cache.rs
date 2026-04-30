@@ -1569,6 +1569,36 @@ impl DiskCache {
         }
     }
 
+    /// Mark an explicit set of pages present in the bitmap and their
+    /// owning groups Present. Used by direct-hybrid-page-replay
+    /// (Phase 004) so that finalize doesn't have to mark every page
+    /// in the database — only the ones it actually wrote.
+    pub(crate) fn mark_pages_present(&self, page_nums: &[u64]) {
+        if page_nums.is_empty() {
+            return;
+        }
+        let max_page = *page_nums.iter().max().unwrap();
+        {
+            let mut bitmap = self.bitmap.write();
+            bitmap.ensure_capacity(max_page);
+            for &pnum in page_nums {
+                bitmap.mark_present(pnum);
+            }
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let states = self.group_states.lock();
+            let max_group = max_page / ppg;
+            self.ensure_group_states_capacity(&states, max_group);
+            for &pnum in page_nums {
+                let gid = (pnum / ppg) as usize;
+                if let Some(s) = states.get(gid) {
+                    s.store(GroupState::Present as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
         self.bitmap.read().persist()?;

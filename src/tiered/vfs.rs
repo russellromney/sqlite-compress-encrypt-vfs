@@ -1063,6 +1063,32 @@ impl TurboliteVfs {
             );
         }
     }
+
+    /// Begin a direct hybrid page replay cycle (Phase 004).
+    ///
+    /// Returns a [`ReplayHandle`] that the caller drives with
+    /// `apply_page` (per decoded HADBP page from walrust),
+    /// `commit_changeset(seq)` (per S3 object), then exactly one of
+    /// `finalize` (success) or `abort` (any failure). On finalize the
+    /// staged pages are atomically installed into the live cache and
+    /// emitted as a staging log under `pending_flushes` so the next
+    /// `flush_to_storage` / `publish_replayed_base` turns them into
+    /// uploaded page groups.
+    ///
+    /// See `crate::tiered::replay` for the full lifecycle contract.
+    pub fn begin_replay(&self) -> io::Result<crate::tiered::replay::ReplayHandle> {
+        let staging_dir = self.config.cache_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir)?;
+        let ctx = crate::tiered::replay::ReplayContext {
+            cache: self.cache.clone(),
+            shared_manifest: self.shared_manifest.clone(),
+            pending_flushes: self.pending_flushes.clone(),
+            staging_seq: self.staging_seq.clone(),
+            flush_lock: self.flush_lock.clone(),
+            staging_dir,
+        };
+        crate::tiered::replay::ReplayHandle::new(ctx)
+    }
 }
 
 impl Vfs for TurboliteVfs {
