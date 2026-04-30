@@ -57,9 +57,16 @@ fn test_encode_empty_page_group() {
     let encoded = test_encode(&pages, page_size);
     let (pg_count, ps, decoded) = test_decode(&encoded);
 
-    assert_eq!(pg_count, 0);
+    // Encoder no longer strips trailing None (would desynchronize encoded
+    // count from manifest's group_page_nums.len() and lose live pages
+    // when the cache happened to be missing the tail). All 4 slots are
+    // emitted as zero pages.
+    assert_eq!(pg_count, 4);
     assert_eq!(ps, page_size);
-    assert!(decoded.is_empty());
+    assert_eq!(decoded.len(), 4);
+    for d in &decoded {
+        assert_eq!(d, &vec![0u8; page_size as usize]);
+    }
 }
 
 #[test]
@@ -85,11 +92,12 @@ fn test_encode_single_page_filled() {
     let encoded = test_encode(&pages, page_size);
     let (pg_count, _ps, decoded) = test_decode(&encoded);
 
-    // page_count = 3 (last non-None is index 2)
-    assert_eq!(pg_count, 3);
+    // pg_count == pages.len() (no strip-trailing-None).
+    assert_eq!(pg_count, 4);
     assert_eq!(decoded[0], vec![0u8; page_size as usize]); // zero-filled
     assert_eq!(decoded[1], vec![0u8; page_size as usize]); // zero-filled
     assert_eq!(decoded[2], vec![0xABu8; page_size as usize]);
+    assert_eq!(decoded[3], vec![0u8; page_size as usize]); // trailing zero
 }
 
 #[test]
@@ -100,9 +108,11 @@ fn test_encode_page_group_large_data() {
     let encoded = test_encode(&pages, page_size);
     let (pg_count, _ps, decoded) = test_decode(&encoded);
 
-    assert_eq!(pg_count, 1);
+    // pg_count tracks pages.len(); trailing None becomes a zero page.
+    assert_eq!(pg_count, 2);
     assert_eq!(decoded[0].len(), page_size as usize);
     assert_eq!(decoded[0], big_page);
+    assert_eq!(decoded[1], vec![0u8; page_size as usize]);
 }
 
 #[test]
@@ -129,6 +139,39 @@ fn test_decode_empty_data() {
     assert!(result.is_err());
 }
 
+/// Regression: the encoder used to strip trailing `None` pages, but the
+/// decoder side iterates `manifest.group_page_nums(gid)` which records
+/// the full group size. When a real, in-bounds page (e.g., the 50th
+/// page of a group) was None at encode time — typically because the
+/// writer's local cache hadn't materialized it and S3 merge didn't fill
+/// it either — the encoder dropped it silently. The follower's decode
+/// loop hit `end > page_data.len()` and broke, leaving a hole at that
+/// page in the cache file. SQLite read the hole and reported "database
+/// disk image is malformed."
+///
+/// The fix: encoder emits exactly `pages.len()` pages, with zeros for
+/// `None`. This regression test pins it.
+#[test]
+fn encoder_does_not_strip_trailing_none_pages() {
+    let page_size = 4096u32;
+    let mut pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(50);
+    for i in 0..49 {
+        pages.push(Some(vec![(i + 1) as u8; page_size as usize]));
+    }
+    pages.push(None); // The 50th page — exactly the symptom in production.
+
+    let encoded = test_encode(&pages, page_size);
+    let (pg_count, _ps, decoded) = test_decode(&encoded);
+
+    assert_eq!(pg_count, 50, "encoder must emit pages.len() == 50, not 49");
+    assert_eq!(decoded.len(), 50);
+    assert_eq!(
+        decoded[49],
+        vec![0u8; page_size as usize],
+        "trailing None must round-trip as a zero page, never be stripped"
+    );
+}
+
 #[test]
 fn test_encode_decode_roundtrip_various_page_sizes() {
     for page_size in [64u32, 256, 1024, 4096] {
@@ -145,11 +188,12 @@ fn test_encode_decode_roundtrip_various_page_sizes() {
         let (pg_count, ps, decoded) = test_decode(&encoded);
 
         assert_eq!(ps, page_size, "page_size mismatch for {}", page_size);
-        // Last non-None is index 2, so pg_count = 3
-        assert_eq!(pg_count, 3, "pg_count mismatch for {}", page_size);
+        // pg_count tracks pages.len() exactly — no trailing-None strip.
+        assert_eq!(pg_count, 4, "pg_count mismatch for {}", page_size);
         assert_eq!(decoded[0], vec![0u8; page_size as usize]);
         assert_eq!(decoded[1], vec![0u8; page_size as usize]); // None → zero
         assert_eq!(decoded[2], vec![2u8; page_size as usize]);
+        assert_eq!(decoded[3], vec![0u8; page_size as usize]); // trailing zero
     }
 }
 

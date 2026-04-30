@@ -172,7 +172,16 @@ pub fn import_sqlite_file(
     let mut index_leaf_pages: Vec<(u64, Vec<u8>)> = Vec::new();
 
     for (gid, page_nums) in group_pages_list.iter().enumerate() {
-        let mut pages: Vec<Option<Vec<u8>>> = vec![None; ppg as usize];
+        // Size to the manifest's actual entry count for this group.
+        // Previously this was sized to `ppg`, so short groups (BTreeAware
+        // packs many ≤ ppg) carried trailing None slots that the encoder
+        // used to strip. The encoder now emits `pages.len()` pages
+        // unconditionally, so trailing None turns into zero pages — a few
+        // extra bytes per short group at best, the symmetry-preserving
+        // correctness fix at worst. Sizing `pages` here means the encoder
+        // emits exactly `page_nums.len()` pages, matching what the
+        // manifest will record in `group_pages[gid]`.
+        let mut pages: Vec<Option<Vec<u8>>> = vec![None; page_nums.len()];
 
         for (idx, &pnum) in page_nums.iter().enumerate() {
             let mut buf = vec![0u8; page_size as usize];

@@ -33,12 +33,18 @@ pub(crate) fn encode_page_group(
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
     _encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
-    // Find last non-empty page to avoid trailing zeros
-    let page_count = pages
-        .iter()
-        .rposition(|p| p.is_some())
-        .map(|i| i + 1)
-        .unwrap_or(0) as u32;
+    // Emit exactly `pages.len()` pages — never strip trailing None.
+    //
+    // Why: callers (import.rs, handle.rs upload-on-change, compact.rs) hand us
+    // a `pages` slice sized to the manifest's `group_page_nums(gid).len()`,
+    // and the manifest records that same length. Any earlier strip-trailing-
+    // None optimization desynchronized encoder and manifest: when the last
+    // entry was a real, in-bounds page that the caller hadn't materialized
+    // (e.g., not yet in cache, S3 merge failed), the encoder dropped it
+    // silently and the follower's decode loop skipped the slot, leaving a
+    // hole in the cache file that SQLite reads as "database disk image is
+    // malformed." Trailing zeros compress to nothing; correctness wins.
+    let page_count = pages.len() as u32;
 
     // Build raw buffer: [u32 page_count][u32 page_size][page bytes...]
     let header_len = 8; // 2 × u32
@@ -92,12 +98,12 @@ pub(crate) fn encode_page_group_seekable(
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
     _encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(Vec<u8>, Vec<FrameEntry>)> {
-    // Find last non-empty page to avoid trailing zeros
-    let page_count = pages
-        .iter()
-        .rposition(|p| p.is_some())
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    // Emit exactly `pages.len()` pages — never strip trailing None. See the
+    // detailed rationale on `encode_page_group` above; the same correctness
+    // invariant applies to seekable groups (and the per-group hole bug bites
+    // even harder here because the frame_table indexes into a buffer the
+    // decoder later trusts to contain `group_page_nums.len()` entries).
+    let page_count = pages.len();
 
     let num_frames = (page_count + sub_ppg as usize - 1) / sub_ppg as usize;
     let mut blob = Vec::new();
