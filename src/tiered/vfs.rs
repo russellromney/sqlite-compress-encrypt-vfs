@@ -933,6 +933,14 @@ impl TurboliteVfs {
         Ok((decoded.manifest, decoded.walrust))
     }
 
+    /// Clone of the VFS-level replay gate. Higher layers (haqlite-turbolite
+    /// follower apply) take the write half around out-of-band cache writes
+    /// like `materialize_to_file` so in-flight VFS reads (which take the
+    /// read half on `xLock(SHARED)`) cannot observe a torn cache file.
+    pub fn replay_gate(&self) -> Arc<parking_lot::RwLock<()>> {
+        Arc::clone(&self.replay_gate)
+    }
+
     /// Fetch the latest manifest from the backend and apply it via `set_manifest`.
     /// Returns the new manifest version, or None if no manifest exists.
     /// Used by HA followers to catch up from the leader's turbolite state.

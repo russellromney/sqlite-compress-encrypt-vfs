@@ -682,9 +682,39 @@ impl TurboliteSharedState {
     }
 
     /// Materialize the full database from backend page groups into a local
-    /// SQLite file. Returns the manifest's change_counter for walrust replay.
+    /// SQLite file using the VFS's current `shared_manifest`. Convenience
+    /// wrapper around [`materialize_manifest_to_file`] for callers that
+    /// have already adopted the target manifest via `set_manifest_bytes`.
     pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
         let manifest = (**self.shared_manifest.load()).clone();
+        self.materialize_manifest_to_file(&manifest, output)
+    }
+
+    /// Materialize the full database from backend page groups into a local
+    /// SQLite file using the supplied `manifest` directly. Returns the
+    /// manifest's change_counter for walrust replay.
+    ///
+    /// Decoupled from `shared_manifest` so callers can materialize a
+    /// candidate manifest BEFORE committing it to the live VFS. The
+    /// follower apply path uses this to keep the VFS untouched until
+    /// the page-group fetches have all succeeded — a missing-group race
+    /// against the leader's publish then leaves the live cache in its
+    /// previous (still-valid) state instead of half-applied.
+    ///
+    /// Pre-flights ALL page-group fetches before opening the output file.
+    /// `File::create` truncates the existing file via `O_TRUNC`, so any
+    /// reader holding an open fd to the old `data.cache` would see an
+    /// empty file the moment we truncate. If a fetch then failed
+    /// mid-loop, the cache would stay in that empty state until a later
+    /// successful materialize overwrote it. By staging all decoded
+    /// page-bytes in memory first, a missing-group / fetch / decode
+    /// failure returns BEFORE the truncate and leaves the existing
+    /// cache untouched.
+    pub fn materialize_manifest_to_file(
+        &self,
+        manifest: &Manifest,
+        output: &std::path::Path,
+    ) -> io::Result<u64> {
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
 
@@ -703,10 +733,6 @@ impl TurboliteSharedState {
             manifest.version,
         );
 
-        let file = std::fs::File::create(output)?;
-        let total_size = page_count * page_size as u64;
-        file.set_len(total_size)?;
-
         let keys_with_gids: Vec<(u64, String)> = manifest
             .page_group_keys
             .iter()
@@ -718,6 +744,12 @@ impl TurboliteSharedState {
         let batch_size = 50;
         let total = keys_with_gids.len();
         let use_seekable = manifest.sub_pages_per_frame > 0;
+        let ps = page_size as usize;
+
+        // Stage all decoded page writes in memory first. Format:
+        // (offset_in_file, bytes). Hard-error on any fetch / missing /
+        // decode failure BEFORE touching the output file.
+        let mut staged_writes: Vec<(u64, Vec<u8>)> = Vec::new();
 
         for (batch_idx, batch) in keys_with_gids.chunks(batch_size).enumerate() {
             let key_strs: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
@@ -731,11 +763,18 @@ impl TurboliteSharedState {
                 let pg_data = match data_map.get(key) {
                     Some(d) => d,
                     None => {
-                        eprintln!(
-                            "[materialize] WARNING: missing object for group {} key {}",
-                            gid, key
-                        );
-                        continue;
+                        // Hard error before any cache mutation: leader
+                        // publish may have raced the page-group upload,
+                        // or a higher version's churn may have re-keyed
+                        // the object. Caller retries on next poll.
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "materialize: missing page-group object for group {} key {} \
+                                 (manifest v{}); leader publish may race the upload, retry on next poll",
+                                gid, key, manifest.version
+                            ),
+                        ));
                     }
                 };
 
@@ -767,7 +806,6 @@ impl TurboliteSharedState {
                     pages.into_iter().flatten().collect()
                 };
 
-                let ps = page_size as usize;
                 for (i, &pnum) in page_nums.iter().enumerate() {
                     if pnum >= page_count {
                         break;
@@ -775,13 +813,26 @@ impl TurboliteSharedState {
                     let start = i * ps;
                     let end = start + ps;
                     if end <= decoded_pages.len() {
-                        file.write_all_at(&decoded_pages[start..end], pnum * page_size as u64)?;
+                        staged_writes.push((
+                            pnum * page_size as u64,
+                            decoded_pages[start..end].to_vec(),
+                        ));
                     }
                 }
             }
 
             let done = std::cmp::min((batch_idx + 1) * batch_size, total);
             eprintln!("[materialize] downloaded {}/{} page groups", done, total);
+        }
+
+        // All fetches/decodes succeeded. Now safe to truncate and
+        // rewrite the output file: any failure here is a real I/O
+        // error on a healthy backend, not a transient publish race.
+        let file = std::fs::File::create(output)?;
+        let total_size = page_count * page_size as u64;
+        file.set_len(total_size)?;
+        for (offset, bytes) in &staged_writes {
+            file.write_all_at(bytes, *offset)?;
         }
 
         eprintln!(

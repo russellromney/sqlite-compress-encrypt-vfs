@@ -391,7 +391,24 @@ impl ReplayHandle {
     /// of already-present pages). Inter-page atomicity for in-flight
     /// SQLite read transactions requires a separate xLock-scoped
     /// gate not yet wired here.
-    pub fn finalize(mut self) -> io::Result<FinalizeReport> {
+    pub fn finalize(self) -> io::Result<FinalizeReport> {
+        self.finalize_inner(/* external_write_held = */ false)
+    }
+
+    /// Variant of `finalize` for callers that already hold
+    /// `replay_gate.write()`. Skips the internal write-lock take so
+    /// the apply path can keep the gate held across an outer
+    /// critical section (e.g. `materialize_to_file` followed by
+    /// replay) without recursive locking — `parking_lot::RwLock`
+    /// would deadlock on a re-take.
+    ///
+    /// Caller MUST hold the write lock returned by
+    /// `TurboliteVfs::replay_gate()` for the duration of this call.
+    pub fn finalize_assuming_external_write(self) -> io::Result<FinalizeReport> {
+        self.finalize_inner(/* external_write_held = */ true)
+    }
+
+    fn finalize_inner(mut self, external_write_held: bool) -> io::Result<FinalizeReport> {
         self.check_not_consumed("finalize")?;
         // Mark consumed early: even on Err the handle is dead.
         self.consumed = true;
@@ -482,7 +499,11 @@ impl ReplayHandle {
         // 3. Take `flush_lock` so we serialise against any concurrent
         //    `flush_to_storage` over the same staging logs / dirty
         //    groups.
-        let _replay_write_guard = self.ctx.replay_gate.write();
+        let _replay_write_guard = if external_write_held {
+            None
+        } else {
+            Some(self.ctx.replay_gate.write())
+        };
         self.ctx
             .replay_epoch
             .fetch_add(1, Ordering::AcqRel);
