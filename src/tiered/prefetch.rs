@@ -163,7 +163,7 @@ impl PrefetchPool {
                     let fetch_ms = fetch_start.elapsed().as_millis();
 
                     let Some(pg_data) = pg_data else {
-                        cache.unclaim_group(gid);
+                        cache.unclaim_if_fetching(gid);
                         finish(gid);
                         continue;
                     };
@@ -214,7 +214,7 @@ impl PrefetchPool {
                             "[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
                             gid, job.manifest_version, current_version,
                         );
-                        cache.unclaim_group(gid);
+                        cache.unclaim_if_fetching(gid);
                         finish(gid);
                         continue;
                     }
@@ -234,7 +234,7 @@ impl PrefetchPool {
                             "[prefetch] gid={} replay epoch advanced ({} -> {}), discarding stale fetch",
                             gid, job.replay_epoch_at_submit, current_epoch,
                         );
-                        cache.unclaim_group(gid);
+                        cache.unclaim_if_fetching(gid);
                         finish(gid);
                         continue;
                     }
@@ -260,7 +260,7 @@ impl PrefetchPool {
                         if !shutdown.load(Ordering::Acquire) {
                             eprintln!("[prefetch] gid={} write error: {}", gid, e);
                         }
-                        cache.unclaim_group(gid);
+                        cache.unclaim_if_fetching(gid);
                         finish(gid);
                         continue;
                     }

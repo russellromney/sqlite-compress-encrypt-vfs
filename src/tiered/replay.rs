@@ -2080,6 +2080,39 @@ mod tests {
         );
     }
 
+    /// Source-level assertion: PrefetchPool worker stale/error
+    /// paths must use `unclaim_if_fetching` (the CAS variant) and
+    /// not the unconditional `unclaim_group`. Without this every
+    /// future reader of prefetch.rs has to verify the property by
+    /// eye; an automated check fails loudly the moment a regression
+    /// reintroduces the unconditional call.
+    ///
+    /// Strips line comments before the check so a comment
+    /// mentioning `unclaim_group(gid)` (e.g. for documentation
+    /// purposes) does not trip the test.
+    #[test]
+    fn prefetch_worker_only_uses_unclaim_if_fetching_on_stale_paths() {
+        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/tiered/prefetch.rs");
+        let src = std::fs::read_to_string(&src_path)
+            .expect("read prefetch.rs source for static assertion");
+        let stripped: String = src
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !stripped.contains("unclaim_group("),
+            "PrefetchPool source must not call unconditional unclaim_group(...) \
+             on stale/error paths. Use unclaim_if_fetching(...) instead so a \
+             stale worker that resumes after replay finalize set the group's \
+             state to Present cannot stomp it back to None."
+        );
+    }
+
     /// PrefetchPool worker error/stale paths use the same CAS
     /// `unclaim_if_fetching` primitive as the eager-fetch path.
     /// Reproduce the worker's stale-detection sequence directly:
