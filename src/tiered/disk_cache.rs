@@ -1321,6 +1321,29 @@ impl DiskCache {
         self.group_condvar.notify_all();
     }
 
+    /// CAS-style unclaim: only transitions `Fetching` → `None` and
+    /// leaves any other state alone. Use this when the caller may
+    /// race with another writer that legitimately advances the
+    /// state to `Present` (for example, replay finalize calling
+    /// `mark_pages_present` while a stale prefetch is still in
+    /// flight). An unconditional `unclaim_group` in that race would
+    /// undo `Present` → `None`, forcing an unnecessary re-fetch
+    /// that could overwrite freshly-installed bytes with stale ones.
+    pub(crate) fn unclaim_if_fetching(&self, gid: u64) -> bool {
+        let states = self.group_states.lock();
+        if let Some(s) = states.get(gid as usize) {
+            let result = s.compare_exchange(
+                GroupState::Fetching as u8,
+                GroupState::None as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            self.group_condvar.notify_all();
+            return result.is_ok();
+        }
+        false
+    }
+
     pub(crate) fn ensure_group_states_capacity(
         &self,
         states: &parking_lot::MutexGuard<'_, Vec<std::sync::atomic::AtomicU8>>,

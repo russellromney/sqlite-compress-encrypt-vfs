@@ -1991,6 +1991,141 @@ mod tests {
         );
     }
 
+    /// Eager group-0 fetch in `TurboliteHandle::new_tiered` now
+    /// uses the same epoch+read-gate primitive as PrefetchPool, via
+    /// `TurboliteHandle::install_pages_under_replay_gate`. Drive
+    /// that helper directly: capture an epoch, run finalize so the
+    /// epoch advances, then call the helper with the captured value.
+    /// Assert the helper SKIPS the install closure (no cache write
+    /// happens, group is unclaimed). Without the helper a freshly
+    /// opening connection would race finalize and overwrite
+    /// replayed bytes.
+    #[test]
+    fn install_pages_under_replay_gate_skips_when_epoch_advanced() {
+        use crate::tiered::TurboliteHandle;
+
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let gate = vfs_replay_gate(&vfs);
+        let epoch = vfs_replay_epoch(&vfs);
+
+        // Seed page 0 as present with bytes A.
+        let pre_bytes = vec![0xAAu8; page_size as usize];
+        cache.write_page(0, &pre_bytes).unwrap();
+
+        // Capture the epoch the way `new_tiered` does before its
+        // backend fetch.
+        let captured = epoch.load(Ordering::Acquire);
+
+        // Run a real replay finalize that bumps the epoch and writes
+        // post-replay bytes to page 0.
+        let post_bytes = vec![0xBBu8; page_size as usize];
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &post_bytes).unwrap();
+        handle.commit_changeset(1).unwrap();
+        handle.finalize().unwrap();
+
+        // The eager-fetch path arrives late with stale bytes. We
+        // bypass the try_claim_group precondition the production
+        // path does — the helper does not depend on the claim, only
+        // on the epoch. (Production sequence: claim → fetch → call
+        // helper. If finalize stomped state to Present in between,
+        // the helper's CAS-aware skip path leaves it alone.)
+        let install_ran = std::sync::atomic::AtomicBool::new(false);
+        let stale_bytes = vec![0xCCu8; page_size as usize];
+        let installed = TurboliteHandle::install_pages_under_replay_gate(
+            &cache,
+            0,
+            &gate,
+            &epoch,
+            captured,
+            || {
+                // If we ever get here, we'd write the stale bytes —
+                // exactly what the helper is supposed to prevent.
+                let _ = cache.write_page(0, &stale_bytes);
+                install_ran.store(true, Ordering::Release);
+            },
+        );
+
+        assert!(
+            !installed,
+            "helper must report install was skipped when the epoch advanced"
+        );
+        assert!(
+            !install_ran.load(Ordering::Acquire),
+            "the install closure must not have executed when the epoch advanced"
+        );
+
+        // Disk must still hold the post-replay bytes (the helper
+        // skipped the stale write).
+        let cache_path = vfs.cache_file_path();
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            buf, post_bytes,
+            "post-replay bytes must remain visible after a stale eager fetch is dropped"
+        );
+
+        // Group 0's state must remain Present (replay's claim).
+        // The earlier unconditional `unclaim_group` would have set
+        // it back to None, forcing a re-fetch that could re-install
+        // stale bytes. The CAS-aware unclaim leaves Present alone.
+        assert_eq!(
+            cache.group_state(0),
+            crate::tiered::GroupState::Present,
+            "group 0 must remain Present after a stale eager fetch is dropped"
+        );
+    }
+
+    /// Mirror of the above for the success case: when the epoch has
+    /// NOT advanced between capture and helper call, the install
+    /// closure runs and the helper returns true.
+    #[test]
+    fn install_pages_under_replay_gate_runs_when_epoch_matches() {
+        use crate::tiered::TurboliteHandle;
+
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let gate = vfs_replay_gate(&vfs);
+        let epoch = vfs_replay_epoch(&vfs);
+
+        let captured = epoch.load(Ordering::Acquire);
+
+        // Use a never-touched page far from any real workload to
+        // avoid colliding with the import seed.
+        let target_page: u64 = 64;
+        let bytes = vec![0xEEu8; page_size as usize];
+        let install_ran = std::sync::atomic::AtomicBool::new(false);
+        let installed = TurboliteHandle::install_pages_under_replay_gate(
+            &cache,
+            0,
+            &gate,
+            &epoch,
+            captured,
+            || {
+                let _ = cache.write_page(target_page, &bytes);
+                install_ran.store(true, Ordering::Release);
+            },
+        );
+        assert!(installed, "helper must report install ran on epoch match");
+        assert!(
+            install_ran.load(Ordering::Acquire),
+            "the install closure must have executed when the epoch matches"
+        );
+
+        let cache_path = vfs.cache_file_path();
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, target_page * page_size as u64)
+            .unwrap();
+        assert_eq!(buf, bytes, "install closure's bytes must land on disk");
+    }
+
     /// `publish_replayed_base` returns hybrid manifest bytes that
     /// round-trip through `decode_manifest_bytes` and carry the
     /// supplied walrust cursor and prefix.

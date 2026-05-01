@@ -190,6 +190,7 @@ impl TurboliteHandle {
         evict_on_checkpoint: bool,
         is_local: bool,
         replay_gate: Arc<parking_lot::RwLock<()>>,
+        replay_epoch: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = (**shared_manifest.load()).clone();
@@ -198,9 +199,19 @@ impl TurboliteHandle {
         // Eagerly fetch page group 0 on open. Group 0 holds SQLite's schema +
         // root page (page 1), which is hit on every connection open, so the
         // round-trip is load-bearing. Interior and index chunk bundles are NOT
-        // fetched eagerly (Phase Cirrus d): they come in as cache misses on
-        // first query like any other page group. In local mode (is_local=true)
-        // nothing is prefetched; the local page-group files back the reads.
+        // fetched eagerly: they come in as cache misses on first query like
+        // any other page group. In local mode (is_local=true) nothing is
+        // prefetched; the local page-group files back the reads.
+        //
+        // Direct hybrid page replay can run on this VFS at any time. The
+        // eager fetch captures the manifest at line 195 (a potentially stale
+        // snapshot) and writes its bytes into DiskCache below. Without
+        // serialisation, replay finalize that lands between the snapshot and
+        // the write would be silently overwritten by stale eager-fetch bytes.
+        // Use the same epoch+read-gate primitive as PrefetchPool: capture
+        // `replay_epoch` before the fetch, take `replay_gate.read()` for the
+        // cache-write critical section, re-check the epoch under the lock.
+        // If finalize ran in between, drop the eager fetch without writing.
         if !is_local {
             let storage_ref = storage
                 .as_ref()
@@ -213,26 +224,24 @@ impl TurboliteHandle {
                 if let Some(key) = manifest.page_group_keys.first() {
                     if !key.is_empty() {
                         if cache.try_claim_group(0) {
+                            // Capture replay epoch BEFORE the fetch so a
+                            // finalize racing between this point and the
+                            // cache write is detected.
+                            let captured_epoch =
+                                replay_epoch.load(std::sync::atomic::Ordering::Acquire);
                             if let Ok(Some(pg_data)) = storage_helpers::get_page_group(
                                 storage_ref.as_ref(),
                                 runtime_ref,
                                 key,
                             ) {
-                                let ft = manifest.frame_tables.first().map(|v| v.as_slice());
-                                let gp0 = manifest.group_page_nums(0);
-                                let _ = Self::decode_and_cache_group_static(
-                                    &cache,
-                                    &pg_data,
-                                    &gp0,
-                                    0, // gid
-                                    manifest.page_size,
-                                    manifest.page_count,
-                                    ft,
-                                    #[cfg(feature = "zstd")]
-                                    dictionary,
-                                    encryption_key.as_ref(),
-                                );
-                                // Apply overrides for group 0
+                                // Pre-fetch the override bytes outside the
+                                // read-gate critical section so the section
+                                // only contains the actual cache writes —
+                                // I/O remains parallel with concurrent
+                                // readers.
+                                let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> =
+                                    Vec::new();
+                                let gp0 = manifest.group_page_nums(0).into_owned();
                                 if let Some(overrides) = manifest.subframe_overrides.get(0) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
                                         let spf = manifest.sub_pages_per_frame as usize;
@@ -259,16 +268,17 @@ impl TurboliteHandle {
                                                         std::cmp::min(frame_start + spf, gp0.len());
                                                     if frame_end > frame_start {
                                                         let frame_page_nums =
-                                                            &gp0[frame_start..frame_end];
+                                                            gp0[frame_start..frame_end].to_vec();
                                                         let data_len = frame_page_nums.len()
                                                             * manifest.page_size as usize;
                                                         if data_len <= decompressed.len() {
-                                                            let _ = cache.write_pages_scattered(
+                                                            override_writes.push((
                                                                 frame_page_nums,
-                                                                &decompressed[..data_len],
-                                                                0,
+                                                                decompressed
+                                                                    [..data_len]
+                                                                    .to_vec(),
                                                                 frame_start as u32,
-                                                            );
+                                                            ));
                                                         }
                                                     }
                                                 }
@@ -276,15 +286,58 @@ impl TurboliteHandle {
                                         }
                                     }
                                 }
-                                cache.mark_group_present(0);
-                                cache.touch_group(0);
+
+                                let ft = manifest
+                                    .frame_tables
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let page_size = manifest.page_size;
+                                let page_count_local = manifest.page_count;
+                                #[cfg(feature = "zstd")]
+                                let dict_for_install = dictionary;
+
+                                Self::install_pages_under_replay_gate(
+                                    &cache,
+                                    0,
+                                    &replay_gate,
+                                    &replay_epoch,
+                                    captured_epoch,
+                                    || {
+                                        let _ = Self::decode_and_cache_group_static(
+                                            &cache,
+                                            &pg_data,
+                                            &gp0,
+                                            0,
+                                            page_size,
+                                            page_count_local,
+                                            if ft.is_empty() { None } else { Some(ft.as_slice()) },
+                                            #[cfg(feature = "zstd")]
+                                            dict_for_install,
+                                            encryption_key.as_ref(),
+                                        );
+                                        for (page_nums, bytes, frame_start) in &override_writes {
+                                            let _ = cache.write_pages_scattered(
+                                                page_nums,
+                                                bytes,
+                                                0,
+                                                *frame_start,
+                                            );
+                                        }
+                                        cache.mark_group_present(0);
+                                        cache.touch_group(0);
+                                    },
+                                );
+                            } else {
+                                // Fetch failed or returned None. Release
+                                // the claim so a future open can retry.
+                                cache.unclaim_group(0);
                             }
                         }
                     }
                 }
             }
-        } // end non-local eager fetch block (group 0 only; interior + index
-          // bundles removed in Phase Cirrus d)
+        } // end non-local eager fetch block (group 0 only)
 
         #[cfg(feature = "zstd")]
         let (encoder_dict, decoder_dict) = match dictionary {
@@ -475,6 +528,43 @@ impl TurboliteHandle {
         if copy_len < buf.len() {
             buf[copy_len..].fill(0);
         }
+    }
+
+    /// Run a cache-mutation closure under the replay gate's read
+    /// lock, after re-checking that the replay epoch has not
+    /// advanced since `captured_epoch`. If it has, replay finalize
+    /// installed new bytes for these pages and the caller's bytes
+    /// are stale; the closure is skipped, the group is unclaimed,
+    /// and the function returns `false`. If it has not, the
+    /// closure runs while the read lock is held (so finalize
+    /// cannot interleave between the check and the writes) and
+    /// the function returns `true`.
+    ///
+    /// Used by the eager group-0 fetch in `new_tiered` and any
+    /// other non-PrefetchPool background cache-writer path that
+    /// captures bytes against a manifest snapshot. PrefetchPool's
+    /// worker inlines the same primitive directly.
+    pub(crate) fn install_pages_under_replay_gate(
+        cache: &DiskCache,
+        gid: u64,
+        replay_gate: &parking_lot::RwLock<()>,
+        replay_epoch: &std::sync::atomic::AtomicU64,
+        captured_epoch: u64,
+        install: impl FnOnce(),
+    ) -> bool {
+        let _read_guard = replay_gate.read();
+        let current = replay_epoch.load(std::sync::atomic::Ordering::Acquire);
+        if current != captured_epoch {
+            // CAS Fetching → None so we don't stomp on a Present
+            // state that finalize (or another writer) legitimately
+            // installed while we were fetching. Unconditional
+            // unclaim here would force a re-fetch and could put
+            // stale bytes back over replayed ones.
+            cache.unclaim_if_fetching(gid);
+            return false;
+        }
+        install();
+        true
     }
 
     /// Decode a page group and write all pages to the cache file.

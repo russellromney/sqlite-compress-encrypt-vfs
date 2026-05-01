@@ -1337,6 +1337,7 @@ impl Vfs for TurboliteVfs {
                 self.config.cache.evict_on_checkpoint,
                 self.is_local,
                 Arc::clone(&self.replay_gate),
+                Arc::clone(&self.replay_epoch),
             )
         } else {
             if let Some(parent) = path.parent() {
