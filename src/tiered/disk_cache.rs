@@ -787,7 +787,7 @@ impl DiskCache {
         if self.cache_compression {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (Phase 004 cinch-cloud SingleWriter does not enable compression)",
+                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (SingleWriter consumers do not enable compression)",
             ));
         }
 
@@ -1706,9 +1706,8 @@ impl DiskCache {
     }
 
     /// Mark an explicit set of pages present in the bitmap and their
-    /// owning groups Present. Used by direct-hybrid-page-replay
-    /// (Phase 004) so that finalize doesn't have to mark every page
-    /// in the database — only the ones it actually wrote.
+    /// owning groups Present. Sibling of `mark_all_pages_present` for
+    /// callers that only want to mark a subset.
     pub(crate) fn mark_pages_present(&self, page_nums: &[u64]) {
         if page_nums.is_empty() {
             return;

@@ -1,33 +1,25 @@
 //! Direct hybrid page replay handle.
 //!
-//! Phase 004 (cinch-cloud `direct-hybrid-page-replay`): lets a caller
-//! (haqlite-turbolite, where the SQLite base lives in Turbolite's
-//! tiered cache and the WAL deltas live in walrust) feed decoded
-//! HADBP physical pages straight into Turbolite without staging
-//! through a temporary SQLite file.
+//! Lets a caller feed decoded physical pages (from an external WAL
+//! delta source) straight into Turbolite without staging through a
+//! temporary SQLite file.
 //!
 //! Lifecycle:
 //! - `TurboliteVfs::begin_replay()` returns a fresh `ReplayHandle`.
 //! - The caller drives `apply_page` (any number) +
 //!   `commit_changeset(seq)` (per discovered changeset).
-//! - On success, `finalize` atomically installs the staged pages into
-//!   the live cache, emits a staging log under `pending_flushes` so a
-//!   later `flush_to_storage` / `publish_replayed_base` will turn
-//!   them into uploaded page groups, and returns a per-cycle
-//!   `FinalizeReport` (telemetry only — the publish input is the
-//!   accumulated VFS state, not this report).
+//! - On success, `finalize` installs the staged pages into the live
+//!   cache, emits a staging log under `pending_flushes` so a later
+//!   `flush_to_storage` will turn them into uploaded page groups,
+//!   and returns a per-cycle `FinalizeReport` (telemetry; not a
+//!   publish input — accumulated VFS state is the source of truth).
 //! - On failure, `abort` drops the in-memory staging map without
 //!   touching the live cache.
 //!
-//! Page id contract: `apply_page` accepts the SQLite 1-based
-//! `sqlite_page_id` from the HADBP changeset and converts to a
-//! Turbolite zero-based `page_num` internally
-//! (`page_num = sqlite_page_id - 1`). Page id `0` is rejected.
-//!
-//! This commit (2a) lands the API surface and the staging-log
-//! integration. The xLock-scoped read/write gate that gives query-level
-//! atomicity (Plan Review 3 B7+B8) and the replay-epoch protecting
-//! background cache writers (Plan Review 4 B13) ship in commit 2b.
+//! Page id contract: `apply_page` accepts a SQLite 1-based
+//! `sqlite_page_id` and converts to a Turbolite zero-based
+//! `page_num` internally (`page_num = sqlite_page_id - 1`). Page id
+//! `0` is rejected.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -77,11 +69,6 @@ enum RollbackOutcome {
 ///   it). Taint the cache so subsequent reads fail loudly until
 ///   the process restarts. Surface the primary error annotated
 ///   with the rollback failure list.
-///
-/// This is the explicit success/failure contract Plan Review
-/// post-2a-fix-3 (B22) called for. Without it, a rollback failure
-/// would silently delete the only recovery artifact and leave the
-/// cache serving torn data.
 fn handle_commit_phase_failure(
     cache: &DiskCache,
     pre_images: &[(u64, Vec<u8>)],
@@ -239,9 +226,9 @@ pub struct FinalizeReport {
 pub(crate) struct ReplayContext {
     pub cache: Arc<DiskCache>,
     pub shared_manifest: Arc<ArcSwap<Manifest>>,
-    /// VFS-level page count atomic. Plan Review post-2a B15: kept in
-    /// sync with `manifest.page_count` so PrefetchPool and other
-    /// non-manifest consumers see replay growth.
+    /// VFS-level page count atomic. Kept in sync with
+    /// `manifest.page_count` so PrefetchPool and other non-manifest
+    /// consumers see replay growth.
     pub vfs_page_count: Arc<AtomicU64>,
     pub pending_flushes: Arc<Mutex<Vec<PendingFlush>>>,
     pub staging_seq: Arc<AtomicU64>,
@@ -340,71 +327,54 @@ impl ReplayHandle {
         Ok(())
     }
 
-    /// Atomically install staged pages into the live cache and emit
-    /// the staging log so the next `flush_to_storage` /
-    /// `publish_replayed_base` uploads them as Turbolite page groups.
+    /// Install staged pages into the live cache and emit the staging
+    /// log so the next `flush_to_storage` uploads them as Turbolite
+    /// page groups.
     ///
-    /// Atomicity model (Plan Review post-2a B14, narrowed by post-2a
-    /// fix-B18):
+    /// Splits into a **pre-flight** phase (all fallible file I/O, no
+    /// live state mutation) and a **commit** phase (live state
+    /// mutation, with single-page-pwrite atomicity at the hardware
+    /// level, bitmap-gated visibility for newly-allocated pages, and
+    /// pre-image rollback for overwrites of already-present pages).
     ///
-    /// finalize splits into a **pre-flight** phase (all fallible file
-    /// I/O, no live state mutation) and a **commit** phase (live
-    /// state mutation, with single-page-pwrite atomicity at the
-    /// hardware level and bitmap-gated visibility for the install).
-    ///
-    /// Pre-flight phase — fallible, no live mutation:
+    /// Pre-flight (no live mutation):
     /// 1. Snapshot pre-state and compute growth.
-    /// 2. Compute the post-replay manifest snapshot.
+    /// 2. Compute the post-replay manifest snapshot (page_count,
+    ///    group_pages extension, db_header refresh, version bump).
     /// 3. Open a `StagingWriter`, append every staged page + the
     ///    post-replay manifest trailer, fsync. On any failure remove
-    ///    the partial file and return Err. The live cache, bitmap,
-    ///    manifest, and `pending_flushes` are untouched.
+    ///    the partial file and return Err. Live state untouched.
     ///
-    /// Commit phase — gated by `flush_lock`:
-    /// 4. Write each `(page_num, bytes)` to `data.cache` via
-    ///    `cache.write_page_no_visibility` — pwrite only, no bitmap
-    ///    mark, no `mem_cache` update. If any write fails partway:
-    ///    - bytes at written offsets exist on disk, but **the bitmap
-    ///      was never updated** for any of them, so the new bytes
-    ///      are unreachable through the VFS read path (reads gate on
-    ///      the bitmap; pages without a present bit fall through to
-    ///      backend fetch). For pages that **were** already present
-    ///      pre-replay, mem_cache still holds the old bytes (never
-    ///      updated by the raw write), so reads via mem_cache still
-    ///      see the old state.
-    ///    - delete the staging log file (no spurious recovery), return
-    ///      Err. The manifest is still pre-replay; nothing published.
+    /// Commit (gated by `flush_lock`):
+    /// 4. For each staged page: capture the pre-image into a buffer
+    ///    if the page was already marked present, then
+    ///    `cache.write_page_no_visibility` (pwrite only, no bitmap,
+    ///    no mem_cache). On any failure: roll back captured
+    ///    pre-images via `write_page_no_visibility_rollback`. If
+    ///    rollback succeeds, delete the staging log and return Err.
+    ///    If rollback partially fails, KEEP the staging log for
+    ///    restart-time recovery and TAINT the cache so subsequent
+    ///    reads fail loudly.
     /// 5. Clear stale `mem_cache` entries for replayed pages, mark
     ///    replayed bits present, bump cache generation. After this
     ///    step the replayed pages become visible.
-    /// 6. ArcSwap shared_manifest to post-replay (page_count,
-    ///    db_header). Update vfs_page_count atomic so PrefetchPool
-    ///    sees growth.
+    /// 6. Atomically swap in the post-replay manifest. Update the
+    ///    VFS-level page_count atomic.
     /// 7. Push `PendingFlush` so the next flush uploads the new
     ///    page groups.
-    /// 8. Persist the bitmap. Failure here is recoverable on restart
-    ///    via the bitmap's existing rebuild-from-cache logic; we
-    ///    surface the error to the caller but in-memory state is
-    ///    consistent.
+    /// 8. Persist the bitmap. Failure here is recoverable on next
+    ///    open via the existing bitmap rebuild path; surfaced to the
+    ///    caller for visibility.
     ///
-    /// **Atomicity scope.** Step 4 + step 5 give per-page atomicity
-    /// (single pwrite is OS-atomic at page-aligned offsets) and a
-    /// bitmap-gate that makes mid-batch failure invisible to readers
-    /// — replayed pages either all become visible together (success)
-    /// or none of them become visible (failure). What this commit
-    /// does **not** yet give is **inter-page atomicity for in-flight
-    /// SQLite read transactions**: a read that started before
-    /// finalize could observe pages from before the bitmap flip on
-    /// some pages and after the flip on others. The xLock-scoped gate
-    /// that closes that window ships in commit 2b (Plan Review 3 B8).
-    /// This is the same constraint the pre-existing
-    /// `replace_cache_from_sqlite_file` path has; not a regression.
+    /// Atomicity scope: per-page pwrite is OS-atomic; mid-batch
+    /// failure is hidden from readers either by the bitmap gate
+    /// (newly-allocated pages) or by pre-image rollback (overwrites
+    /// of already-present pages). Inter-page atomicity for in-flight
+    /// SQLite read transactions requires a separate xLock-scoped
+    /// gate not yet wired here.
     pub fn finalize(mut self) -> io::Result<FinalizeReport> {
         self.check_not_consumed("finalize")?;
-        // Mark consumed early: even on Err the handle is dead, and
-        // the upstream walrust driver will not call abort() on the
-        // Turbolite handle directly (the haqlite-turbolite adapter
-        // owns its own state machine; abort goes through the adapter).
+        // Mark consumed early: even on Err the handle is dead.
         self.consumed = true;
 
         let installed_pages_in_this_cycle: BTreeSet<u64> = self.staged.keys().copied().collect();
@@ -417,11 +387,8 @@ impl ReplayHandle {
         let new_page_count = std::cmp::max(pre_page_count, self.max_sqlite_page_id as u64);
 
         if self.staged.is_empty() {
-            // Empty replay cycle. No pages, no growth. No-op publish
-            // path: caller (publish_replayed_base) still emits a
-            // hybrid manifest with the new walrust cursor. Plan
-            // Review 3 B9: covers "follower already caught up; promote
-            // anyway".
+            // Empty cycle. Caller may still publish a manifest with
+            // an advanced cursor for the no-pending-state case.
             return Ok(FinalizeReport {
                 installed_pages_in_this_cycle,
                 new_page_count,
@@ -429,16 +396,11 @@ impl ReplayHandle {
         }
 
         // 2. Compute the post-replay manifest. Includes page_count
-        //    growth, BTreeAware group-pages extension for any
-        //    newly-replayed pages, a refreshed db_header if page 0
-        //    was replayed (Plan Review post-2a B16), and an
-        //    incremented version so restart-time recovery
-        //    (vfs.rs:194-217) actually adopts the trailer manifest
-        //    instead of seeing trailer.version == loaded.version
-        //    and skipping it (Plan Review post-2a fix-4 B23).
-        //
-        //    The manifest is built but NOT yet stored; we publish it
-        //    atomically in step 6.
+        //    growth, group_pages extension for newly-replayed pages,
+        //    a refreshed db_header if page 0 was replayed, and an
+        //    incremented version so restart-time recovery adopts
+        //    the trailer manifest. Built but NOT yet stored; we
+        //    publish it atomically in step 6.
         let mut post_manifest = pre_manifest.clone();
         if new_page_count != pre_page_count {
             extend_for_growth(&mut post_manifest, pre_page_count, new_page_count);
@@ -454,22 +416,11 @@ impl ReplayHandle {
                 post_manifest.db_header = Some(page0.clone());
             }
         }
-        // Version bump (Plan Review post-2a fix-4 B23). This is the
-        // key signal recovery uses to decide a staging-log trailer
-        // is newer than the on-disk/remote manifest. Without this
-        // bump, restart after a tainted-cache scenario would replay
-        // the staging log's pages but skip its manifest changes —
-        // group_pages, page_index, db_header — leaving a fresh
-        // follower's flush_dirty_groups unable to resolve replayed
-        // pages via manifest.page_location and silently dropping
-        // them.
-        //
-        // Multiple back-to-back finalizes without an intervening
-        // flush each bump version monotonically. The next flush
-        // advances version once more (flush.rs:176
-        // `next_version = manifest_snap.version + 1`); the
-        // intermediate versions never reach remote storage, only
-        // shared_manifest in-memory.
+        // Version bump. Restart-time recovery only adopts a
+        // staging-log trailer manifest when its version is greater
+        // than the loaded one; bumping here ensures the trailer's
+        // group_pages, page_index, and db_header changes are
+        // adopted along with the page bytes.
         post_manifest.version = pre_manifest.version + 1;
 
         // 3. Pre-flight the staging log to disk. This is the most
@@ -577,8 +528,8 @@ impl ReplayHandle {
         // 6. Publish the post-replay manifest atomically. ArcSwap is
         //    infallible; after the store, readers loading the manifest
         //    see the new page_count and db_header. Update the VFS
-        //    page_count atomic too (Plan Review post-2a B15) so
-        //    PrefetchPool and other non-manifest consumers see growth.
+        //    page_count atomic too so PrefetchPool and other
+        //    non-manifest consumers see growth.
         self.ctx.shared_manifest.store(Arc::new(post_manifest));
         self.ctx
             .vfs_page_count
@@ -613,11 +564,11 @@ impl ReplayHandle {
     /// Pre-flight write of the staging log file. Fully fsync'd before
     /// returning; caller can rely on the on-disk bytes being durable.
     ///
-    /// Plan Review post-2a fix B19: the staging file path is computed
-    /// up front, so any failure between `StagingWriter::open` and the
-    /// final fsync removes the partial file. Without this cleanup, a
-    /// failed pre-flight could leave an orphan `<version>.log` for
-    /// restart recovery to mistake for a real checkpoint.
+    /// The expected file path is computed up front, so any failure
+    /// between `StagingWriter::open` and the final fsync removes the
+    /// partial file. Without this cleanup, a failed pre-flight could
+    /// leave an orphan `<version>.log` for restart recovery to
+    /// mistake for a real checkpoint.
     fn write_staging_log(
         &self,
         post_manifest: &Manifest,
@@ -855,9 +806,10 @@ mod tests {
     }
 
     /// Finalize emits a `PendingFlush` so a later flush picks up the
-    /// replayed pages. This is how `flush_dirty_groups` learns about
-    /// replay (Plan Review 4 B10 — group resolution via
-    /// `manifest.page_location` not positional shortcut).
+    /// replayed pages. `flush_dirty_groups` then resolves dirty
+    /// groups via `manifest.page_location` (rather than a positional
+    /// shortcut), which works for both Positional and BTreeAware
+    /// manifests.
     #[test]
     fn finalize_pushes_a_pending_flush() {
         let tmp = TempDir::new().unwrap();
@@ -882,8 +834,8 @@ mod tests {
 
     /// Two replay cycles back-to-back without an intervening publish
     /// each emit their own staging log; both stay pending until
-    /// flush. This is the Plan Review 4 B9 invariant — accumulated
-    /// state across cycles must survive until publish.
+    /// flush. Accumulated state across cycles must survive until
+    /// publish.
     #[test]
     fn two_cycles_accumulate_pending_flushes() {
         let tmp = TempDir::new().unwrap();
@@ -912,9 +864,9 @@ mod tests {
 
     /// finalize that runs with no staged pages is a valid no-op:
     /// returns a report with zero installed pages and the unchanged
-    /// page_count, does not enqueue a PendingFlush. This covers the
-    /// "follower already caught up; promote anyway" path Plan Review
-    /// 3 B9 named.
+    /// page_count, does not enqueue a PendingFlush. Caller may still
+    /// publish a manifest with an advanced cursor for the
+    /// no-pending-state case.
     #[test]
     fn finalize_with_no_pages_is_a_noop_publish() {
         let tmp = TempDir::new().unwrap();
@@ -934,9 +886,9 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a B15: replay growth must update the
-    /// VFS-level `page_count` atomic, not just the manifest, so
-    /// PrefetchPool and other non-manifest readers see the new size.
+    /// Replay growth must update the VFS-level `page_count` atomic,
+    /// not just the manifest, so PrefetchPool and other non-manifest
+    /// readers see the new size.
     #[test]
     fn finalize_growth_updates_vfs_page_count_atomic() {
         let tmp = TempDir::new().unwrap();
@@ -962,9 +914,9 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a B16: replaying SQLite page id 1 (turbolite
-    /// page 0) carries the new database header bytes. finalize must
-    /// refresh `manifest.db_header` so a fresh follower applying the
+    /// Replaying SQLite page id 1 (turbolite page 0) carries the new
+    /// database header bytes. finalize must refresh
+    /// `manifest.db_header` so a fresh follower applying the
     /// published manifest gets the post-replay header without
     /// re-fetching page 0.
     #[test]
@@ -1039,15 +991,14 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a B17: replay-driven growth against a
-    /// BTreeAware manifest must extend `group_pages` and rebuild
-    /// `page_index` so every replayed page resolves through
-    /// `manifest.page_location`. cinch tenants always go through
-    /// `import_sqlite_file` which produces BTreeAware manifests, so
-    /// this is the load-bearing growth path. Without this, replay
-    /// would either bail on growth (breaking failover) or silently
-    /// leave grown pages unindexed (`page_location` returns None,
-    /// flush_dirty_groups skips them, fresh follower misses data).
+    /// Replay-driven growth against a BTreeAware manifest must
+    /// extend `group_pages` and rebuild `page_index` so every
+    /// replayed page resolves through `manifest.page_location`.
+    /// `import_sqlite_file` produces BTreeAware manifests, so this
+    /// is the common growth path. Without it, replay would either
+    /// bail on growth or silently leave grown pages unindexed
+    /// (`page_location` returns None, `flush_dirty_groups` skips
+    /// them, a fresh follower misses data).
     #[test]
     fn finalize_growth_extends_btreeaware_group_pages_and_page_index() {
         let tmp = TempDir::new().unwrap();
@@ -1059,7 +1010,7 @@ mod tests {
         assert_eq!(
             pre_manifest.strategy,
             GroupingStrategy::BTreeAware,
-            "import_sqlite_file produces BTreeAware manifests; this is the path cinch tenants use"
+            "import_sqlite_file produces BTreeAware manifests"
         );
 
         let pre_page_count = pre_manifest.page_count;
@@ -1092,14 +1043,12 @@ mod tests {
         }
     }
 
-    /// Plan Review post-2a B14: a finalize whose pre-flight (the
-    /// staging-log write) fails must leave the live state untouched
-    /// — no PendingFlush, no manifest growth, no bitmap flip, no
-    /// page_count atomic bump. We force pre-flight failure by
-    /// pointing the staging dir at a path that conflicts with a
-    /// regular file (open() fails with NotADirectory), via the
-    /// public TurboliteVfs::begin_replay path's normal flow plus a
-    /// post-construction filesystem manipulation.
+    /// A finalize whose pre-flight (the staging-log write) fails
+    /// must leave the live state untouched — no PendingFlush, no
+    /// manifest growth, no bitmap flip, no page_count atomic bump.
+    /// Forces pre-flight failure by pointing the staging dir at a
+    /// path that conflicts with a regular file (open() fails with
+    /// NotADirectory).
     #[test]
     fn finalize_preflight_failure_leaves_live_state_untouched() {
         let tmp = TempDir::new().unwrap();
@@ -1166,12 +1115,10 @@ mod tests {
         v
     }
 
-    /// Plan Review post-2a fix-B18: the raw write helper
-    /// `write_page_no_visibility` must NOT touch the bitmap or
-    /// mem_cache. The reviewer's worry was that finalize's claimed
-    /// bitmap-gated atomicity was broken because `write_page`
-    /// already calls `bitmap_mark`. The fix uses a raw helper; this
-    /// test pins the helper's contract.
+    /// The raw write helper `write_page_no_visibility` must NOT
+    /// touch the bitmap or mem_cache. Pins the helper's contract:
+    /// finalize's bitmap-gated atomicity for newly-allocated pages
+    /// depends on this.
     #[test]
     fn write_page_no_visibility_does_not_flip_bitmap_or_touch_mem_cache() {
         let tmp = TempDir::new().unwrap();
@@ -1199,28 +1146,15 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a fix-B19: pre-flight failure after
-    /// `StagingWriter::open` succeeds (e.g. one or more append calls
-    /// or the manifest serialization fails) must remove the partial
-    /// staging file. This test forces a manifest-trailer
-    /// serialization failure indirectly via a successful open then
-    /// hijacks the directory before finalize's fsync runs — the
-    /// pattern the previous test
-    /// (`finalize_preflight_failure_leaves_live_state_untouched`)
-    /// uses, but here we additionally assert there's no stray
-    /// `<version>.log` left in the original staging directory.
-    ///
-    /// Note: the simplest reproducible failure shape is replacing
-    /// the staging dir with a regular file BEFORE begin_replay so
-    /// `StagingWriter::open` itself fails. That doesn't exercise the
-    /// "partial file left behind" cleanup. Instead we let the file
-    /// open succeed, then induce a manifest-encode failure by
-    /// poisoning the staging-dir as a regular file mid-finalize —
-    /// since `StagingWriter::open` opens the file then keeps it
-    /// open via BufWriter, replacing the dir doesn't fail open. We
-    /// fall back to a structural assertion: after any pre-flight
-    /// failure that triggered StagingWriter::open, no orphan log
-    /// remains.
+    /// Pre-flight failure after `StagingWriter::open` succeeds (or
+    /// any later append / manifest-encode / fsync step) must remove
+    /// the partial staging file so restart-time recovery does not
+    /// mistake it for a real checkpoint. The simplest reproducible
+    /// failure here is replacing the staging dir with a regular
+    /// file so `StagingWriter::open` itself fails — no file is
+    /// created. The cleanup path uses the expected path computed up
+    /// front, so it also removes a partial file in cases where open
+    /// succeeded and a later step failed.
     #[test]
     fn finalize_preflight_failure_removes_partial_staging_log() {
         let tmp = TempDir::new().unwrap();
@@ -1261,12 +1195,12 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a fix-B20: positional manifest growth must
-    /// stay positional. Bumping page_count is sufficient — touching
-    /// `group_pages` would let `build_page_index` auto-flip the
-    /// strategy to BTreeAware, after which existing pages stop
-    /// resolving through `page_location` because they were never
-    /// inserted into `page_index`.
+    /// Positional manifest growth must stay positional. Bumping
+    /// `page_count` is sufficient — touching `group_pages` would let
+    /// `build_page_index` auto-flip the strategy to BTreeAware,
+    /// after which existing pages stop resolving through
+    /// `page_location` because they were never inserted into
+    /// `page_index`.
     #[test]
     fn extend_for_growth_positional_does_not_flip_to_btreeaware() {
         use crate::tiered::config::GroupingStrategy;
@@ -1301,23 +1235,20 @@ mod tests {
         }
     }
 
-    /// Plan Review post-2a fix-3 (B21): the load-bearing test for
-    /// the atomicity contract. Replays new bytes onto a page that
-    /// is **already present** in the cache, injects a write failure
-    /// on the second page, asserts:
+    /// Atomicity contract for overwrites of already-present pages.
+    /// Replays new bytes onto a page that is already present in
+    /// the cache, injects a write failure on the second page, and
+    /// asserts:
     ///   1. finalize returns Err
-    ///   2. the first page (which had succeeded its forward write)
-    ///      reads back its OLD pre-replay bytes through the VFS read
-    ///      path (rollback worked)
-    ///   3. the bitmap is unchanged for already-present pages,
-    ///      mem_cache is unchanged, and no PendingFlush was queued
+    ///   2. the first page (which had its forward write succeed)
+    ///      reads back as its OLD pre-replay bytes (rollback worked)
+    ///   3. the bitmap is unchanged for already-present pages and
+    ///      no PendingFlush was queued
     ///   4. the staging log was deleted
     ///
-    /// Without pre-image rollback this test fails: the first page's
-    /// new bytes would be visible after Err. The earlier 2a-fix-2
-    /// claim that "bitmap-gate makes mid-batch failure invisible"
-    /// only holds for pages that were not previously present;
-    /// overwrites of already-present pages need explicit rollback.
+    /// The bitmap-gate alone only hides mid-batch failures for
+    /// pages that were not previously present. Overwrites of
+    /// already-present pages need explicit pre-image rollback.
     #[test]
     fn finalize_rolls_back_overwrites_of_already_present_pages_on_mid_batch_failure() {
         let tmp = TempDir::new().unwrap();
@@ -1419,9 +1350,7 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a fix-3 (B22): the rollback-failure
-    /// invariant. When pre-image rollback ITSELF fails, finalize
-    /// must:
+    /// When pre-image rollback itself fails, finalize must:
     ///   1. Return Err with a clear rollback-failure annotation.
     ///   2. KEEP the staging log on disk so restart-time recovery
     ///      can converge the cache.
@@ -1507,18 +1436,16 @@ mod tests {
         );
     }
 
-    /// Plan Review post-2a fix-4 (B23): the load-bearing
-    /// restart-recovery test. After a rollback-failure scenario
+    /// Restart-recovery contract. After a rollback-failure scenario
     /// leaves the cache tainted and the staging log on disk, a
     /// fresh VFS open at the same cache_dir must converge the cache
-    /// AND the manifest shape (page_count, group_pages,
-    /// page_index, db_header) to the post-replay state.
-    ///
-    /// The staging log's manifest trailer carries the post-replay
-    /// shape; recovery (vfs.rs:194-217) only adopts it when
-    /// `trailer.version > loaded.version`, so finalize bumps the
-    /// version (this commit's fix). Without the bump, recovery would
-    /// replay the bytes but skip the manifest changes.
+    /// AND the manifest shape (page_count, group_pages, page_index,
+    /// db_header) to the post-replay state. The staging log's
+    /// manifest trailer carries the post-replay shape; the
+    /// recovery code only adopts it when `trailer.version >
+    /// loaded.version`, so finalize bumps the version. Without the
+    /// bump, recovery would replay the bytes but skip the manifest
+    /// changes.
     #[test]
     fn finalize_rollback_failure_recovers_manifest_and_bytes_on_restart() {
         let tmp = TempDir::new().unwrap();
