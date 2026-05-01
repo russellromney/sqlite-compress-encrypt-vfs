@@ -224,13 +224,33 @@ pub(crate) struct DiskCache {
     /// Used for churn detection (>50% of cache evicted = high churn).
     pub(crate) stat_last_eviction_count: AtomicU64,
 
-    /// Test-only failure injection for `write_page_no_visibility`.
-    /// When the counter reaches zero, the next call returns Err.
-    /// Decremented atomically per call so tests can drive a failure
-    /// at an exact ordinal write within a replay batch and prove the
-    /// pre-image rollback contract.
+    /// Test-only failure injection for `write_page_no_visibility`
+    /// on the FORWARD path (replay finalize step 4). When the
+    /// counter reaches zero, the next forward-path call returns
+    /// Err. Decremented atomically per call so tests can drive a
+    /// failure at an exact ordinal write within a replay batch.
     #[cfg(test)]
     pub(crate) fail_no_visibility_after: std::sync::atomic::AtomicI64,
+
+    /// Test-only failure injection for the ROLLBACK path. Separate
+    /// counter from `fail_no_visibility_after` because rollback is
+    /// a different fault domain — a forward-write injection should
+    /// not also break rollback writes (otherwise tests can't
+    /// distinguish "rollback succeeded" from "rollback wasn't even
+    /// reached"). When the counter reaches zero, the next
+    /// rollback write returns Err.
+    #[cfg(test)]
+    pub(crate) fail_rollback_after: std::sync::atomic::AtomicI64,
+
+    /// "Tainted" flag set by replay rollback when at least one
+    /// rollback write failed. After taint, subsequent reads on this
+    /// VFS instance must fail loudly: the cache contains mixed
+    /// old/new bytes that don't represent any consistent snapshot.
+    /// Recovery: process restart. `assemble()` runs
+    /// `recover_staging_logs` which converges the cache back to a
+    /// consistent state, and the new VFS instance starts with a
+    /// fresh (untainted) flag.
+    pub(crate) tainted: std::sync::atomic::AtomicBool,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -429,6 +449,9 @@ impl DiskCache {
             stat_last_eviction_count: AtomicU64::new(0),
             #[cfg(test)]
             fail_no_visibility_after: std::sync::atomic::AtomicI64::new(i64::MAX),
+            #[cfg(test)]
+            fail_rollback_after: std::sync::atomic::AtomicI64::new(i64::MAX),
+            tainted: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -589,6 +612,20 @@ impl DiskCache {
     pub(crate) fn read_page(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
+        // Hard-fail on a tainted cache. Replay rollback failure
+        // sets this flag because the cache holds mixed old/new
+        // bytes that don't represent any consistent snapshot. The
+        // recovery path is process restart: the next VFS open's
+        // assemble() runs recover_staging_logs() and converges the
+        // cache back to consistent state. Until then, serving any
+        // read would risk returning torn / inconsistent data.
+        if self.tainted.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "DiskCache is tainted (replay rollback failed); restart the VFS to recover from the staging log",
+            ));
+        }
+
         if self.cache_compression {
             return self.read_page_compressed(page_num, buf);
         }
@@ -693,17 +730,8 @@ impl DiskCache {
     /// which is stateful and can't be cleanly rolled back); the
     /// caller (replay) is gated to uncompressed cache.
     pub(crate) fn write_page_no_visibility(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
-        use std::os::unix::fs::FileExt;
-
-        if self.cache_compression {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (Phase 004 cinch-cloud SingleWriter does not enable compression)",
-            ));
-        }
-
-        // Test-only failure injection. Production builds compile
-        // this check out via #[cfg(test)] on the counter.
+        // Test-only failure injection on the forward path. Production
+        // builds compile this check out via #[cfg(test)].
         #[cfg(test)]
         {
             let remaining = self
@@ -713,11 +741,54 @@ impl DiskCache {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     format!(
-                        "test-injected write_page_no_visibility failure on page {}",
+                        "test-injected forward write_page_no_visibility failure on page {}",
                         page_num
                     ),
                 ));
             }
+        }
+        self.write_page_no_visibility_inner(page_num, data)
+    }
+
+    /// Same byte-write contract as `write_page_no_visibility` but
+    /// against the rollback fault domain. Used by replay finalize's
+    /// pre-image rollback so a forward-write failure injection does
+    /// not also break the rollback path. Production builds collapse
+    /// this and the forward variant into the same inner call.
+    pub(crate) fn write_page_no_visibility_rollback(
+        &self,
+        page_num: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let remaining = self
+                .fail_rollback_after
+                .fetch_sub(1, Ordering::SeqCst);
+            if remaining <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "test-injected rollback write_page_no_visibility failure on page {}",
+                        page_num
+                    ),
+                ));
+            }
+        }
+        self.write_page_no_visibility_inner(page_num, data)
+    }
+
+    /// Shared raw-write implementation for both the forward and
+    /// rollback paths. pwrite bytes only — no bitmap mark, no
+    /// mem_cache update.
+    fn write_page_no_visibility_inner(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        if self.cache_compression {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (Phase 004 cinch-cloud SingleWriter does not enable compression)",
+            ));
         }
 
         let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;

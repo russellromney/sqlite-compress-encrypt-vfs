@@ -46,48 +46,106 @@ use crate::tiered::staging::{PendingFlush, StagingWriter};
 /// manifest gets the post-replay header without re-fetching.
 const SQLITE_DB_HEADER_LEN: usize = 100;
 
-/// Best-effort rollback of pre-images captured during replay
-/// finalize's commit phase.
+/// Outcome of [`rollback_pre_images`]. The caller must branch on
+/// this to decide whether to delete the staging log artifact.
+enum RollbackOutcome {
+    /// Every captured pre-image was successfully restored. Cache is
+    /// byte-identical to its pre-replay state for all written pages.
+    /// Caller may delete the staging log; nothing to recover.
+    AllRestored,
+    /// At least one rollback write failed. Cache holds mixed old/new
+    /// bytes — does not represent any consistent snapshot. Caller
+    /// must KEEP the staging log so restart-time recovery
+    /// (`recover_staging_logs` at VFS open) can converge the cache,
+    /// AND must mark the cache tainted so subsequent reads fail
+    /// loudly until the process restarts.
+    PartialFailure { failed_pages: Vec<u64> },
+}
+
+/// Common error path for any failure during finalize's commit
+/// phase (mid-batch write or pre-image read). Performs explicit
+/// rollback and acts on the outcome:
 ///
-/// Called when a mid-batch write or pre-image read fails. Walks the
-/// captured pre-images in REVERSE order (so the first-overwritten
-/// page is restored last, matching the order it would have been
-/// observed by a concurrent reader) and writes each old_bytes back.
+/// - **Rollback fully restores the pre-images.** Cache is consistent
+///   with its pre-replay state. Delete the staging log so it does
+///   not get recovered on next open. Surface the primary error.
 ///
-/// "Best-effort" semantics: if a rollback write itself fails (e.g.
-/// disk full, I/O error), the failure is logged via tracing and the
-/// loop continues for remaining pages. Returning Err from rollback
-/// would mask the primary error and leave the caller with no clear
-/// signal. The staging log is also kept on disk as a durable
-/// post-image (when caller leaves it) so restart-time recovery can
-/// converge the cache even if rollback was partial — but in this
-/// commit's flow the caller deletes the staging log after rollback,
-/// so a partial-rollback failure does leak some new bytes into the
-/// cache. That's a tradeoff: avoiding the leak would require a
-/// pre-flight side-cache file (rejected by Plan Review 3 B5 because
-/// `DiskCache.cache_file` is held open and a path-rename install
-/// would not update the descriptor).
+/// - **Rollback partially fails.** Cache holds mixed old/new bytes
+///   for the failed pages — does not represent any consistent
+///   snapshot. KEEP the staging log on disk (it carries the durable
+///   post-image; restart-time `recover_staging_logs` will replay
+///   it). Taint the cache so subsequent reads fail loudly until
+///   the process restarts. Surface the primary error annotated
+///   with the rollback failure list.
 ///
-/// Test-only failure injection on `write_page_no_visibility` is
-/// reset to MAX inside this function so rollback writes are NOT
-/// subject to the same forward-write injection — rollback is a
-/// recovery action. Production builds compile this reset out via
-/// `#[cfg(test)]`.
-fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) {
-    #[cfg(test)]
-    {
-        cache
-            .fail_no_visibility_after
-            .store(i64::MAX, std::sync::atomic::Ordering::SeqCst);
+/// This is the explicit success/failure contract Plan Review
+/// post-2a-fix-3 (B22) called for. Without it, a rollback failure
+/// would silently delete the only recovery artifact and leave the
+/// cache serving torn data.
+fn handle_commit_phase_failure(
+    cache: &DiskCache,
+    pre_images: &[(u64, Vec<u8>)],
+    staging_log_path: &std::path::Path,
+    primary_msg: String,
+) -> io::Error {
+    match rollback_pre_images(cache, pre_images) {
+        RollbackOutcome::AllRestored => {
+            let _ = std::fs::remove_file(staging_log_path);
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{primary_msg} (rolled back {} pre-images; staging log {} removed; cache consistent)",
+                    pre_images.len(),
+                    staging_log_path.display(),
+                ),
+            )
+        }
+        RollbackOutcome::PartialFailure { failed_pages } => {
+            // Cache has mixed bytes. Mark tainted so subsequent
+            // reads fail. Keep staging log on disk for restart
+            // recovery (`recover_staging_logs` at VFS open will
+            // replay it and converge the cache).
+            cache
+                .tainted
+                .store(true, std::sync::atomic::Ordering::Release);
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{primary_msg} (rollback FAILED for {} of {} pre-images at pages {:?}; staging log {} KEPT for restart recovery; cache TAINTED)",
+                    failed_pages.len(),
+                    pre_images.len(),
+                    failed_pages,
+                    staging_log_path.display(),
+                ),
+            )
+        }
     }
+}
+
+/// Walk captured pre-images in REVERSE order and write each
+/// `old_bytes` back via `write_page_no_visibility_rollback` (a
+/// separate fault domain from the forward path so a forward-write
+/// injection cannot also break rollback writes).
+///
+/// Returns the outcome explicitly so the caller can decide whether
+/// to delete the staging log + leave a clean cache or keep the
+/// staging log + taint the cache for restart-time recovery.
+fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> RollbackOutcome {
+    let mut failed_pages: Vec<u64> = Vec::new();
     for (page_num, old_bytes) in pre_images.iter().rev() {
-        if let Err(e) = cache.write_page_no_visibility(*page_num, old_bytes) {
+        if let Err(e) = cache.write_page_no_visibility_rollback(*page_num, old_bytes) {
             tracing::error!(
                 "replay finalize rollback: failed to restore pre-image for page {}: {}",
                 page_num,
                 e
             );
+            failed_pages.push(*page_num);
         }
+    }
+    if failed_pages.is_empty() {
+        RollbackOutcome::AllRestored
+    } else {
+        RollbackOutcome::PartialFailure { failed_pages }
     }
 }
 
@@ -447,21 +505,16 @@ impl ReplayHandle {
             let pre_image = if was_present {
                 let mut buf = vec![0u8; page_size_bytes];
                 if let Err(e) = self.ctx.cache.read_page(page_num, &mut buf) {
-                    // Reading the pre-image failed. Best-effort
-                    // rollback of any pre-images we already
-                    // captured, then bail.
-                    rollback_pre_images(&self.ctx.cache, &pre_images);
-                    let _ = std::fs::remove_file(&staging_log_path);
-                    return Err(io::Error::new(
-                        e.kind(),
+                    return Err(handle_commit_phase_failure(
+                        &self.ctx.cache,
+                        &pre_images,
+                        &staging_log_path,
                         format!(
-                            "replay finalize: pre-image read of page {} failed after writing {} of {} pages: {} (rolled back {} pages; staging log {} removed)",
+                            "replay finalize: pre-image read of page {} failed after writing {} of {} pages: {}",
                             page_num,
                             written.len(),
                             self.staged.len(),
-                            e,
-                            pre_images.len(),
-                            staging_log_path.display(),
+                            e
                         ),
                     ));
                 }
@@ -471,23 +524,16 @@ impl ReplayHandle {
             };
 
             if let Err(e) = self.ctx.cache.write_page_no_visibility(page_num, new_bytes) {
-                // Mid-batch write failure. Roll back every
-                // already-present page we successfully overwrote
-                // before this point. Newly-allocated pages were
-                // never visible (bitmap not flipped) so they need
-                // no rollback. Then delete the staging log artifact.
-                rollback_pre_images(&self.ctx.cache, &pre_images);
-                let _ = std::fs::remove_file(&staging_log_path);
-                return Err(io::Error::new(
-                    e.kind(),
+                return Err(handle_commit_phase_failure(
+                    &self.ctx.cache,
+                    &pre_images,
+                    &staging_log_path,
                     format!(
-                        "replay finalize: cache.write_page_no_visibility({}) failed after writing {} of {} pages: {} (rolled back {} pre-images; staging log {} removed)",
+                        "replay finalize: cache.write_page_no_visibility({}) failed after writing {} of {} pages: {}",
                         page_num,
                         written.len(),
                         self.staged.len(),
-                        e,
-                        pre_images.len(),
-                        staging_log_path.display(),
+                        e
                     ),
                 ));
             }
@@ -1283,9 +1329,10 @@ mod tests {
         let new_page_1 = vec![0xBBu8; page_size as usize];
         let new_page_2 = vec![0xCCu8; page_size as usize];
 
-        // Arm injection: 1 successful forward write, then fail on the
-        // 2nd. Rollback writes are not subject to this counter
-        // (rollback_pre_images resets it to i64::MAX before writing).
+        // Arm injection on the FORWARD path: 1 successful write,
+        // then fail on the 2nd. Rollback writes go through a
+        // separate fault domain (fail_rollback_after, default
+        // i64::MAX) so rollback succeeds in this test.
         cache
             .fail_no_visibility_after
             .store(1, Ordering::SeqCst);
@@ -1347,6 +1394,94 @@ mod tests {
         assert!(
             logs.is_empty(),
             "staging log must be removed after commit-phase failure (found: {logs:?})"
+        );
+    }
+
+    /// Plan Review post-2a fix-3 (B22): the rollback-failure
+    /// invariant. When pre-image rollback ITSELF fails, finalize
+    /// must:
+    ///   1. Return Err with a clear rollback-failure annotation.
+    ///   2. KEEP the staging log on disk so restart-time recovery
+    ///      can converge the cache.
+    ///   3. Mark the cache tainted so subsequent reads fail loudly
+    ///      rather than serve mixed old/new bytes.
+    ///
+    /// Without these guarantees, a rollback failure silently deletes
+    /// the only recovery artifact and lets readers see torn data.
+    #[test]
+    fn finalize_rollback_failure_keeps_staging_log_and_taints_cache() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+
+        // Seed page 0 as present so the overwrite path captures a
+        // pre-image and exercises rollback.
+        let target_turbolite_page: u64 = 0;
+        let pre_replay_bytes = vec![0xAAu8; page_size as usize];
+        cache
+            .write_page(target_turbolite_page, &pre_replay_bytes)
+            .unwrap();
+        assert!(cache.is_present(target_turbolite_page));
+
+        let staging_dir = tmp.path().join("cache").join("staging");
+        let pre_logs = list_staging_logs(&staging_dir);
+
+        let new_page_1 = vec![0xBBu8; page_size as usize];
+        let new_page_2 = vec![0xCCu8; page_size as usize];
+
+        // Forward injection: 1 success, then fail on the 2nd. This
+        // is the same setup as the rollback-success test; what
+        // changes is we ALSO arm the rollback fault domain.
+        cache
+            .fail_no_visibility_after
+            .store(1, Ordering::SeqCst);
+        // Rollback injection: fail on the very first rollback write.
+        // pre_images contains exactly one entry (page 0) so the
+        // single rollback write attempt will fail.
+        cache.fail_rollback_after.store(0, Ordering::SeqCst);
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &new_page_1).unwrap();
+        handle.apply_page(2, &new_page_2).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let result = handle.finalize();
+
+        // (1) finalize returns Err annotated with the rollback failure.
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rollback FAILED"),
+            "finalize Err must annotate rollback failure; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("KEPT"),
+            "finalize Err must say staging log was KEPT; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("TAINTED"),
+            "finalize Err must say cache TAINTED; got: {err_msg}"
+        );
+
+        // (2) Staging log still on disk for restart recovery.
+        let post_logs = list_staging_logs(&staging_dir);
+        assert_eq!(
+            post_logs.len(),
+            pre_logs.len() + 1,
+            "staging log must remain on disk after rollback failure (pre={pre_logs:?}, post={post_logs:?})"
+        );
+
+        // (3) Cache is tainted; reads fail loudly.
+        assert!(
+            cache.tainted.load(Ordering::Acquire),
+            "cache must be marked tainted after rollback failure"
+        );
+        let mut buf = vec![0u8; page_size as usize];
+        let read_err = cache
+            .read_page(target_turbolite_page, &mut buf)
+            .expect_err("tainted cache must fail reads");
+        assert!(
+            read_err.to_string().contains("tainted"),
+            "tainted-cache read error must mention tainted; got: {read_err}"
         );
     }
 
