@@ -53,6 +53,31 @@ pub struct TurboliteVfs {
     /// from racing on version numbers and storage keys. Also prevents a
     /// durable-mode checkpoint from interleaving with a flush in progress.
     flush_lock: Arc<Mutex<()>>,
+    /// Read/write gate for direct hybrid page replay.
+    ///
+    /// SQLite read transactions hold an Arc-owned read guard between
+    /// `xLock(SHARED)` and `xUnlock(NONE)` on `TurboliteHandle`.
+    /// `ReplayHandle::finalize` takes the write guard before installing
+    /// staged pages, so a finalize and a SQLite read transaction are
+    /// mutually exclusive: an in-flight read sees pre-replay state for
+    /// its full duration, and a read started while finalize is running
+    /// blocks until install completes and observes only the post-replay
+    /// state. Mid-read torn snapshots are impossible.
+    pub(crate) replay_gate: Arc<parking_lot::RwLock<()>>,
+    /// Monotonic epoch incremented by `ReplayHandle::finalize` while
+    /// holding `replay_gate.write()`. Background cache writers
+    /// (PrefetchPool, eager-fetch on handle open) capture the current
+    /// value at job submission and re-check it under `replay_gate.read()`
+    /// immediately before their final cache write; if the value has
+    /// advanced, they drop the work without writing. This stops a stale
+    /// prefetch fetched against the pre-replay manifest from overwriting
+    /// freshly-replayed bytes.
+    pub(crate) replay_epoch: Arc<AtomicU64>,
+    /// Test-only barrier that lets a deterministic test pause finalize
+    /// after the write-gate is held but before any page write happens.
+    /// Production builds compile this field out via #[cfg(test)].
+    #[cfg(test)]
+    pub(crate) finalize_pause: parking_lot::Mutex<Option<Arc<std::sync::Barrier>>>,
     /// WAL replication state (started lazily on first MainDb open).
     #[cfg(feature = "wal")]
     wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
@@ -274,6 +299,9 @@ impl TurboliteVfs {
             Arc::new(Mutex::new(recovered_staging))
         };
         let flush_lock = Arc::new(Mutex::new(()));
+        let replay_gate: Arc<parking_lot::RwLock<()>> =
+            Arc::new(parking_lot::RwLock::new(()));
+        let replay_epoch = Arc::new(AtomicU64::new(0));
 
         // Prefetch pool: backend-agnostic, runs for every non-local setup
         // (local has no remote I/O to parallelise, so skip the worker
@@ -292,6 +320,8 @@ impl TurboliteVfs {
                 config.compression.dictionary.clone(),
                 config.encryption.key,
                 Arc::clone(&shared_manifest),
+                Arc::clone(&replay_gate),
+                Arc::clone(&replay_epoch),
             )))
         };
 
@@ -309,6 +339,10 @@ impl TurboliteVfs {
             pending_flushes,
             staging_seq,
             flush_lock,
+            replay_gate,
+            replay_epoch,
+            #[cfg(test)]
+            finalize_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
         })
@@ -1086,9 +1120,71 @@ impl TurboliteVfs {
             pending_flushes: self.pending_flushes.clone(),
             staging_seq: self.staging_seq.clone(),
             flush_lock: self.flush_lock.clone(),
+            replay_gate: self.replay_gate.clone(),
+            replay_epoch: self.replay_epoch.clone(),
             staging_dir,
+            #[cfg(test)]
+            finalize_pause: {
+                let guard = self.finalize_pause.lock();
+                guard.clone()
+            },
         };
         crate::tiered::replay::ReplayHandle::new(ctx)
+    }
+
+    /// Test-only deterministic pause hook for `ReplayHandle::finalize`.
+    ///
+    /// When a barrier is installed, finalize will call `barrier.wait()`
+    /// twice during the commit phase: once after acquiring
+    /// `replay_gate.write()` but before any page writes (so the test
+    /// can release/observe the pre-replay state under contention) and
+    /// once at the end of the commit just before releasing the write
+    /// guard (so the test can observe finalize-just-finished state).
+    /// Setting `None` removes the pause for subsequent finalize calls.
+    #[cfg(test)]
+    pub fn install_finalize_pause_for_test(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *self.finalize_pause.lock() = barrier;
+    }
+
+    /// Promote accumulated replayed state to a remote manifest payload.
+    ///
+    /// Drives `flush_dirty_groups` over whatever staging logs and
+    /// dirty groups have accumulated since the last flush, encodes
+    /// the resulting manifest as hybrid bytes carrying the supplied
+    /// walrust cursor, and returns those bytes for the caller to
+    /// CAS-publish under its manifest key. If no replay state is
+    /// pending, the call still returns a hybrid payload built from
+    /// the current manifest with the new cursor — that covers the
+    /// "follower already caught up before promotion" case.
+    pub fn publish_replayed_base(
+        &self,
+        walrust_seq: u64,
+        walrust_prefix: &str,
+    ) -> io::Result<Vec<u8>> {
+        // Drive a flush over any pending replay state. flush_to_storage
+        // drains pending_flushes + shared_dirty_groups together and
+        // resolves dirty groups via manifest.page_location, which
+        // works for both Positional and BTreeAware manifests because
+        // ReplayHandle::finalize already extended page_count and
+        // group_pages before emitting the staging log.
+        let has_pending = self
+            .pending_flushes
+            .lock()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false)
+            || self
+                .shared_dirty_groups
+                .lock()
+                .map(|g| !g.is_empty())
+                .unwrap_or(false);
+        if has_pending {
+            self.flush_to_storage()?;
+        }
+        // Whether we flushed or not, the in-memory manifest is the
+        // source of truth for the published payload. Encode it with
+        // the walrust delta extension so the caller (haqlite-turbolite)
+        // can CAS it under its manifest key.
+        self.manifest_bytes_with_walrust_delta(walrust_seq, walrust_prefix)
     }
 }
 
@@ -1240,6 +1336,7 @@ impl Vfs for TurboliteVfs {
                 self.config.cache.max_bytes,
                 self.config.cache.evict_on_checkpoint,
                 self.is_local,
+                Arc::clone(&self.replay_gate),
             )
         } else {
             if let Some(parent) = path.parent() {

@@ -121,6 +121,20 @@ pub struct TurboliteHandle {
     /// Active byte-range locks
     active_db_locks: HashMap<String, Box<dyn std::any::Any + Send + Sync>>,
 
+    /// VFS-level read/write gate that direct hybrid page replay uses
+    /// to fence finalize against in-flight SQLite read transactions.
+    /// `None` for passthrough (WAL/journal) handles, which never see
+    /// replay.
+    replay_gate: Option<Arc<parking_lot::RwLock<()>>>,
+    /// Owned read guard held across an entire SQLite read transaction.
+    /// Acquired in `lock(LockKind::Shared)` (first SHARED for the
+    /// connection) and dropped in `lock(LockKind::None)` or this
+    /// handle's `Drop` impl. Using the parking_lot `arc_lock` shape
+    /// (`ArcRwLockReadGuard`) so the guard can live on the handle
+    /// without a borrow lifetime tying it to `replay_gate`.
+    replay_read_guard:
+        Option<parking_lot::lock_api::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>>,
+
     /// Per-handle settings queue. The SQL function `turbolite_config_set`
     /// pushes here (via thread-local routing in `settings.rs`); xRead
     /// drains and applies on the next slow-path read. Only registered on
@@ -136,6 +150,11 @@ impl Drop for TurboliteHandle {
         // `leave_handle` is a no-op if the queue was never registered
         // (passthrough case), so this covers both constructors.
         settings::leave_handle(&self.settings_queue);
+        // Make absolutely sure the replay-gate read guard is dropped
+        // before the handle goes away. SQLite normally drives the
+        // unlock-to-NONE before close, but the field default-drops
+        // anyway; keeping this explicit makes the contract obvious.
+        self.replay_read_guard = None;
     }
 }
 
@@ -170,6 +189,7 @@ impl TurboliteHandle {
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
         is_local: bool,
+        replay_gate: Arc<parking_lot::RwLock<()>>,
     ) -> io::Result<Self> {
         // Snapshot the shared manifest for initialization (avoid holding lock during S3 I/O)
         let manifest = (**shared_manifest.load()).clone();
@@ -331,6 +351,8 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            replay_gate: Some(replay_gate),
+            replay_read_guard: None,
             settings_queue,
         })
     }
@@ -384,6 +406,8 @@ impl TurboliteHandle {
             db_path,
             lock_file: None,
             active_db_locks: HashMap::new(),
+            replay_gate: None,
+            replay_read_guard: None,
             // Passthrough gets a queue too (keeps the struct uniform and
             // Drop safe) but never registers on the thread-local stack —
             // SQL pushes bypass the journal/WAL file and land on the
@@ -2820,9 +2844,25 @@ impl DatabaseHandle for TurboliteHandle {
         match lock {
             LockKind::None => {
                 self.active_db_locks.clear();
+                // Drop the replay-gate read guard at the end of the
+                // SQLite read transaction. Holding it longer would
+                // wedge replay finalize, which needs the write guard.
+                self.replay_read_guard = None;
             }
             LockKind::Shared => {
                 self.active_db_locks.clear();
+
+                // Acquire the replay-gate read guard at the entry of
+                // the read transaction so replay finalize cannot
+                // interleave between page reads. This blocks (rather
+                // than returning busy) on contention; surfacing busy
+                // mid-query would expose replay internals to users.
+                // Existing byte-range tries below stay non-blocking.
+                if self.replay_read_guard.is_none() {
+                    if let Some(gate) = self.replay_gate.as_ref() {
+                        self.replay_read_guard = Some(gate.read_arc());
+                    }
+                }
 
                 match file_guard::try_lock(
                     std::sync::Arc::clone(&lock_file),
@@ -2832,9 +2872,16 @@ impl DatabaseHandle for TurboliteHandle {
                 ) {
                     Ok(_) => {}
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // File-lock try failed. Drop the replay guard
+                        // we just took so we don't wedge replay while
+                        // waiting for the caller to retry the lock.
+                        self.replay_read_guard = None;
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.replay_read_guard = None;
+                        return Err(e);
+                    }
                 }
 
                 match file_guard::try_lock(
@@ -2848,9 +2895,13 @@ impl DatabaseHandle for TurboliteHandle {
                             .insert("shared".to_string(), Box::new(guard));
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.replay_read_guard = None;
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.replay_read_guard = None;
+                        return Err(e);
+                    }
                 }
             }
             LockKind::Reserved => {

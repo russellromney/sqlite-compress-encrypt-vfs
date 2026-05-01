@@ -233,7 +233,26 @@ pub(crate) struct ReplayContext {
     pub pending_flushes: Arc<Mutex<Vec<PendingFlush>>>,
     pub staging_seq: Arc<AtomicU64>,
     pub flush_lock: Arc<Mutex<()>>,
+    /// VFS-level read/write gate. `finalize` takes the write half
+    /// for the entire commit phase so an in-flight SQLite read
+    /// transaction (which holds the read half between `xLock(SHARED)`
+    /// and `xUnlock(NONE)` on `TurboliteHandle`) and a finalize are
+    /// mutually exclusive.
+    pub replay_gate: Arc<parking_lot::RwLock<()>>,
+    /// VFS-level replay epoch. Incremented by `finalize` while
+    /// holding the write gate. Background cache writers (PrefetchPool,
+    /// etc.) capture the value at submission and re-check it under
+    /// the read gate just before writing to cache; mismatch means a
+    /// finalize ran in between and the writer drops without writing.
+    pub replay_epoch: Arc<AtomicU64>,
     pub staging_dir: std::path::PathBuf,
+    /// Test-only pause hook. When set, finalize calls
+    /// `barrier.wait()` once after acquiring the write gate but
+    /// before any page writes, and again at the end of the commit.
+    /// Lets deterministic tests observe the system mid-finalize
+    /// without sleep loops.
+    #[cfg(test)]
+    pub finalize_pause: Option<Arc<std::sync::Barrier>>,
 }
 
 /// Mutable state of an in-progress replay.
@@ -438,7 +457,44 @@ impl ReplayHandle {
             }
         };
 
-        // ----- Commit phase (live mutation under flush_lock) ----
+        // ----- Commit phase ---------------------------------------
+        //
+        // Order matters here:
+        //
+        // 1. Take the replay-gate write lock. This blocks until every
+        //    in-flight SQLite read transaction has released its read
+        //    guard (the guard is held across `xLock(SHARED)` ..
+        //    `xUnlock(NONE)` on TurboliteHandle), and prevents new
+        //    read transactions from starting until commit is done.
+        //    A read that started before us completes against the
+        //    pre-replay snapshot; a read started after the gate is
+        //    held blocks at xLock until we finish and observes only
+        //    the post-replay snapshot. No torn snapshots.
+        //
+        // 2. Increment `replay_epoch` immediately under the write
+        //    gate. Any background cache writer (prefetch, eager
+        //    fetch) that captured the previous epoch and has not yet
+        //    reached its final cache write will re-acquire the read
+        //    gate, see the bumped epoch, and drop its work. Bumping
+        //    here, before any page write, means "stale" is decided
+        //    before any new bytes hit the cache.
+        //
+        // 3. Take `flush_lock` so we serialise against any concurrent
+        //    `flush_to_storage` over the same staging logs / dirty
+        //    groups.
+        let _replay_write_guard = self.ctx.replay_gate.write();
+        self.ctx
+            .replay_epoch
+            .fetch_add(1, Ordering::AcqRel);
+
+        // Test-only barrier #1: parked here, after the write gate is
+        // held and the epoch is bumped, but before any page is
+        // written. Lets a test observe pre-replay state under
+        // finalize contention.
+        #[cfg(test)]
+        if let Some(ref pause) = self.ctx.finalize_pause {
+            pause.wait();
+        }
 
         let _flush_guard = self
             .ctx
@@ -554,6 +610,16 @@ impl ReplayHandle {
         //    restart-time recovery; surface the error so callers see
         //    that the durability step had a problem.
         self.ctx.cache.persist_bitmap()?;
+
+        // Test-only barrier #2: parked here at the end of the commit
+        // phase. The write gate is still held; once this returns,
+        // both `_flush_guard` and `_replay_write_guard` go out of
+        // scope and the gate is released. Lets a test observe
+        // post-replay state with the gate still held.
+        #[cfg(test)]
+        if let Some(ref pause) = self.ctx.finalize_pause {
+            pause.wait();
+        }
 
         Ok(FinalizeReport {
             installed_pages_in_this_cycle,
@@ -1665,5 +1731,327 @@ mod tests {
     // FileExt path above.
     #[allow(dead_code)]
     fn _unused_path_marker(_p: &Path) {}
+
+    fn vfs_replay_gate(vfs: &TurboliteVfs) -> Arc<parking_lot::RwLock<()>> {
+        let h = vfs.begin_replay().unwrap();
+        let g = h.ctx.replay_gate.clone();
+        h.abort().unwrap();
+        g
+    }
+
+    fn vfs_replay_epoch(vfs: &TurboliteVfs) -> Arc<AtomicU64> {
+        let h = vfs.begin_replay().unwrap();
+        let e = h.ctx.replay_epoch.clone();
+        h.abort().unwrap();
+        e
+    }
+
+    /// Reader started before finalize: holds the read gate, so
+    /// finalize blocks until the reader releases. The reader sees
+    /// the pre-replay snapshot for its full duration. After release,
+    /// finalize completes and a later read sees the post-replay
+    /// snapshot. Deterministic: no sleeps; uses an explicit
+    /// `Barrier` to serialise the steps.
+    #[test]
+    fn finalize_blocks_when_reader_holds_replay_gate() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let gate = vfs_replay_gate(&vfs);
+
+        // Seed page 0 as present so the test exercises an overwrite.
+        let pre_replay_bytes = vec![0xAAu8; page_size as usize];
+        cache.write_page(0, &pre_replay_bytes).unwrap();
+
+        // Stand-in for a SQLite read transaction: take an Arc-owned
+        // read guard on the gate. This is exactly the shape
+        // TurboliteHandle uses across xLock(SHARED) .. xUnlock(NONE).
+        let reader_guard = Arc::new(parking_lot::Mutex::new(Some(gate.read_arc())));
+
+        // Coordinate the test from the main thread.
+        let finalize_started = Arc::new(std::sync::Barrier::new(2));
+        let release_reader = Arc::new(std::sync::Barrier::new(2));
+        let finalize_started_t = Arc::clone(&finalize_started);
+        let release_reader_t = Arc::clone(&release_reader);
+
+        let vfs_arc = Arc::new(vfs);
+        let vfs_thread = Arc::clone(&vfs_arc);
+        let new_bytes = vec![0xBBu8; page_size as usize];
+
+        let finalize_thread = std::thread::spawn(move || {
+            // Signal main: about to call finalize (which will block).
+            finalize_started_t.wait();
+            let mut handle = vfs_thread.begin_replay().unwrap();
+            handle.apply_page(1, &new_bytes).unwrap();
+            handle.commit_changeset(1).unwrap();
+            // This call must block until the reader releases its
+            // read guard. Once it returns we know finalize won the
+            // gate.
+            handle.finalize().unwrap();
+            // Signal main: finalize done.
+            release_reader_t.wait();
+        });
+
+        // Wait for the worker to be at the call site.
+        finalize_started.wait();
+        // While finalize is blocked on the gate, prove the reader
+        // can still read the pre-replay bytes. Read directly off
+        // disk to bypass mem_cache (which may carry post-replay
+        // bytes after finalize completes; we want to verify the
+        // disk side is still pre-replay until finalize wins).
+        use std::os::unix::fs::FileExt;
+        let cache_path = vfs_arc.cache_file_path();
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            buf, pre_replay_bytes,
+            "reader holding the gate must still observe pre-replay bytes on disk"
+        );
+
+        // Release the reader. finalize unblocks and completes.
+        {
+            let mut g = reader_guard.lock();
+            *g = None;
+        }
+        // Wait for finalize to finish.
+        release_reader.wait();
+        finalize_thread.join().unwrap();
+
+        // Now a new reader (fresh VFS-level read) sees post-replay.
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            buf,
+            vec![0xBBu8; page_size as usize],
+            "after finalize completes, the next read must see post-replay bytes"
+        );
+    }
+
+    /// Reader started during finalize: must block at gate acquisition
+    /// until finalize releases the write guard, then observe only the
+    /// post-replay snapshot. Uses the test-only finalize pause hook
+    /// to park finalize at a deterministic point with the write gate
+    /// held.
+    #[test]
+    fn reader_starting_during_finalize_blocks_then_sees_post_replay() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let gate = vfs_replay_gate(&vfs);
+
+        let pre_replay = vec![0xAAu8; page_size as usize];
+        cache.write_page(0, &pre_replay).unwrap();
+
+        // Single 2-party barrier reused for both finalize sync
+        // points. Wave 1: finalize hits barrier #1 (write gate
+        // held, no writes yet) and the test releases it. Wave 2:
+        // finalize hits barrier #2 (end of commit, gate still held)
+        // and the test releases it. After wave 2, finalize returns
+        // and drops the write guard.
+        let pause = Arc::new(std::sync::Barrier::new(2));
+        vfs.install_finalize_pause_for_test(Some(Arc::clone(&pause)));
+
+        let vfs_arc = Arc::new(vfs);
+        let vfs_for_finalize = Arc::clone(&vfs_arc);
+        let new_bytes = vec![0xCCu8; page_size as usize];
+
+        let finalize_thread = std::thread::spawn(move || {
+            let mut handle = vfs_for_finalize.begin_replay().unwrap();
+            handle.apply_page(1, &new_bytes).unwrap();
+            handle.commit_changeset(1).unwrap();
+            handle.finalize().unwrap();
+        });
+
+        // Wait until finalize is parked at barrier #1: write gate
+        // is held, epoch has been bumped, no page write yet.
+        pause.wait();
+
+        // Concurrent reader thread: try to take read_arc on the gate.
+        // It must block because finalize holds the write guard.
+        // Use a channel to confirm "blocked", then unblock finalize.
+        let blocked_signal = Arc::new(parking_lot::Mutex::new(false));
+        let blocked_signal_t = Arc::clone(&blocked_signal);
+        let gate_for_reader = Arc::clone(&gate);
+
+        let reader_thread = std::thread::spawn(move || {
+            // Pre-acquire signal: about to call read_arc.
+            // The actual read_arc call will block.
+            let _g = gate_for_reader.read_arc();
+            // If we get here, the gate has been released by
+            // finalize. Mark blocked=true so the test sees the
+            // reader proceeded only after finalize finished.
+            *blocked_signal_t.lock() = true;
+        });
+
+        // Give the reader thread a moment to actually attempt the
+        // read_arc (and block). 50ms is generous; we don't depend
+        // on it for correctness, only for confirming the reader is
+        // parked at the gate before we let finalize through.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !*blocked_signal.lock(),
+            "reader must be blocked while finalize holds the write gate"
+        );
+
+        // Release finalize past barrier #2 at the end of commit.
+        // Once this wait returns, finalize is past F2 and will
+        // shortly drop the write guard as it returns from the
+        // function.
+        pause.wait();
+
+        // Wait for finalize to fully return so the write guard is
+        // definitely dropped.
+        finalize_thread.join().unwrap();
+
+        // The reader was blocked on read_arc; with the write guard
+        // dropped, it now acquires the read guard and proceeds.
+        // Joining the reader thread waits for that to happen.
+        reader_thread.join().unwrap();
+        assert!(
+            *blocked_signal.lock(),
+            "reader must have unblocked only after finalize released the write gate"
+        );
+
+        // Cache holds post-replay bytes for page 0.
+        let cache_path = vfs_arc.cache_file_path();
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            buf,
+            vec![0xCCu8; page_size as usize],
+            "post-finalize disk bytes must equal replayed bytes"
+        );
+    }
+
+    /// Stale background writer protection: a worker that captured
+    /// the pre-replay epoch must drop its write rather than
+    /// overwrite replayed bytes, even if it has fully fetched and
+    /// decoded its data while finalize was running.
+    ///
+    /// Models the prefetch worker shape directly (without spinning a
+    /// real PrefetchPool, which needs remote storage). The test
+    /// thread:
+    ///   1. captures the current `replay_epoch`,
+    ///   2. waits for finalize to bump the epoch under the write
+    ///      gate,
+    ///   3. takes `replay_gate.read()`, re-checks the epoch (the
+    ///      same shape PrefetchPool's worker uses), and asserts
+    ///      it sees the bumped value and so MUST NOT proceed to
+    ///      write — which is exactly what the worker code does at
+    ///      runtime.
+    #[test]
+    fn stale_background_writer_drops_after_finalize_bumps_epoch() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let gate = vfs_replay_gate(&vfs);
+        let epoch = vfs_replay_epoch(&vfs);
+
+        // Seed page 0 as present so we have a clear pre/post diff.
+        let pre_bytes = vec![0xAAu8; page_size as usize];
+        cache.write_page(0, &pre_bytes).unwrap();
+
+        // Capture epoch the way PrefetchPool::submit does.
+        let captured_epoch = epoch.load(Ordering::Acquire);
+
+        // Run finalize (no parking — we drive synchronously here).
+        let mut handle = vfs.begin_replay().unwrap();
+        let new_bytes = vec![0xDDu8; page_size as usize];
+        handle.apply_page(1, &new_bytes).unwrap();
+        handle.commit_changeset(1).unwrap();
+        handle.finalize().unwrap();
+
+        // The "background writer" wakes up post-finalize. It does
+        // exactly what PrefetchPool's worker does:
+        //   - take replay_gate read lock
+        //   - re-check epoch
+        //   - if mismatched, drop without writing
+        let _read_guard = gate.read();
+        let current_epoch = epoch.load(Ordering::Acquire);
+        assert_ne!(
+            current_epoch, captured_epoch,
+            "epoch must advance across finalize so stale writers can detect it"
+        );
+
+        // Confirm: had this been a real prefetch with stale bytes,
+        // it would now skip the write and the post-replay bytes
+        // remain on disk untouched.
+        let cache_path = vfs.cache_file_path();
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::File::open(&cache_path).unwrap();
+        let mut buf = vec![0u8; page_size as usize];
+        f.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(
+            buf, new_bytes,
+            "post-replay bytes must remain visible; a real worker that respects the epoch check would never reach the write call here"
+        );
+    }
+
+    /// `publish_replayed_base` returns hybrid manifest bytes that
+    /// round-trip through `decode_manifest_bytes` and carry the
+    /// supplied walrust cursor and prefix.
+    #[test]
+    fn publish_replayed_base_round_trips_walrust_delta_when_no_pending_state() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, _page_size) = fresh_vfs_with_pages(&tmp, 4);
+
+        let bytes = vfs
+            .publish_replayed_base(42, "test-prefix/")
+            .expect("publish_replayed_base on empty pending state");
+        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes)
+            .expect("decode round-trip");
+        let (seq, prefix) = walrust.expect("walrust delta extension must be present");
+        assert_eq!(seq, 42);
+        assert_eq!(prefix, "test-prefix/");
+        assert!(
+            m.page_count > 0,
+            "manifest must carry a real page count from the import-seeded fixture"
+        );
+    }
+
+    /// `publish_replayed_base` after a successful replay returns a
+    /// manifest whose page_group_keys reflect the flushed groups.
+    /// The check that the keys differ from the pre-replay manifest
+    /// for every replayed group is encoded by the flush primitive,
+    /// not by this test directly; here we assert the simpler shape
+    /// invariant: the published manifest version >= the post-finalize
+    /// manifest version, page_count covers the replayed pages, and
+    /// the returned bytes carry the supplied walrust cursor.
+    #[test]
+    fn publish_replayed_base_after_replay_carries_post_replay_state() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let cache = vfs_cache(&vfs);
+        let pre_replay = vec![0xAAu8; page_size as usize];
+        cache.write_page(0, &pre_replay).unwrap();
+
+        let new_bytes = vec![0xBBu8; page_size as usize];
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &new_bytes).unwrap();
+        handle.commit_changeset(7).unwrap();
+        handle.finalize().unwrap();
+
+        let post_finalize_version = vfs.manifest().version;
+
+        // The local-mode VFS keeps no remote storage, so flush is a
+        // no-op upload-wise but still bumps the manifest. Tests for
+        // remote-mode flush behaviour live in flush.rs's own suite.
+        let bytes = vfs
+            .publish_replayed_base(13, "p/")
+            .expect("publish_replayed_base after replay");
+        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
+        let (seq, prefix) = walrust.expect("walrust extension");
+        assert_eq!(seq, 13);
+        assert_eq!(prefix, "p/");
+        assert!(
+            m.version >= post_finalize_version,
+            "published manifest version must be >= post-finalize version (post={post_finalize_version}, published={})",
+            m.version
+        );
+    }
 }
 

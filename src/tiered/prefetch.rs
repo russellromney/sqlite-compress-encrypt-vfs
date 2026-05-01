@@ -35,6 +35,13 @@ pub(crate) struct PrefetchJob {
     pub(crate) overrides: HashMap<usize, SubframeOverride>,
     /// Manifest version when this job was submitted.
     pub(crate) manifest_version: u64,
+    /// Replay epoch captured at submission. The worker re-reads the
+    /// shared epoch under `replay_gate.read()` immediately before its
+    /// final cache write; if the value has advanced, replay finalize
+    /// has installed new bytes for these pages and the prefetch's
+    /// version of the bytes is stale. The job is dropped without
+    /// writing.
+    pub(crate) replay_epoch_at_submit: u64,
 }
 
 /// Fixed thread pool for background page group prefetching.
@@ -50,6 +57,10 @@ pub(crate) struct PrefetchPool {
     /// Set to true when the pool is shutting down; suppresses noisy
     /// fetch/decode/write error logs during teardown.
     shutdown: Arc<AtomicBool>,
+    /// Replay epoch reference held by the pool so `submit` can
+    /// snapshot it into each `PrefetchJob`. Workers reload from the
+    /// shared atomic under `replay_gate.read()` later.
+    replay_epoch_at_pool: Arc<AtomicU64>,
 }
 
 impl PrefetchPool {
@@ -63,6 +74,8 @@ impl PrefetchPool {
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         encryption_key: Option<[u8; 32]>,
         shared_manifest: Arc<ArcSwap<Manifest>>,
+        replay_gate: Arc<parking_lot::RwLock<()>>,
+        replay_epoch: Arc<AtomicU64>,
     ) -> Self {
         let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
         // Bounded so the completion signal can't grow without limit if no one
@@ -92,6 +105,8 @@ impl PrefetchPool {
             let shared_manifest = Arc::clone(&shared_manifest);
             let shutdown = Arc::clone(&shutdown);
             let in_flight = Arc::clone(&in_flight);
+            let replay_gate = Arc::clone(&replay_gate);
+            let replay_epoch = Arc::clone(&replay_epoch);
 
             workers.push(std::thread::spawn(move || {
                 // Mark a job as finished: drop the in-flight counter (so
@@ -187,6 +202,26 @@ impl PrefetchPool {
                         turbolite_debug!(
                             "[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
                             gid, job.manifest_version, current_version,
+                        );
+                        cache.unclaim_group(gid);
+                        finish(gid);
+                        continue;
+                    }
+
+                    // Hold the replay-gate read lock across both the
+                    // epoch re-check and the cache write. This blocks
+                    // concurrent finalize, which takes the write
+                    // guard, and means we cannot race between
+                    // "epoch matches" and "we wrote bytes". If
+                    // finalize ran between submit and here, the
+                    // captured epoch will not match the current value
+                    // and we drop without writing.
+                    let _replay_read_guard = replay_gate.read();
+                    let current_epoch = replay_epoch.load(Ordering::Acquire);
+                    if current_epoch != job.replay_epoch_at_submit {
+                        turbolite_debug!(
+                            "[prefetch] gid={} replay epoch advanced ({} -> {}), discarding stale fetch",
+                            gid, job.replay_epoch_at_submit, current_epoch,
                         );
                         cache.unclaim_group(gid);
                         finish(gid);
@@ -308,6 +343,7 @@ impl PrefetchPool {
             in_flight,
             workers: parking_lot::Mutex::new(workers),
             shutdown,
+            replay_epoch_at_pool: replay_epoch,
         }
     }
 
@@ -324,6 +360,11 @@ impl PrefetchPool {
         manifest_version: u64,
     ) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
+        // Snapshot the replay epoch at submission. The worker re-reads
+        // it under the replay_gate read lock before its final cache
+        // write; if it has advanced, replay finalize ran in between
+        // and the prefetch's bytes are stale.
+        let replay_epoch_at_submit = self.replay_epoch_at_pool.load(Ordering::Acquire);
         match self.job_tx.send(PrefetchJob {
             gid,
             key,
@@ -333,6 +374,7 @@ impl PrefetchPool {
             sub_pages_per_frame: sub_ppf,
             group_page_nums,
             overrides,
+            replay_epoch_at_submit,
         }) {
             Ok(()) => true,
             Err(_) => {
