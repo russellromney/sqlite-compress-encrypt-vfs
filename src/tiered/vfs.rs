@@ -1106,7 +1106,7 @@ impl TurboliteVfs {
         }
     }
 
-    /// Begin a direct hybrid page replay cycle (Phase 004).
+    /// Begin a direct hybrid page replay cycle.
     ///
     /// Returns a [`ReplayHandle`] that the caller drives with
     /// `apply_page` (per decoded HADBP page from walrust),
