@@ -11,7 +11,10 @@ use super::*;
 // (page_count tells us how many pages are in the group).
 
 /// Decrypt data if an encryption key is provided, otherwise return as-is (zero-copy).
-pub(crate) fn decrypt_if_needed(data: &[u8], encryption_key: Option<&[u8; 32]>) -> io::Result<Vec<u8>> {
+pub(crate) fn decrypt_if_needed(
+    data: &[u8],
+    encryption_key: Option<&[u8; 32]>,
+) -> io::Result<Vec<u8>> {
     #[cfg(feature = "encryption")]
     if let Some(key) = encryption_key {
         return compress::decrypt_gcm_random_nonce(data, key);
@@ -28,14 +31,23 @@ pub(crate) fn encode_page_group(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    _encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
-    // Find last non-empty page to avoid trailing zeros
-    let page_count = pages
-        .iter()
-        .rposition(|p| p.is_some())
-        .map(|i| i + 1)
-        .unwrap_or(0) as u32;
+    #[cfg(not(feature = "encryption"))]
+    let _ = encryption_key;
+
+    // Emit exactly `pages.len()` pages — never strip trailing None.
+    //
+    // Why: callers (import.rs, handle.rs upload-on-change, compact.rs) hand us
+    // a `pages` slice sized to the manifest's `group_page_nums(gid).len()`,
+    // and the manifest records that same length. Any earlier strip-trailing-
+    // None optimization desynchronized encoder and manifest: when the last
+    // entry was a real, in-bounds page that the caller hadn't materialized
+    // (e.g., not yet in cache, S3 merge failed), the encoder dropped it
+    // silently and the follower's decode loop skipped the slot, leaving a
+    // hole in the cache file that SQLite reads as "database disk image is
+    // malformed." Trailing zeros compress to nothing; correctness wins.
+    let page_count = pages.len() as u32;
 
     // Build raw buffer: [u32 page_count][u32 page_size][page bytes...]
     let header_len = 8; // 2 × u32
@@ -87,14 +99,17 @@ pub(crate) fn encode_page_group_seekable(
     sub_ppg: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    _encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<(Vec<u8>, Vec<FrameEntry>)> {
-    // Find last non-empty page to avoid trailing zeros
-    let page_count = pages
-        .iter()
-        .rposition(|p| p.is_some())
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    #[cfg(not(feature = "encryption"))]
+    let _ = encryption_key;
+
+    // Emit exactly `pages.len()` pages — never strip trailing None. See the
+    // detailed rationale on `encode_page_group` above; the same correctness
+    // invariant applies to seekable groups (and the per-group hole bug bites
+    // even harder here because the frame_table indexes into a buffer the
+    // decoder later trusts to contain `group_page_nums.len()` entries).
+    let page_count = pages.len();
 
     let num_frames = (page_count + sub_ppg as usize - 1) / sub_ppg as usize;
     let mut blob = Vec::new();
@@ -133,9 +148,11 @@ pub(crate) fn encode_page_group_seekable(
 
         // Per-frame encryption: random nonce prepended to each frame
         #[cfg(feature = "encryption")]
-        if let Some(key) = encryption_key {
-            frame_data = compress::encrypt_gcm_random_nonce(&frame_data, key)?;
-        }
+        let frame_data = if let Some(key) = encryption_key {
+            compress::encrypt_gcm_random_nonce(&frame_data, key)?
+        } else {
+            frame_data
+        };
 
         frame_table.push(FrameEntry {
             offset,
@@ -188,7 +205,12 @@ pub(crate) fn decode_page_group_seekable_full(
         if end > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("frame extends beyond data: {}..{} > {}", start, end, data.len()),
+                format!(
+                    "frame extends beyond data: {}..{} > {}",
+                    start,
+                    end,
+                    data.len()
+                ),
             ));
         }
         let decrypted = decrypt_if_needed(&data[start..end], encryption_key)?;
@@ -319,8 +341,11 @@ pub(crate) fn encode_interior_bundle(
     page_size: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] encoder_dict: Option<&zstd::dict::EncoderDictionary<'static>>,
-    _encryption_key: Option<&[u8; 32]>,
+    encryption_key: Option<&[u8; 32]>,
 ) -> io::Result<Vec<u8>> {
+    #[cfg(not(feature = "encryption"))]
+    let _ = encryption_key;
+
     let page_count = pages.len() as u32;
     let header_len = 8 + pages.len() * 8; // 2×u32 + page_count×u64
     let raw_len = header_len + pages.len() * page_size as usize;
@@ -391,7 +416,8 @@ pub(crate) fn decode_interior_bundle(
             io::ErrorKind::InvalidData,
             format!(
                 "interior bundle truncated: expected {} bytes, got {}",
-                expected_len, raw.len()
+                expected_len,
+                raw.len()
             ),
         ));
     }
@@ -428,19 +454,24 @@ pub(crate) fn encode_override_frame(
         }
     }
     let frame_data = compress::compress(
-        &raw, compression_level,
-        #[cfg(feature = "zstd")] encoder_dict,
-        #[cfg(not(feature = "zstd"))] None,
+        &raw,
+        compression_level,
+        #[cfg(feature = "zstd")]
+        encoder_dict,
+        #[cfg(not(feature = "zstd"))]
+        None,
     )?;
     #[cfg(feature = "encryption")]
-    if let Some(key) = encryption_key {
-        frame_data = compress::encrypt_gcm_random_nonce(&frame_data, key)?;
-    }
-    let _ = encryption_key; // suppress unused warning when encryption feature is off
+    let frame_data = if let Some(key) = encryption_key {
+        compress::encrypt_gcm_random_nonce(&frame_data, key)?
+    } else {
+        frame_data
+    };
+    #[cfg(not(feature = "encryption"))]
+    let _ = encryption_key;
     Ok(frame_data)
 }
 
 #[cfg(test)]
 #[path = "test_encoding.rs"]
 mod tests;
-

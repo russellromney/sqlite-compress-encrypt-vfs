@@ -48,37 +48,46 @@ fn open_turbolite(path: &std::path::Path, vfs_name: &str) -> Connection {
 
 #[derive(Debug, Clone)]
 enum SqlOp {
-    Insert { id: i64, text: String, real_val: f64 },
-    Update { id: i64, text: String },
-    Delete { id: i64 },
-    InsertBlob { id: i64, data: Vec<u8> },
+    Insert {
+        id: i64,
+        text: String,
+        real_val: f64,
+    },
+    Update {
+        id: i64,
+        text: String,
+    },
+    Delete {
+        id: i64,
+    },
+    InsertBlob {
+        id: i64,
+        data: Vec<u8>,
+    },
 }
 
 /// Generate a random SQL operation.
 fn sql_op_strategy() -> impl Strategy<Value = SqlOp> {
     prop_oneof![
         // INSERT with text
-        (1..10_000i64, "[a-zA-Z0-9 ]{0,200}", any::<f64>()).prop_map(
-            |(id, text, real_val)| SqlOp::Insert {
+        (1..10_000i64, "[a-zA-Z0-9 ]{0,200}", any::<f64>()).prop_map(|(id, text, real_val)| {
+            SqlOp::Insert {
                 id: id.abs(),
                 text,
                 real_val,
             }
-        ),
+        }),
         // UPDATE
         (1..10_000i64, "[a-zA-Z0-9 ]{0,200}")
-            .prop_map(|(id, text)| SqlOp::Update {
-                id: id.abs(),
-                text,
-            }),
+            .prop_map(|(id, text)| SqlOp::Update { id: id.abs(), text }),
         // DELETE
         (1..10_000i64).prop_map(|id| SqlOp::Delete { id: id.abs() }),
         // INSERT with blob
-        (1..10_000i64, proptest::collection::vec(any::<u8>(), 0..1024))
-            .prop_map(|(id, data)| SqlOp::InsertBlob {
-                id: id.abs(),
-                data,
-            }),
+        (
+            1..10_000i64,
+            proptest::collection::vec(any::<u8>(), 0..1024)
+        )
+            .prop_map(|(id, data)| SqlOp::InsertBlob { id: id.abs(), data }),
     ]
 }
 
@@ -99,10 +108,7 @@ fn execute_op(conn: &Connection, op: &SqlOp) -> Result<usize, String> {
             )
             .map_err(|e| e.to_string()),
         SqlOp::Delete { id } => conn
-            .execute(
-                "DELETE FROM test_data WHERE id = ?1",
-                rusqlite::params![id],
-            )
+            .execute("DELETE FROM test_data WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| e.to_string()),
         SqlOp::InsertBlob { id, data } => conn
             .execute(
@@ -170,11 +176,7 @@ fn assert_integrity(conn: &Connection, label: &str) {
     let result: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("failed to run integrity_check");
-    assert_eq!(
-        result, "ok",
-        "{} integrity_check failed: {}",
-        label, result
-    );
+    assert_eq!(result, "ok", "{} integrity_check failed: {}", label, result);
 }
 
 /// Compare schemas between two connections.

@@ -48,9 +48,7 @@ fn plain_connection_does_not_inherit_scalar_from_alive_turbolite_handle() {
     // Plain sqlite connection on the same thread. Auto-extension fires;
     // top_queue() returns tlite's queue.
     let plain = Connection::open_in_memory().unwrap();
-    plain
-        .execute("CREATE TABLE t (x INTEGER)", [])
-        .unwrap();
+    plain.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
 
     // If the bug exists: `plain.turbolite_config_set(...)` succeeds and
     // the push lands on tlite's queue. If the install-hook correctly

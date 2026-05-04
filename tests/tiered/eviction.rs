@@ -6,9 +6,9 @@
 //! (fresh cache dir) to test eviction. The cold reader fetches from S3,
 //! which populates the sub-chunk tracker (the source of truth for eviction).
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// Write test data to S3, return (bucket, prefix, endpoint) for cold readers.
 fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
@@ -27,14 +27,16 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
         &format!("{}_write.db", prefix),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA page_size=4096;
          PRAGMA journal_mode=WAL;
          CREATE TABLE evict_data (id INTEGER PRIMARY KEY, payload TEXT);
          CREATE INDEX idx_evict_payload ON evict_data(payload);",
-    ).unwrap();
+    )
+    .unwrap();
 
     {
         let tx = conn.unchecked_transaction().unwrap();
@@ -42,11 +44,13 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
             tx.execute(
                 "INSERT INTO evict_data VALUES (?1, ?2)",
                 rusqlite::params![i, format!("{:0>300}", i)],
-            ).unwrap();
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     drop(conn);
 
     (bucket, s3_prefix, endpoint)
@@ -54,9 +58,15 @@ fn write_test_data(prefix: &str) -> (String, String, Option<String>) {
 
 /// Open a cold reader VFS (fresh cache) and return (conn, shared_state, cache_dir).
 fn cold_reader(
-    bucket: &str, prefix: &str, endpoint: &Option<String>,
+    bucket: &str,
+    prefix: &str,
+    endpoint: &Option<String>,
     config_fn: impl FnOnce(&mut TurboliteConfig),
-) -> (rusqlite::Connection, turbolite::tiered::TurboliteSharedState, TempDir) {
+) -> (
+    rusqlite::Connection,
+    turbolite::tiered::TurboliteSharedState,
+    TempDir,
+) {
     let cache_dir = TempDir::new().unwrap();
     let mut config = TurboliteConfig {
         bucket: bucket.to_string(),
@@ -66,7 +76,8 @@ fn cold_reader(
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         read_only: true,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     config_fn(&mut config);
     let vfs_name = unique_vfs_name("evict_cold");
@@ -79,7 +90,8 @@ fn cold_reader(
         "cold_read.db",
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     (conn, shared, cache_dir)
 }
@@ -92,7 +104,8 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let _ = TurboliteVfs::new_local(config).unwrap().destroy_s3();
 }
@@ -105,7 +118,9 @@ fn test_evict_tier_data() {
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
     // Query to populate cache from S3
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500);
 
     let info_before: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
@@ -119,10 +134,17 @@ fn test_evict_tier_data() {
 
     let info_after: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
     let size_after = info_after["size_bytes"].as_u64().unwrap();
-    assert!(size_after < size_before, "cache should shrink: before={} after={}", size_before, size_after);
+    assert!(
+        size_after < size_before,
+        "cache should shrink: before={} after={}",
+        size_before,
+        size_after
+    );
 
     // Data still readable (re-fetched from S3)
-    let count2: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let count2: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count2, 500);
 
     drop(conn);
@@ -134,13 +156,17 @@ fn test_evict_tier_all() {
     let (bucket, prefix, endpoint) = write_test_data("evict_tier_all");
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
 
     let evicted = shared.evict_tier("all");
     assert!(evicted > 0, "should evict sub-chunks");
 
     // Data still readable
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500);
 
     drop(conn);
@@ -152,7 +178,9 @@ fn test_evict_idempotent() {
     let (bucket, prefix, endpoint) = write_test_data("evict_idempotent");
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
 
     let evicted1 = shared.evict_tier("data");
     assert!(evicted1 > 0);
@@ -197,41 +225,54 @@ fn test_evict_on_checkpoint_clears_data_tier() {
         "evict_on_cp.db",
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute_batch(
         "PRAGMA page_size=4096; PRAGMA journal_mode=WAL;
          CREATE TABLE cp_test (id INTEGER PRIMARY KEY, data TEXT);",
-    ).unwrap();
+    )
+    .unwrap();
 
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..200 {
-            tx.execute("INSERT INTO cp_test VALUES (?1, ?2)",
-                rusqlite::params![i, format!("{:0>300}", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO cp_test VALUES (?1, ?2)",
+                rusqlite::params![i, format!("{:0>300}", i)],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
 
     // First checkpoint populates S3
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Write more data and checkpoint again - this triggers evict_on_checkpoint
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 200..300 {
-            tx.execute("INSERT INTO cp_test VALUES (?1, ?2)",
-                rusqlite::params![i, format!("{:0>300}", i)]).unwrap();
+            tx.execute(
+                "INSERT INTO cp_test VALUES (?1, ?2)",
+                rusqlite::params![i, format!("{:0>300}", i)],
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // After checkpoint with evict_on_checkpoint, data tier should be empty
     let info: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
     let data_chunks = info["tiers"]["data"]["chunks"].as_u64().unwrap_or(0);
     eprintln!("after evict_on_checkpoint: {}", shared.cache_info());
-    assert_eq!(data_chunks, 0, "data tier should be empty after evict_on_checkpoint");
+    assert_eq!(
+        data_chunks, 0,
+        "data tier should be empty after evict_on_checkpoint"
+    );
 
     // Pinned/interior should survive
     let pinned = info["tiers"]["pinned"]["chunks"].as_u64().unwrap_or(0);
@@ -239,7 +280,9 @@ fn test_evict_on_checkpoint_clears_data_tier() {
     // Note: pinned may be 0 for small databases where interior pages fit in one group
 
     // Data still readable
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM cp_test", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cp_test", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 300);
 
     drop(conn);
@@ -282,7 +325,9 @@ fn test_warm_already_cached_is_low_submit() {
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
     // Fully warm cache with query
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
 
     // Warm again - should submit few/no groups
     let accesses = turbolite::tiered::parse_eqp_output("SCAN evict_data");
@@ -308,28 +353,45 @@ fn test_cache_info_counters_after_cold_read() {
     shared.reset_s3_counters();
 
     // Cold query - should cause S3 fetches and cache misses
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
 
     let info: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
-    eprintln!("cache_info after cold read: {}", serde_json::to_string_pretty(&info).unwrap());
+    eprintln!(
+        "cache_info after cold read: {}",
+        serde_json::to_string_pretty(&info).unwrap()
+    );
 
     let size = info["size_bytes"].as_u64().unwrap();
     let groups_cached = info["groups_cached"].as_u64().unwrap();
     let s3_gets = info["s3_gets_total"].as_u64().unwrap();
 
-    assert!(size > 0, "cache should report non-zero bytes after cold read");
-    assert!(groups_cached > 0, "should have cached groups after cold read");
+    assert!(
+        size > 0,
+        "cache should report non-zero bytes after cold read"
+    );
+    assert!(
+        groups_cached > 0,
+        "should have cached groups after cold read"
+    );
     assert!(s3_gets > 0, "should have S3 GETs after cold read");
 
     // Run same query again - should be cache hits
-    let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let _: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
 
     let info2: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
     let hits = info2["hits"].as_u64().unwrap();
     assert!(hits > 0, "warm query should register cache hits");
 
     let hit_rate = info2["hit_rate"].as_f64().unwrap();
-    assert!(hit_rate > 0.5, "hit rate should be >50% after warm query, got {:.2}", hit_rate);
+    assert!(
+        hit_rate > 0.5,
+        "hit rate should be >50% after warm query, got {:.2}",
+        hit_rate
+    );
 
     drop(conn);
     cleanup(&bucket, &prefix, &endpoint);
@@ -347,22 +409,32 @@ fn test_cache_budget_enforced() {
 
     // Run queries that exceed the budget
     for _ in 0..3 {
-        let _: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+            .unwrap();
     }
 
     let info: serde_json::Value = serde_json::from_str(&shared.cache_info()).unwrap();
     let evictions = info["evictions"].as_u64().unwrap_or(0);
     let size = info["size_bytes"].as_u64().unwrap_or(0);
 
-    eprintln!("after budget queries: size={} evictions={}", size, evictions);
-    eprintln!("full info: {}", serde_json::to_string_pretty(&info).unwrap());
+    eprintln!(
+        "after budget queries: size={} evictions={}",
+        size, evictions
+    );
+    eprintln!(
+        "full info: {}",
+        serde_json::to_string_pretty(&info).unwrap()
+    );
 
     // With a 32KB budget and ~500 rows of data, evictions should have fired
     // Note: between-query eviction requires the trace callback (SQLITE_TRACE_PROFILE)
     // which is only installed by the loadable extension. In integration tests without
     // the extension, between-query eviction won't fire. So we check the data is still
     // readable rather than asserting eviction count.
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500, "data should be readable regardless of budget");
 
     drop(conn);

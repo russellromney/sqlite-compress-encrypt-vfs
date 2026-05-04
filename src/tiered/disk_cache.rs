@@ -47,14 +47,26 @@ impl CacheIndex {
     /// Returns the offset where the page was written.
     pub(crate) fn insert(&mut self, page_num: u64, compressed_len: u32) -> u64 {
         let offset = self.next_offset;
-        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        self.entries.insert(
+            page_num,
+            CacheIndexEntry {
+                offset,
+                compressed_len,
+            },
+        );
         self.next_offset = offset + compressed_len as u64;
         offset
     }
 
     /// Record a page at a specific offset (for bulk writes where offset is pre-computed).
     pub(crate) fn insert_at(&mut self, page_num: u64, offset: u64, compressed_len: u32) {
-        self.entries.insert(page_num, CacheIndexEntry { offset, compressed_len });
+        self.entries.insert(
+            page_num,
+            CacheIndexEntry {
+                offset,
+                compressed_len,
+            },
+        );
         let end = offset + compressed_len as u64;
         if end > self.next_offset {
             self.next_offset = end;
@@ -82,8 +94,12 @@ impl CacheIndex {
         let data = serde_json::to_vec(&PersistableCacheIndex {
             entries: &self.entries,
             next_offset: self.next_offset,
-        }).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serialize cache index: {}", e))
+        })
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("serialize cache index: {}", e),
+            )
         })?;
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, &data)?;
@@ -207,6 +223,34 @@ pub(crate) struct DiskCache {
     /// Sub-chunks evicted in the last between-query eviction pass.
     /// Used for churn detection (>50% of cache evicted = high churn).
     pub(crate) stat_last_eviction_count: AtomicU64,
+
+    /// Test-only failure injection for `write_page_no_visibility`
+    /// on the FORWARD path (replay finalize step 4). When the
+    /// counter reaches zero, the next forward-path call returns
+    /// Err. Decremented atomically per call so tests can drive a
+    /// failure at an exact ordinal write within a replay batch.
+    #[cfg(test)]
+    pub(crate) fail_no_visibility_after: std::sync::atomic::AtomicI64,
+
+    /// Test-only failure injection for the ROLLBACK path. Separate
+    /// counter from `fail_no_visibility_after` because rollback is
+    /// a different fault domain — a forward-write injection should
+    /// not also break rollback writes (otherwise tests can't
+    /// distinguish "rollback succeeded" from "rollback wasn't even
+    /// reached"). When the counter reaches zero, the next
+    /// rollback write returns Err.
+    #[cfg(test)]
+    pub(crate) fail_rollback_after: std::sync::atomic::AtomicI64,
+
+    /// "Tainted" flag set by replay rollback when at least one
+    /// rollback write failed. After taint, subsequent reads on this
+    /// VFS instance must fail loudly: the cache contains mixed
+    /// old/new bytes that don't represent any consistent snapshot.
+    /// Recovery: process restart. `assemble()` runs
+    /// `recover_staging_logs` which converges the cache back to a
+    /// consistent state, and the new VFS instance starts with a
+    /// fresh (untainted) flag.
+    pub(crate) tainted: std::sync::atomic::AtomicBool,
 }
 
 /// Counter for lazy eviction (every 64 group fetches).
@@ -214,11 +258,27 @@ pub(crate) static EVICTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 impl DiskCache {
-    pub(crate) fn new(cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32, page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>) -> io::Result<Self> {
+    pub(crate) fn new(
+        cache_dir: &Path,
+        ttl_secs: u64,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        page_size: u32,
+        page_count: u64,
+        encryption_key: Option<[u8; 32]>,
+        group_pages: Vec<Vec<u64>>,
+    ) -> io::Result<Self> {
         Self::new_with_compression(
-            cache_dir, ttl_secs, pages_per_group, sub_pages_per_frame,
-            page_size, page_count, encryption_key, group_pages,
-            false, 3,
+            cache_dir,
+            ttl_secs,
+            pages_per_group,
+            sub_pages_per_frame,
+            page_size,
+            page_count,
+            encryption_key,
+            group_pages,
+            false,
+            3,
             #[cfg(feature = "zstd")]
             None,
             0, // mem_cache_budget: disabled by default
@@ -226,9 +286,16 @@ impl DiskCache {
     }
 
     pub(crate) fn new_with_compression(
-        cache_dir: &Path, ttl_secs: u64, pages_per_group: u32, sub_pages_per_frame: u32,
-        page_size: u32, page_count: u64, encryption_key: Option<[u8; 32]>, group_pages: Vec<Vec<u64>>,
-        cache_compression: bool, cache_compression_level: i32,
+        cache_dir: &Path,
+        ttl_secs: u64,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        page_size: u32,
+        page_count: u64,
+        encryption_key: Option<[u8; 32]>,
+        group_pages: Vec<Vec<u64>>,
+        cache_compression: bool,
+        cache_compression_level: i32,
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         mem_cache_budget: u64,
     ) -> io::Result<Self> {
@@ -271,7 +338,11 @@ impl DiskCache {
         }
 
         // Sub-chunk tracker (primary tracking mechanism)
-        let spf = if sub_pages_per_frame > 0 { sub_pages_per_frame } else { pages_per_group };
+        let spf = if sub_pages_per_frame > 0 {
+            sub_pages_per_frame
+        } else {
+            pages_per_group
+        };
         let tracker_path = cache_dir.join("sub_chunk_tracker");
         #[cfg(feature = "encryption")]
         let mut tracker = if encryption_key.is_some() {
@@ -331,7 +402,9 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
-            cache_file_len: std::sync::atomic::AtomicU64::new(cache_file.metadata().map(|m| m.len()).unwrap_or(0)),
+            cache_file_len: std::sync::atomic::AtomicU64::new(
+                cache_file.metadata().map(|m| m.len()).unwrap_or(0),
+            ),
             cache_file,
             cache_file_extend: parking_lot::Mutex::new(()),
             mem_cache: if mem_cache_budget > 0 && page_count > 0 && page_size > 0 {
@@ -374,15 +447,20 @@ impl DiskCache {
             stat_bytes_evicted: AtomicU64::new(0),
             stat_peak_cache_bytes: AtomicU64::new(0),
             stat_last_eviction_count: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_no_visibility_after: std::sync::atomic::AtomicI64::new(i64::MAX),
+            #[cfg(test)]
+            fail_rollback_after: std::sync::atomic::AtomicI64::new(i64::MAX),
+            tainted: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Create a zstd encoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn encoder_dict(&self) -> Option<zstd::dict::EncoderDictionary<'static>> {
-        self.dictionary.as_ref().map(|d| {
-            zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level)
-        })
+        self.dictionary
+            .as_ref()
+            .map(|d| zstd::dict::EncoderDictionary::copy(d, self.cache_compression_level))
     }
 
     /// Bump the generation counter. Called by sync() after writing dirty pages.
@@ -394,13 +472,20 @@ impl DiskCache {
     /// Promote contiguous decoded pages directly into mem_cache (zero extra I/O).
     /// Called after write_pages_bulk/write_pages_scattered when pages are decoded from S3.
     /// The data is already in `raw_data` at page-size offsets, so we just memcpy into the cache.
-    pub(crate) fn promote_bulk_to_mem_cache(&self, start_page: u64, raw_data: &[u8], num_pages: u64) {
+    pub(crate) fn promote_bulk_to_mem_cache(
+        &self,
+        start_page: u64,
+        raw_data: &[u8],
+        num_pages: u64,
+    ) {
         let mc = match self.mem_cache {
             Some(ref mc) => mc,
             None => return,
         };
         let ps = self.page_size.load(Ordering::Relaxed) as usize;
-        if ps == 0 { return; }
+        if ps == 0 {
+            return;
+        }
 
         for i in 0..num_pages as usize {
             let pnum = start_page + i as u64;
@@ -410,21 +495,37 @@ impl DiskCache {
                     // Already cached, update in place
                     let src_start = i * ps;
                     let copy_len = ps.min(raw_data.len() - src_start);
-                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, copy_len); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            raw_data[src_start..].as_ptr(),
+                            ptr,
+                            copy_len,
+                        );
+                    }
                 } else {
                     let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 > self.mem_cache_budget { return; } // budget exhausted
+                    if current + ps as u64 > self.mem_cache_budget {
+                        return;
+                    } // budget exhausted
                     let src_start = i * ps;
                     let src_end = (src_start + ps).min(raw_data.len());
                     let mut page_buf = vec![0u8; ps].into_boxed_slice();
                     page_buf[..src_end - src_start].copy_from_slice(&raw_data[src_start..src_end]);
                     let new_ptr = Box::into_raw(page_buf) as *mut u8;
-                    if slot.compare_exchange(
-                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
-                    ).is_ok() {
+                    if slot
+                        .compare_exchange(
+                            std::ptr::null_mut(),
+                            new_ptr,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                        }
                     }
                 }
             }
@@ -438,27 +539,43 @@ impl DiskCache {
             None => return,
         };
         let ps = self.page_size.load(Ordering::Relaxed) as usize;
-        if ps == 0 { return; }
+        if ps == 0 {
+            return;
+        }
 
         for (i, &pnum) in page_nums.iter().enumerate() {
             if let Some(slot) = mc.get(pnum as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 let src_start = i * ps;
-                if src_start + ps > raw_data.len() { break; }
+                if src_start + ps > raw_data.len() {
+                    break;
+                }
                 if !ptr.is_null() {
-                    unsafe { std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(raw_data[src_start..].as_ptr(), ptr, ps);
+                    }
                 } else {
                     let current = self.mem_cache_bytes.load(Ordering::Relaxed);
-                    if current + ps as u64 > self.mem_cache_budget { return; }
+                    if current + ps as u64 > self.mem_cache_budget {
+                        return;
+                    }
                     let mut page_buf = vec![0u8; ps].into_boxed_slice();
                     page_buf.copy_from_slice(&raw_data[src_start..src_start + ps]);
                     let new_ptr = Box::into_raw(page_buf) as *mut u8;
-                    if slot.compare_exchange(
-                        std::ptr::null_mut(), new_ptr, Ordering::Release, Ordering::Relaxed
-                    ).is_ok() {
+                    if slot
+                        .compare_exchange(
+                            std::ptr::null_mut(),
+                            new_ptr,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         self.mem_cache_bytes.fetch_add(ps as u64, Ordering::Relaxed);
                     } else {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(new_ptr, ps)));
+                        }
                     }
                 }
             }
@@ -484,9 +601,9 @@ impl DiskCache {
     /// Create a zstd decoder dictionary from raw bytes (if dictionary is set).
     #[cfg(feature = "zstd")]
     fn decoder_dict(&self) -> Option<zstd::dict::DecoderDictionary<'static>> {
-        self.dictionary.as_ref().map(|d| {
-            zstd::dict::DecoderDictionary::copy(d)
-        })
+        self.dictionary
+            .as_ref()
+            .map(|d| zstd::dict::DecoderDictionary::copy(d))
     }
 
     /// Read a single page from the cache file.
@@ -494,6 +611,20 @@ impl DiskCache {
     /// Compressed mode: look up offset+len in index, pread, decrypt CTR, zstd decompress.
     pub(crate) fn read_page(&self, page_num: u64, buf: &mut [u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
+
+        // Hard-fail on a tainted cache. Replay rollback failure
+        // sets this flag because the cache holds mixed old/new
+        // bytes that don't represent any consistent snapshot. The
+        // recovery path is process restart: the next VFS open's
+        // assemble() runs recover_staging_logs() and converges the
+        // cache back to consistent state. Until then, serving any
+        // read would risk returning torn / inconsistent data.
+        if self.tainted.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "DiskCache is tainted (replay rollback failed); restart the VFS to recover from the staging log",
+            ));
+        }
 
         if self.cache_compression {
             return self.read_page_compressed(page_num, buf);
@@ -508,7 +639,9 @@ impl DiskCache {
                 if !ptr.is_null() {
                     let ps = self.page_size.load(Ordering::Relaxed) as usize;
                     let copy_len = buf.len().min(ps);
-                    unsafe { std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len); }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), copy_len);
+                    }
                     return Ok(());
                 }
             }
@@ -533,16 +666,19 @@ impl DiskCache {
             let index = self.cache_index.lock();
             match index.get(page_num) {
                 Some(e) => *e,
-                None => return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("page {} not in compressed cache index", page_num),
-                )),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("page {} not in compressed cache index", page_num),
+                    ))
+                }
             }
         };
 
         // Read the compressed (and optionally encrypted) blob
         let mut compressed = vec![0u8; entry.compressed_len as usize];
-        self.cache_file.read_exact_at(&mut compressed, entry.offset)?;
+        self.cache_file
+            .read_exact_at(&mut compressed, entry.offset)?;
 
         // Decrypt if encrypted (CTR, same size)
         #[cfg(feature = "encryption")]
@@ -571,7 +707,9 @@ impl DiskCache {
                     io::ErrorKind::InvalidData,
                     format!(
                         "decompressed page {} too small: need {} bytes, got {}",
-                        page_num, buf.len(), decompressed.len()
+                        page_num,
+                        buf.len(),
+                        decompressed.len()
                     ),
                 ));
             }
@@ -583,6 +721,91 @@ impl DiskCache {
     /// Write a single page to the cache file.
     /// Uncompressed mode: encrypt with CTR if key set, pwrite at fixed offset.
     /// Compressed mode: zstd compress, CTR encrypt, append at index offset.
+    /// Raw page write: pwrite bytes only, **no** bitmap mark, **no**
+    /// mem_cache update. Used by direct hybrid page replay
+    /// (`tiered::replay`): replay finalize must hold every bit flip
+    /// for the end of the install so a mid-batch failure leaves the
+    /// pages unreachable through the VFS read path. Compressed mode
+    /// is unsupported (it allocates offsets via `cache_index.insert`
+    /// which is stateful and can't be cleanly rolled back); the
+    /// caller (replay) is gated to uncompressed cache.
+    pub(crate) fn write_page_no_visibility(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        // Test-only failure injection on the forward path. Production
+        // builds compile this check out via #[cfg(test)].
+        #[cfg(test)]
+        {
+            let remaining = self.fail_no_visibility_after.fetch_sub(1, Ordering::SeqCst);
+            if remaining <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "test-injected forward write_page_no_visibility failure on page {}",
+                        page_num
+                    ),
+                ));
+            }
+        }
+        self.write_page_no_visibility_inner(page_num, data)
+    }
+
+    /// Same byte-write contract as `write_page_no_visibility` but
+    /// against the rollback fault domain. Used by replay finalize's
+    /// pre-image rollback so a forward-write failure injection does
+    /// not also break the rollback path. Production builds collapse
+    /// this and the forward variant into the same inner call.
+    pub(crate) fn write_page_no_visibility_rollback(
+        &self,
+        page_num: u64,
+        data: &[u8],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let remaining = self.fail_rollback_after.fetch_sub(1, Ordering::SeqCst);
+            if remaining <= 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "test-injected rollback write_page_no_visibility failure on page {}",
+                        page_num
+                    ),
+                ));
+            }
+        }
+        self.write_page_no_visibility_inner(page_num, data)
+    }
+
+    /// Shared raw-write implementation for both the forward and
+    /// rollback paths. pwrite bytes only — no bitmap mark, no
+    /// mem_cache update.
+    fn write_page_no_visibility_inner(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        if self.cache_compression {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "write_page_no_visibility: compressed cache mode is not supported by direct hybrid page replay (SingleWriter consumers do not enable compression)",
+            ));
+        }
+
+        let offset = page_num * self.page_size.load(Ordering::Acquire) as u64;
+
+        // CTR encryption: same size, no overhead. Encrypt before
+        // pwrite. The bitmap and mem_cache are NOT touched.
+        let _enc_buf: Vec<u8>;
+        #[cfg(feature = "encryption")]
+        let data = if let Some(ref key) = self.encryption_key {
+            _enc_buf = compress::encrypt_ctr(data, page_num, key)?;
+            _enc_buf.as_slice()
+        } else {
+            data
+        };
+
+        let needed = offset + data.len() as u64;
+        self.ensure_file_len(needed)?;
+        self.cache_file.write_all_at(data, offset)?;
+        Ok(())
+    }
+
     pub(crate) fn write_page(&self, page_num: u64, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
@@ -596,8 +819,8 @@ impl DiskCache {
         let _write_data: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            write_data = compress::encrypt_ctr(data, page_num, key)?;
-            write_data.as_slice()
+            _write_data = compress::encrypt_ctr(data, page_num, key)?;
+            _write_data.as_slice()
         } else {
             data
         };
@@ -614,8 +837,12 @@ impl DiskCache {
             if let Some(slot) = mc.get(page_num as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 if !ptr.is_null() {
-                    let copy_len = data.len().min(self.page_size.load(Ordering::Relaxed) as usize);
-                    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len); }
+                    let copy_len = data
+                        .len()
+                        .min(self.page_size.load(Ordering::Relaxed) as usize);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, copy_len);
+                    }
                 }
             }
         }
@@ -630,7 +857,8 @@ impl DiskCache {
         #[cfg(feature = "zstd")]
         let ed = self.encoder_dict();
         let blob = compress::compress(
-            data, self.cache_compression_level,
+            data,
+            self.cache_compression_level,
             #[cfg(feature = "zstd")]
             ed.as_ref(),
             #[cfg(not(feature = "zstd"))]
@@ -639,9 +867,11 @@ impl DiskCache {
 
         // Encrypt compressed blob
         #[cfg(feature = "encryption")]
-        if let Some(ref key) = self.encryption_key {
-            blob = compress::encrypt_ctr(&blob, page_num, key)?;
-        }
+        let blob = if let Some(ref key) = self.encryption_key {
+            compress::encrypt_ctr(&blob, page_num, key)?
+        } else {
+            blob
+        };
 
         let blob_len = blob.len() as u32;
 
@@ -662,7 +892,12 @@ impl DiskCache {
     /// Write a contiguous range of pages to the cache file in a single I/O operation.
     /// `start_page` is the first page number, `data` is the raw concatenated page data.
     /// Uses RwLock: read lock for pwrite (concurrent), write lock only if file needs extending.
-    pub(crate) fn write_pages_bulk(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
+    pub(crate) fn write_pages_bulk(
+        &self,
+        start_page: u64,
+        data: &[u8],
+        num_pages: u64,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
 
@@ -680,7 +915,11 @@ impl DiskCache {
             for i in 0..num_pages {
                 let start = i as usize * page_sz;
                 let end = (start + page_sz).min(data.len());
-                encrypted.extend_from_slice(&compress::encrypt_ctr(&data[start..end], start_page + i, key)?);
+                encrypted.extend_from_slice(&compress::encrypt_ctr(
+                    &data[start..end],
+                    start_page + i,
+                    key,
+                )?);
             }
             encrypted
         } else {
@@ -726,7 +965,12 @@ impl DiskCache {
     }
 
     /// Compressed bulk write: compress each page individually, concatenate, single pwrite.
-    fn write_pages_bulk_compressed(&self, start_page: u64, data: &[u8], num_pages: u64) -> io::Result<()> {
+    fn write_pages_bulk_compressed(
+        &self,
+        start_page: u64,
+        data: &[u8],
+        num_pages: u64,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
 
@@ -744,7 +988,8 @@ impl DiskCache {
             let page_data = &data[start..end];
 
             let compressed = compress::compress(
-                page_data, self.cache_compression_level,
+                page_data,
+                self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
                 #[cfg(not(feature = "zstd"))]
@@ -752,9 +997,11 @@ impl DiskCache {
             )?;
 
             #[cfg(feature = "encryption")]
-            if let Some(ref key) = self.encryption_key {
-                compressed = compress::encrypt_ctr(&compressed, start_page + i, key)?;
-            }
+            let compressed = if let Some(ref key) = self.encryption_key {
+                compress::encrypt_ctr(&compressed, start_page + i, key)?
+            } else {
+                compressed
+            };
 
             let blob_offset = blob.len() as u64;
             let compressed_len = compressed.len() as u32;
@@ -808,7 +1055,13 @@ impl DiskCache {
 
     /// Write pages to the cache at non-consecutive positions (B-tree-packed groups).
     /// `page_nums` maps position in `data` to actual page number.
-    pub(crate) fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
+    pub(crate) fn write_pages_scattered(
+        &self,
+        page_nums: &[u64],
+        data: &[u8],
+        gid: u64,
+        start_index_in_group: u32,
+    ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
         if page_nums.is_empty() || page_sz == 0 {
@@ -816,7 +1069,9 @@ impl DiskCache {
         }
 
         // Track how many pages we actually write (data may be shorter than page_nums)
-        let writable_count = page_nums.iter().enumerate()
+        let writable_count = page_nums
+            .iter()
+            .enumerate()
             .take_while(|(i, _)| (i + 1) * page_sz <= data.len())
             .count();
         let written_pages = &page_nums[..writable_count];
@@ -825,7 +1080,13 @@ impl DiskCache {
         }
 
         if self.cache_compression {
-            return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
+            return self.write_pages_scattered_compressed(
+                written_pages,
+                data,
+                page_sz,
+                gid,
+                start_index_in_group,
+            );
         }
 
         // Promote decoded pages to mem_cache before encryption
@@ -901,7 +1162,8 @@ impl DiskCache {
             let page_data = &data[src_start..src_start + page_sz];
 
             let compressed = compress::compress(
-                page_data, self.cache_compression_level,
+                page_data,
+                self.cache_compression_level,
                 #[cfg(feature = "zstd")]
                 ed.as_ref(),
                 #[cfg(not(feature = "zstd"))]
@@ -909,9 +1171,11 @@ impl DiskCache {
             )?;
 
             #[cfg(feature = "encryption")]
-            if let Some(ref key) = self.encryption_key {
-                compressed = compress::encrypt_ctr(&compressed, pnum, key)?;
-            }
+            let compressed = if let Some(ref key) = self.encryption_key {
+                compress::encrypt_ctr(&compressed, pnum, key)?
+            } else {
+                compressed
+            };
 
             let blob_offset = blob.len() as u64;
             let compressed_len = compressed.len() as u32;
@@ -1037,7 +1301,8 @@ impl DiskCache {
         }
         // Track peak cache size
         let current = self.tracker.lock().current_cache_bytes;
-        self.stat_peak_cache_bytes.fetch_max(current, Ordering::Relaxed);
+        self.stat_peak_cache_bytes
+            .fetch_max(current, Ordering::Relaxed);
         // Wake any threads waiting on this group
         self.group_condvar.notify_all();
         // Lazy eviction check
@@ -1056,6 +1321,29 @@ impl DiskCache {
             s.store(GroupState::None as u8, Ordering::Release);
         }
         self.group_condvar.notify_all();
+    }
+
+    /// CAS-style unclaim: only transitions `Fetching` → `None` and
+    /// leaves any other state alone. Use this when the caller may
+    /// race with another writer that legitimately advances the
+    /// state to `Present` (for example, replay finalize calling
+    /// `mark_pages_present` while a stale prefetch is still in
+    /// flight). An unconditional `unclaim_group` in that race would
+    /// undo `Present` → `None`, forcing an unnecessary re-fetch
+    /// that could overwrite freshly-installed bytes with stale ones.
+    pub(crate) fn unclaim_if_fetching(&self, gid: u64) -> bool {
+        let states = self.group_states.lock();
+        if let Some(s) = states.get(gid as usize) {
+            let result = s.compare_exchange(
+                GroupState::Fetching as u8,
+                GroupState::None as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            self.group_condvar.notify_all();
+            return result.is_ok();
+        }
+        false
     }
 
     pub(crate) fn ensure_group_states_capacity(
@@ -1083,24 +1371,27 @@ impl DiskCache {
     }
 
     /// Wait for a group to leave Fetching state (condvar, no spin).
-    /// Wait until the group is no longer in a "pending" state.
-    /// Returns when state is Present, or Fetching (worker claimed it),
-    /// or None after having been Fetching (worker failed).
-    /// Caller must re-check state and loop as needed.
-    pub(crate) fn wait_for_group(&self, gid: u64) {
+    /// Returns the observed state after waiting. The wait is bounded so
+    /// a lost Fetching claim cannot park a SQLite read forever.
+    pub(crate) fn wait_for_group(&self, gid: u64) -> GroupState {
         let mut guard = self.group_condvar_mutex.lock();
+        let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let state = self.group_state(gid);
             if state == GroupState::Present {
-                return;
+                return state;
             }
             if state == GroupState::Fetching {
-                self.group_condvar.wait(&mut guard);
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return state;
+                };
+                self.group_condvar.wait_for(&mut guard, remaining);
                 continue;
             }
             // state == None. Worker may not have picked up job yet.
-            self.group_condvar.wait_for(&mut guard, Duration::from_millis(5));
-            return;
+            self.group_condvar
+                .wait_for(&mut guard, Duration::from_millis(5));
+            return self.group_state(gid);
         }
     }
 
@@ -1110,14 +1401,22 @@ impl DiskCache {
         // Also touch all sub-chunks in this group.
         // Use actual page count from group_pages (not positional ppg).
         let gp = self.group_pages.read();
-        let num_pages = gp.get(gid as usize).map(|v| v.len() as u32).unwrap_or(self.pages_per_group);
+        let num_pages = gp
+            .get(gid as usize)
+            .map(|v| v.len() as u32)
+            .unwrap_or(self.pages_per_group);
         drop(gp);
         let mut tracker = self.tracker.lock();
         let frames = if self.sub_pages_per_frame > 0 {
             (num_pages + self.sub_pages_per_frame - 1) / self.sub_pages_per_frame
-        } else { 1 };
+        } else {
+            1
+        };
         for fi in 0..frames {
-            let id = SubChunkId { group_id: gid as u32, frame_index: fi as u16 };
+            let id = SubChunkId {
+                group_id: gid as u32,
+                frame_index: fi as u16,
+            };
             tracker.touch(id);
         }
     }
@@ -1230,7 +1529,8 @@ impl DiskCache {
                     let old = slot.swap(std::ptr::null_mut(), Ordering::Release);
                     if !old.is_null() && ps > 0 {
                         // Reconstruct the Box to defer its drop (no UAF risk)
-                        let boxed = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
+                        let boxed =
+                            unsafe { Box::from_raw(std::slice::from_raw_parts_mut(old, ps)) };
                         self.deferred_frees.lock().push(boxed);
                         self.mem_cache_bytes.fetch_sub(ps as u64, Ordering::Relaxed);
                     }
@@ -1360,7 +1660,8 @@ impl DiskCache {
             self.stat_bytes_evicted.fetch_add(scbs, Ordering::Relaxed);
             evicted += 1;
         }
-        self.stat_last_eviction_count.store(evicted as u64, Ordering::Relaxed);
+        self.stat_last_eviction_count
+            .store(evicted as u64, Ordering::Relaxed);
 
         // Churn detection: if >50% of cache was evicted, warn
         if evicted > 0 {
@@ -1370,7 +1671,9 @@ impl DiskCache {
                 eprintln!(
                     "[cache] WARNING: high churn detected. Evicted {} of {} sub-chunks ({}%). \
                      Consider increasing cache_limit.",
-                    evicted, total_before, evicted as u64 * 100 / total_before,
+                    evicted,
+                    total_before,
+                    evicted as u64 * 100 / total_before,
                 );
             }
         }
@@ -1384,7 +1687,9 @@ impl DiskCache {
             return;
         }
         let mut index = self.cache_index.lock();
-        let to_remove: Vec<u64> = index.entries.keys()
+        let to_remove: Vec<u64> = index
+            .entries
+            .keys()
             .copied()
             .filter(|p| !keep_pages.contains(p))
             .collect();
@@ -1427,6 +1732,35 @@ impl DiskCache {
         }
     }
 
+    /// Mark an explicit set of pages present in the bitmap and their
+    /// owning groups Present. Sibling of `mark_all_pages_present` for
+    /// callers that only want to mark a subset.
+    pub(crate) fn mark_pages_present(&self, page_nums: &[u64]) {
+        if page_nums.is_empty() {
+            return;
+        }
+        let max_page = *page_nums.iter().max().unwrap();
+        {
+            let mut bitmap = self.bitmap.write();
+            bitmap.ensure_capacity(max_page);
+            for &pnum in page_nums {
+                bitmap.mark_present(pnum);
+            }
+        }
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let states = self.group_states.lock();
+            let max_group = max_page / ppg;
+            self.ensure_group_states_capacity(&states, max_group);
+            for &pnum in page_nums {
+                let gid = (pnum / ppg) as usize;
+                if let Some(s) = states.get(gid) {
+                    s.store(GroupState::Present as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
         self.bitmap.read().persist()?;
@@ -1447,7 +1781,9 @@ impl Drop for DiskCache {
                 for slot in mc.iter() {
                     let ptr = slot.swap(std::ptr::null_mut(), Ordering::Relaxed);
                     if !ptr.is_null() {
-                        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps))); }
+                        unsafe {
+                            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, ps)));
+                        }
                     }
                 }
             }
@@ -1460,4 +1796,3 @@ impl Drop for DiskCache {
 #[cfg(test)]
 #[path = "test_disk_cache.rs"]
 mod tests;
-

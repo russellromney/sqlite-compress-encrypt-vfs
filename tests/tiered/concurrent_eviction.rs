@@ -133,7 +133,8 @@ fn verify_all_checksums(conn: &rusqlite::Connection) -> usize {
     for (id, payload, stored_crc) in &rows {
         let actual_crc = crc32(payload) as i64;
         assert_eq!(
-            *stored_crc, actual_crc,
+            *stored_crc,
+            actual_crc,
             "CRC mismatch for row {}: stored={}, actual={}, payload_len={}",
             id,
             stored_crc,
@@ -148,8 +149,7 @@ fn verify_all_checksums(conn: &rusqlite::Connection) -> usize {
 /// while cache eviction is active (tight cache budget forces pages in/out).
 #[test]
 fn concurrent_reads_with_eviction_never_corrupt() {
-    let (bucket, prefix, endpoint, _writer_dir) =
-        setup_concurrent_db("conc_reads_evict");
+    let (bucket, prefix, endpoint, _writer_dir) = setup_concurrent_db("conc_reads_evict");
 
     let stop = Arc::new(AtomicBool::new(false));
     let total_verified = Arc::new(AtomicU64::new(0));
@@ -200,10 +200,7 @@ fn concurrent_reads_with_eviction_never_corrupt() {
 
     let verified = total_verified.load(Ordering::Relaxed);
     let err_count = errors.load(Ordering::Relaxed);
-    eprintln!(
-        "Total rows verified: {}, errors: {}",
-        verified, err_count
-    );
+    eprintln!("Total rows verified: {}, errors: {}", verified, err_count);
     assert_eq!(err_count, 0, "corrupted reads detected during eviction");
     assert!(verified > 0, "no rows were verified");
 }
@@ -212,16 +209,18 @@ fn concurrent_reads_with_eviction_never_corrupt() {
 /// Simpler than the concurrent test, catches basic eviction bugs.
 #[test]
 fn sequential_scans_with_tight_cache() {
-    let (bucket, prefix, endpoint, _writer_dir) =
-        setup_concurrent_db("seq_evict");
+    let (bucket, prefix, endpoint, _writer_dir) = setup_concurrent_db("seq_evict");
 
     // 30 cache pages forces eviction on every scan
-    let (conn, _vfs_name, _cache_dir) =
-        open_evicting_reader(&bucket, &prefix, &endpoint, 30);
+    let (conn, _vfs_name, _cache_dir) = open_evicting_reader(&bucket, &prefix, &endpoint, 30);
 
     for scan in 0..10 {
         let count = verify_all_checksums(&conn);
-        assert_eq!(count, 2000, "scan {}: expected 2000 rows, got {}", scan, count);
+        assert_eq!(
+            count, 2000,
+            "scan {}: expected 2000 rows, got {}",
+            scan, count
+        );
 
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -239,12 +238,10 @@ fn sequential_scans_with_tight_cache() {
 /// surrounding pages are being evicted.
 #[test]
 fn point_queries_under_eviction() {
-    let (bucket, prefix, endpoint, _writer_dir) =
-        setup_concurrent_db("point_evict");
+    let (bucket, prefix, endpoint, _writer_dir) = setup_concurrent_db("point_evict");
 
     // Very tight cache: 20 pages
-    let (conn, _vfs_name, _cache_dir) =
-        open_evicting_reader(&bucket, &prefix, &endpoint, 20);
+    let (conn, _vfs_name, _cache_dir) = open_evicting_reader(&bucket, &prefix, &endpoint, 20);
 
     // Do 500 random point queries
     for i in 0..500 {

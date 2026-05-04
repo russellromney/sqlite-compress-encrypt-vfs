@@ -11,8 +11,8 @@
 #![cfg(feature = "wal")]
 
 use super::helpers::*;
-use turbolite::tiered::*;
 use std::path::Path;
+use turbolite::tiered::*;
 
 struct WalTestParams {
     bucket: String,
@@ -64,7 +64,8 @@ fn import_for_wal(
         let conn = rusqlite::Connection::open(&local_db).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         setup_fn(&conn);
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         drop(conn);
     }
     let manifest = import_sqlite_file(&config, &local_db).unwrap();
@@ -80,10 +81,14 @@ fn import_for_wal(
 fn test_version_is_change_counter() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, manifest) = import_for_wal("wal_ver", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
         for i in 0..100 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)",
-                rusqlite::params![i, format!("val_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("val_{}", i)],
+            )
+            .unwrap();
         }
     });
 
@@ -100,22 +105,32 @@ fn test_version_is_change_counter() {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         for i in 100..110 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)",
-                rusqlite::params![i, format!("new_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("new_{}", i)],
+            )
+            .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     let read_cache = tempfile::tempdir().unwrap();
     let new_manifest = turbolite::tiered::get_manifest(&params.read_config(read_cache.path()))
-        .unwrap().unwrap();
+        .unwrap()
+        .unwrap();
 
-    assert!(new_manifest.version > manifest.version,
-        "version should advance: {} -> {}", manifest.version, new_manifest.version);
+    assert!(
+        new_manifest.version > manifest.version,
+        "version should advance: {} -> {}",
+        manifest.version,
+        new_manifest.version
+    );
 }
 
 // ============================================================================
@@ -127,10 +142,14 @@ fn test_version_is_change_counter() {
 fn test_crash_recovery_via_wal() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, _) = import_for_wal("wal_crash", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
         for i in 0..50 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)",
-                rusqlite::params![i, format!("base_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("base_{}", i)],
+            )
+            .unwrap();
         }
     });
 
@@ -144,11 +163,15 @@ fn test_crash_recovery_via_wal() {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         for i in 50..100 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)",
-                rusqlite::params![i, format!("wal_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("wal_{}", i)],
+            )
+            .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
         drop(conn);
@@ -164,8 +187,11 @@ fn test_crash_recovery_via_wal() {
     let conn = rusqlite::Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    )
+    .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     eprintln!("[test] crash recovery rows: {}", count);
     assert!(count >= 50, "must have at least base 50, got {}", count);
 }
@@ -175,9 +201,15 @@ fn test_crash_recovery_via_wal() {
 fn test_checkpoint_plus_wal_recovery() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, _) = import_for_wal("wal_cp_wal", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
-        for i in 0..30 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("import_{}", i)]).unwrap(); }
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 0..30 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("import_{}", i)],
+            )
+            .unwrap();
+        }
     });
 
     // Phase 1: write + checkpoint
@@ -186,12 +218,21 @@ fn test_checkpoint_plus_wal_recovery() {
         let vfs = TurboliteVfs::new_local(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
-        let conn = rusqlite::Connection::open_with_flags(&db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        for i in 30..60 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("cp_{}", i)]).unwrap(); }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        for i in 30..60 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("cp_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Phase 2: WAL only
@@ -200,11 +241,19 @@ fn test_checkpoint_plus_wal_recovery() {
         let vfs = TurboliteVfs::new_local(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
-        let conn = rusqlite::Connection::open_with_flags(&db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        for i in 60..100 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("wal_{}", i)]).unwrap(); }
+        for i in 60..100 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("wal_{}", i)],
+            )
+            .unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
         drop(conn);
     }
@@ -216,10 +265,18 @@ fn test_checkpoint_plus_wal_recovery() {
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     eprintln!("[test] checkpoint+WAL recovery rows: {}", count);
-    assert!(count >= 60, "must have at least 60 (import+checkpoint), got {}", count);
+    assert!(
+        count >= 60,
+        "must have at least 60 (import+checkpoint), got {}",
+        count
+    );
 }
 
 // ============================================================================
@@ -231,9 +288,15 @@ fn test_checkpoint_plus_wal_recovery() {
 fn test_no_wal_recovery_is_noop() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, _) = import_for_wal("wal_noop", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
-        for i in 0..50 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("v_{}", i)]).unwrap(); }
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v_{}", i)],
+            )
+            .unwrap();
+        }
     });
 
     let rc = tempfile::tempdir().unwrap();
@@ -242,8 +305,12 @@ fn test_no_wal_recovery_is_noop() {
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 50);
 }
 
@@ -256,9 +323,15 @@ fn test_no_wal_recovery_is_noop() {
 fn test_wal_gc_after_checkpoint() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, _) = import_for_wal("wal_gc", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
-        for i in 0..20 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("b_{}", i)]).unwrap(); }
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 0..20 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("b_{}", i)],
+            )
+            .unwrap();
+        }
     });
 
     let vfs_name = unique_vfs_name("wal_gc");
@@ -266,24 +339,33 @@ fn test_wal_gc_after_checkpoint() {
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let db_path = format!("file:source.db?vfs={}", vfs_name);
 
-    let conn = rusqlite::Connection::open_with_flags(&db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
     // Write several batches, let WAL ship
     for batch in 0..5 {
         for i in 0..10 {
-            conn.execute("INSERT INTO t VALUES (?1, ?2)",
-                rusqlite::params![20 + batch * 10 + i, format!("b{}_{}", batch, i)]).unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![20 + batch * 10 + i, format!("b{}_{}", batch, i)],
+            )
+            .unwrap();
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
     // Checkpoint triggers GC
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 70, "should have 20 + 50 = 70 rows");
 }
 
@@ -296,9 +378,15 @@ fn test_wal_gc_after_checkpoint() {
 fn test_large_data_wal_recovery() {
     let cache_dir = tempfile::tempdir().unwrap();
     let (params, _) = import_for_wal("wal_lg", cache_dir.path(), |conn| {
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
-        for i in 0..200 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("i_{}", i)]).unwrap(); }
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 0..200 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("i_{}", i)],
+            )
+            .unwrap();
+        }
     });
 
     // Write + checkpoint + write + WAL
@@ -307,16 +395,30 @@ fn test_large_data_wal_recovery() {
         let vfs = TurboliteVfs::new_local(params.wal_config(cache_dir.path())).unwrap();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
         let db_path = format!("file:source.db?vfs={}", vfs_name);
-        let conn = rusqlite::Connection::open_with_flags(&db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
-        for i in 200..600 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("cp_{}", i)]).unwrap(); }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        for i in 200..600 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("cp_{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
 
-        for i in 600..1000 { conn.execute("INSERT INTO t VALUES (?1, ?2)",
-            rusqlite::params![i, format!("w_{}", i)]).unwrap(); }
+        for i in 600..1000 {
+            conn.execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![i, format!("w_{}", i)],
+            )
+            .unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_secs(2));
         drop(conn);
     }
@@ -327,8 +429,16 @@ fn test_large_data_wal_recovery() {
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         &format!("file:source.db?vfs={}", vfs_name),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+        .unwrap();
     eprintln!("[test] large recovery: {} rows", count);
-    assert!(count >= 600, "must have at least 600 (import+checkpoint), got {}", count);
+    assert!(
+        count >= 600,
+        "must have at least 600 (import+checkpoint), got {}",
+        count
+    );
 }

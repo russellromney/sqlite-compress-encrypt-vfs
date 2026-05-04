@@ -6,9 +6,9 @@
 //! - Corrupt snapshot manifests are skipped gracefully
 //! - Multiple snapshots protect overlapping page groups
 
-use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{SharedTurboliteVfs, TurboliteConfig, TurboliteVfs};
 
 /// Write data, checkpoint, snapshot the manifest, write more data, checkpoint again.
 /// gc() should NOT delete the page groups referenced by the snapshot manifest.
@@ -28,8 +28,7 @@ fn test_gc_preserves_snapshot_page_groups() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_snap_preserve.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -53,13 +52,16 @@ fn test_gc_preserves_snapshot_page_groups() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v1");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v1");
 
     let count_after_v1 = count_s3_objects(&bucket, &prefix, &endpoint);
     eprintln!("S3 objects after v1: {}", count_after_v1);
 
     // Snapshot: copy current manifest to manifest-snap-test123.msgpack
-    let snap_key = vfs_ref.copy_manifest_to_snapshot("test123").expect("snapshot copy");
+    let snap_key = vfs_ref
+        .copy_manifest_to_snapshot("test123")
+        .expect("snapshot copy");
     eprintln!("Snapshot manifest key: {}", snap_key);
 
     // Write batch 2, checkpoint (creates page group v2, old v1 groups are now orphans
@@ -75,12 +77,18 @@ fn test_gc_preserves_snapshot_page_groups() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v2");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v2");
 
     let count_after_v2 = count_s3_objects(&bucket, &prefix, &endpoint);
     eprintln!("S3 objects after v2 (no GC yet): {}", count_after_v2);
     // v2 should have more objects (v1 + v2 page groups + snapshot manifest)
-    assert!(count_after_v2 > count_after_v1, "v2 should accumulate: v1={} v2={}", count_after_v1, count_after_v2);
+    assert!(
+        count_after_v2 > count_after_v1,
+        "v2 should accumulate: v1={} v2={}",
+        count_after_v1,
+        count_after_v2
+    );
 
     // Run gc(). With snapshot manifest present, v1 page groups should survive.
     drop(conn);
@@ -96,7 +104,10 @@ fn test_gc_preserves_snapshot_page_groups() {
     };
     let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let deleted = gc_vfs.gc().expect("gc");
-    eprintln!("GC deleted {} objects (with snapshot protecting v1)", deleted);
+    eprintln!(
+        "GC deleted {} objects (with snapshot protecting v1)",
+        deleted
+    );
 
     let count_after_gc = count_s3_objects(&bucket, &prefix, &endpoint);
     eprintln!("S3 objects after gc with snapshot: {}", count_after_gc);
@@ -105,7 +116,8 @@ fn test_gc_preserves_snapshot_page_groups() {
     assert!(
         count_after_gc >= count_after_v1,
         "snapshot should protect v1 page groups from gc: after_v1={} after_gc={}",
-        count_after_v1, count_after_gc,
+        count_after_v1,
+        count_after_gc,
     );
 
     // Verify data integrity: open at current manifest, all 200 rows visible
@@ -120,7 +132,10 @@ fn test_gc_preserves_snapshot_page_groups() {
     let count: i64 = reader
         .query_row("SELECT COUNT(*) FROM snap_test", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(count, 200, "all 200 rows should be readable after gc with snapshot");
+    assert_eq!(
+        count, 200,
+        "all 200 rows should be readable after gc with snapshot"
+    );
 }
 
 /// After deleting the snapshot manifest, gc() should clean up the old page groups.
@@ -140,8 +155,7 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_snap_delete.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -165,10 +179,13 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v1");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v1");
 
     // Snapshot
-    vfs_ref.copy_manifest_to_snapshot("del456").expect("snapshot");
+    vfs_ref
+        .copy_manifest_to_snapshot("del456")
+        .expect("snapshot");
 
     // Write + checkpoint v2
     {
@@ -182,12 +199,15 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v2");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v2");
 
     let count_before_delete = count_s3_objects(&bucket, &prefix, &endpoint);
 
     // Delete the snapshot manifest
-    vfs_ref.delete_snapshot_manifest("del456").expect("delete snapshot");
+    vfs_ref
+        .delete_snapshot_manifest("del456")
+        .expect("delete snapshot");
 
     // Now gc should clean up v1 page groups
     drop(conn);
@@ -206,15 +226,22 @@ fn test_gc_cleans_up_after_snapshot_deleted() {
     eprintln!("GC deleted {} objects after snapshot deleted", deleted);
 
     let count_after_gc = count_s3_objects(&bucket, &prefix, &endpoint);
-    eprintln!("S3 objects: before_delete={} after_gc={}", count_before_delete, count_after_gc);
+    eprintln!(
+        "S3 objects: before_delete={} after_gc={}",
+        count_before_delete, count_after_gc
+    );
 
     // With snapshot deleted, gc should have cleaned up v1 orphans
     assert!(
         count_after_gc < count_before_delete,
         "gc should reduce object count after snapshot deleted: before={} after={}",
-        count_before_delete, count_after_gc,
+        count_before_delete,
+        count_after_gc,
     );
-    assert!(deleted > 0, "gc should have deleted at least 1 orphan after snapshot deleted");
+    assert!(
+        deleted > 0,
+        "gc should have deleted at least 1 orphan after snapshot deleted"
+    );
 
     // Data integrity: current data (200 rows) still readable
     let read_vfs_name = unique_vfs_name("gc_snap_delete_read");
@@ -247,8 +274,7 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_snap_corrupt.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -272,7 +298,8 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
 
     // Write a corrupt snapshot manifest directly to S3
     let rt = shared_runtime_handle();
@@ -291,7 +318,9 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
             .put_object()
             .bucket(&bucket)
             .key(&corrupt_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(b"this is not valid msgpack".to_vec()))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                b"this is not valid msgpack".to_vec(),
+            ))
             .send()
             .await
             .expect("put corrupt manifest");
@@ -311,7 +340,11 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
     };
     let gc_vfs = TurboliteVfs::new_local(gc_config).expect("gc vfs");
     let result = gc_vfs.gc();
-    assert!(result.is_ok(), "gc should not crash on corrupt snapshot manifest: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "gc should not crash on corrupt snapshot manifest: {:?}",
+        result.err()
+    );
 
     // The corrupt manifest key itself should still exist (it's kept alive as a live key)
     let all_keys_after = count_s3_objects(&bucket, &prefix, &endpoint);
@@ -329,7 +362,10 @@ fn test_gc_skips_corrupt_snapshot_manifest() {
     let count: i64 = reader
         .query_row("SELECT COUNT(*) FROM snap_corrupt", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(count, 50, "data should be intact after gc with corrupt snapshot");
+    assert_eq!(
+        count, 50,
+        "data should be intact after gc with corrupt snapshot"
+    );
 }
 
 /// Multiple snapshots: gc() should protect page groups from ALL snapshot manifests.
@@ -349,8 +385,7 @@ fn test_gc_multiple_snapshots() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_snap_multi.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -374,8 +409,11 @@ fn test_gc_multiple_snapshots() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v1");
-    vfs_ref.copy_manifest_to_snapshot("snap-a").expect("snapshot a");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v1");
+    vfs_ref
+        .copy_manifest_to_snapshot("snap-a")
+        .expect("snapshot a");
 
     // v2: write, checkpoint, snapshot "snap-b"
     {
@@ -389,8 +427,11 @@ fn test_gc_multiple_snapshots() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v2");
-    vfs_ref.copy_manifest_to_snapshot("snap-b").expect("snapshot b");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v2");
+    vfs_ref
+        .copy_manifest_to_snapshot("snap-b")
+        .expect("snapshot b");
 
     // v3: write, checkpoint (current state)
     {
@@ -404,10 +445,14 @@ fn test_gc_multiple_snapshots() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v3");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v3");
 
     let count_before_gc = count_s3_objects(&bucket, &prefix, &endpoint);
-    eprintln!("S3 objects before gc (3 versions, 2 snapshots): {}", count_before_gc);
+    eprintln!(
+        "S3 objects before gc (3 versions, 2 snapshots): {}",
+        count_before_gc
+    );
 
     // gc with both snapshots alive: should protect v1 and v2 page groups
     drop(conn);
@@ -431,11 +476,14 @@ fn test_gc_multiple_snapshots() {
     assert!(
         count_after_gc >= count_before_gc - 1, // at most manifest.json deleted
         "both snapshots should protect their page groups: before={} after={}",
-        count_before_gc, count_after_gc,
+        count_before_gc,
+        count_after_gc,
     );
 
     // Delete snap-a, gc again: v1-specific page groups should now be cleanable
-    gc_vfs.delete_snapshot_manifest("snap-a").expect("delete snap-a");
+    gc_vfs
+        .delete_snapshot_manifest("snap-a")
+        .expect("delete snap-a");
     let deleted2 = gc_vfs.gc().expect("gc after snap-a deleted");
     eprintln!("GC after snap-a deleted: deleted {} objects", deleted2);
 
@@ -443,7 +491,9 @@ fn test_gc_multiple_snapshots() {
     // (v1 groups that aren't shared with v2 or v3 get cleaned up)
 
     // Delete snap-b, gc again: now all old page groups should be cleanable
-    gc_vfs.delete_snapshot_manifest("snap-b").expect("delete snap-b");
+    gc_vfs
+        .delete_snapshot_manifest("snap-b")
+        .expect("delete snap-b");
     let deleted3 = gc_vfs.gc().expect("gc after snap-b deleted");
     eprintln!("GC after snap-b deleted: deleted {} objects", deleted3);
 
@@ -462,7 +512,10 @@ fn test_gc_multiple_snapshots() {
     let count: i64 = reader
         .query_row("SELECT COUNT(*) FROM snap_multi", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(count, 150, "all 150 rows should be readable after all gc passes");
+    assert_eq!(
+        count, 150,
+        "all 150 rows should be readable after all gc passes"
+    );
 }
 
 /// Phase Recall Step 2: fork from a snapshot manifest into a new prefix.
@@ -484,8 +537,7 @@ fn test_fork_from_snapshot_manifest() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "fork_src.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -509,14 +561,22 @@ fn test_fork_from_snapshot_manifest() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v1");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v1");
 
     // Snapshot
-    vfs_ref.copy_manifest_to_snapshot("fork-snap").expect("snapshot");
-    let snap_manifest = vfs_ref.get_snapshot_manifest("fork-snap")
+    vfs_ref
+        .copy_manifest_to_snapshot("fork-snap")
+        .expect("snapshot");
+    let snap_manifest = vfs_ref
+        .get_snapshot_manifest("fork-snap")
         .expect("get snapshot")
         .expect("should exist");
-    eprintln!("Snapshot manifest v{} with {} page groups", snap_manifest.version, snap_manifest.page_group_keys.len());
+    eprintln!(
+        "Snapshot manifest v{} with {} page groups",
+        snap_manifest.version,
+        snap_manifest.page_group_keys.len()
+    );
 
     // Write batch 2 (ids 50-99), checkpoint -- this is AFTER the snapshot
     {
@@ -530,7 +590,8 @@ fn test_fork_from_snapshot_manifest() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint v2");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint v2");
 
     // Verify source has all 100 rows
     let src_count: i64 = conn
@@ -554,7 +615,9 @@ fn test_fork_from_snapshot_manifest() {
     let fork_vfs = TurboliteVfs::new_local(fork_config).expect("fork vfs");
 
     // Seed the fork with the snapshot manifest
-    fork_vfs.seed_manifest(&snap_manifest).expect("seed manifest");
+    fork_vfs
+        .seed_manifest(&snap_manifest)
+        .expect("seed manifest");
 
     // Open a connection through the forked VFS
     let fork_vfs_name = unique_vfs_name("fork_dst");
@@ -570,18 +633,32 @@ fn test_fork_from_snapshot_manifest() {
     let fork_count: i64 = fork_conn
         .query_row("SELECT COUNT(*) FROM fork_test", [], |row| row.get(0))
         .expect("count");
-    assert_eq!(fork_count, 50, "fork should see only 50 rows (pre-snapshot), got {}", fork_count);
+    assert_eq!(
+        fork_count, 50,
+        "fork should see only 50 rows (pre-snapshot), got {}",
+        fork_count
+    );
 
     // Verify the data content is from before the snapshot
     let fork_data: String = fork_conn
-        .query_row("SELECT data FROM fork_test WHERE id = 0", [], |row| row.get(0))
+        .query_row("SELECT data FROM fork_test WHERE id = 0", [], |row| {
+            row.get(0)
+        })
         .expect("query");
-    assert_eq!(fork_data, "before_snap_0", "fork data should be pre-snapshot");
+    assert_eq!(
+        fork_data, "before_snap_0",
+        "fork data should be pre-snapshot"
+    );
 
     // Verify post-snapshot data is NOT visible
-    let missing: Result<i64, _> = fork_conn
-        .query_row("SELECT id FROM fork_test WHERE id = 50", [], |row| row.get(0));
-    assert!(missing.is_err(), "post-snapshot row 50 should NOT be visible in fork");
+    let missing: Result<i64, _> =
+        fork_conn.query_row("SELECT id FROM fork_test WHERE id = 50", [], |row| {
+            row.get(0)
+        });
+    assert!(
+        missing.is_err(),
+        "post-snapshot row 50 should NOT be visible in fork"
+    );
 }
 
 /// Fork from snapshot, write to the fork, verify the original is untouched (COW).
@@ -601,8 +678,7 @@ fn test_fork_cow_isolation() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cow_src.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -626,11 +702,15 @@ fn test_fork_cow_isolation() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
 
     // Snapshot + read it
-    vfs_ref.copy_manifest_to_snapshot("cow-snap").expect("snapshot");
-    let snap_manifest = vfs_ref.get_snapshot_manifest("cow-snap")
+    vfs_ref
+        .copy_manifest_to_snapshot("cow-snap")
+        .expect("snapshot");
+    let snap_manifest = vfs_ref
+        .get_snapshot_manifest("cow-snap")
         .expect("get")
         .expect("exists");
 
@@ -656,13 +736,14 @@ fn test_fork_cow_isolation() {
     // Open fork as read-write and insert new data
     let fork_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "cow_fork.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &fork_vfs_name,
     )
     .expect("open fork rw");
 
-    fork_conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
+    fork_conn
+        .execute_batch("PRAGMA journal_mode=WAL;")
+        .expect("wal");
 
     // Write to the fork
     {
@@ -676,7 +757,9 @@ fn test_fork_cow_isolation() {
         }
         tx.commit().expect("commit fork");
     }
-    fork_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint fork");
+    fork_conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint fork");
 
     // Fork should have 60 rows
     let fork_count: i64 = fork_conn
@@ -688,12 +771,20 @@ fn test_fork_cow_isolation() {
     let src_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM cow_test", [], |row| row.get(0))
         .expect("count src");
-    assert_eq!(src_count, 30, "original should still have 30 rows (COW isolation)");
+    assert_eq!(
+        src_count, 30,
+        "original should still have 30 rows (COW isolation)"
+    );
 
     // Verify no fork data leaked into original
-    let leak_check: Result<i64, _> = conn
-        .query_row("SELECT id FROM cow_test WHERE id = 30", [], |row| row.get(0));
-    assert!(leak_check.is_err(), "fork data should NOT appear in original");
+    let leak_check: Result<i64, _> =
+        conn.query_row("SELECT id FROM cow_test WHERE id = 30", [], |row| {
+            row.get(0)
+        });
+    assert!(
+        leak_check.is_err(),
+        "fork data should NOT appear in original"
+    );
 }
 
 /// Verify that copy_manifest_to_snapshot + get_snapshot_manifest round-trips correctly.
@@ -710,8 +801,7 @@ fn test_snapshot_manifest_roundtrip() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "snap_roundtrip.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .expect("open");
@@ -735,24 +825,52 @@ fn test_snapshot_manifest_roundtrip() {
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
 
     // Copy manifest to snapshot
-    let snap_key = vfs_ref.copy_manifest_to_snapshot("rt-test").expect("snapshot");
-    assert!(snap_key.contains("manifest-snap-rt-test.msgpack"), "snap key should contain expected name: {}", snap_key);
+    let snap_key = vfs_ref
+        .copy_manifest_to_snapshot("rt-test")
+        .expect("snapshot");
+    assert!(
+        snap_key.contains("manifest-snap-rt-test.msgpack"),
+        "snap key should contain expected name: {}",
+        snap_key
+    );
 
     // Read it back
-    let snap_manifest = vfs_ref.get_snapshot_manifest("rt-test").expect("get snapshot").expect("should exist");
-    assert!(snap_manifest.version >= 1, "snapshot manifest version should be >= 1");
-    assert!(snap_manifest.page_count > 0, "snapshot manifest should have pages");
-    assert!(!snap_manifest.page_group_keys.is_empty(), "snapshot manifest should have page groups");
+    let snap_manifest = vfs_ref
+        .get_snapshot_manifest("rt-test")
+        .expect("get snapshot")
+        .expect("should exist");
+    assert!(
+        snap_manifest.version >= 1,
+        "snapshot manifest version should be >= 1"
+    );
+    assert!(
+        snap_manifest.page_count > 0,
+        "snapshot manifest should have pages"
+    );
+    assert!(
+        !snap_manifest.page_group_keys.is_empty(),
+        "snapshot manifest should have page groups"
+    );
 
     // Non-existent snapshot returns None
-    let missing = vfs_ref.get_snapshot_manifest("nonexistent").expect("get missing");
+    let missing = vfs_ref
+        .get_snapshot_manifest("nonexistent")
+        .expect("get missing");
     assert!(missing.is_none(), "nonexistent snapshot should return None");
 
     // Delete and verify gone
-    vfs_ref.delete_snapshot_manifest("rt-test").expect("delete snapshot");
-    let after_delete = vfs_ref.get_snapshot_manifest("rt-test").expect("get after delete");
-    assert!(after_delete.is_none(), "deleted snapshot should return None");
+    vfs_ref
+        .delete_snapshot_manifest("rt-test")
+        .expect("delete snapshot");
+    let after_delete = vfs_ref
+        .get_snapshot_manifest("rt-test")
+        .expect("get after delete");
+    assert!(
+        after_delete.is_none(),
+        "deleted snapshot should return None"
+    );
 }

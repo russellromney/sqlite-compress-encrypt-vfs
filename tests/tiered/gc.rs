@@ -1,8 +1,8 @@
 //! Garbage collection tests: post-checkpoint GC, disabled GC, full scan, no-orphan safety.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_gc_post_checkpoint() {
@@ -19,8 +19,7 @@ fn test_gc_post_checkpoint() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_post.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -44,7 +43,8 @@ fn test_gc_post_checkpoint() {
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let count_after_v1 = count_s3_objects(&bucket, &prefix, &endpoint);
     eprintln!("S3 objects after v1: {}", count_after_v1);
 
@@ -60,7 +60,8 @@ fn test_gc_post_checkpoint() {
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let count_after_v2 = count_s3_objects(&bucket, &prefix, &endpoint);
     eprintln!("S3 objects after v2 (with GC): {}", count_after_v2);
 
@@ -69,7 +70,8 @@ fn test_gc_post_checkpoint() {
     assert!(
         count_after_v2 <= count_after_v1,
         "GC should not increase S3 object count: v1={} v2={}",
-        count_after_v1, count_after_v2,
+        count_after_v1,
+        count_after_v2,
     );
 
     // Verify data integrity after GC
@@ -95,8 +97,7 @@ fn test_gc_disabled_preserves_old_versions() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_off.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -120,7 +121,8 @@ fn test_gc_disabled_preserves_old_versions() {
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let count_after_v1 = count_s3_objects(&bucket, &prefix, &endpoint);
 
     // Second write + checkpoint — old versions should remain
@@ -135,14 +137,16 @@ fn test_gc_disabled_preserves_old_versions() {
         }
         tx.commit().unwrap();
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let count_after_v2 = count_s3_objects(&bucket, &prefix, &endpoint);
 
     // Without GC, v2 should have MORE objects (v1 + v2 page groups)
     assert!(
         count_after_v2 > count_after_v1,
         "Without GC, old versions should accumulate: v1={} v2={}",
-        count_after_v1, count_after_v2,
+        count_after_v1,
+        count_after_v2,
     );
 }
 
@@ -163,8 +167,7 @@ fn test_gc_full_scan() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_scan.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -188,7 +191,8 @@ fn test_gc_full_scan() {
             .unwrap();
         }
         tx.commit().unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     let count_before_gc = count_s3_objects(&bucket, &prefix, &endpoint);
@@ -203,7 +207,8 @@ fn test_gc_full_scan() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();
@@ -216,7 +221,8 @@ fn test_gc_full_scan() {
     assert!(
         count_after_gc < count_before_gc,
         "Full GC should reduce object count: before={} after={}",
-        count_before_gc, count_after_gc,
+        count_before_gc,
+        count_after_gc,
     );
     assert!(deleted > 0, "GC should have deleted at least 1 orphan");
 
@@ -248,8 +254,7 @@ fn test_gc_no_orphans() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "gc_noop.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -263,7 +268,8 @@ fn test_gc_no_orphans() {
 
     // Single write + checkpoint with GC already enabled → no old versions exist
     conn.execute("INSERT INTO gc_noop VALUES (1)", []).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
 
     // Full GC scan should find nothing to delete
     drop(conn);
@@ -274,7 +280,8 @@ fn test_gc_no_orphans() {
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: Some(endpoint_url()),
         region: Some("auto".to_string()),
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let gc_vfs = TurboliteVfs::new_local(gc_config).unwrap();
     let deleted = gc_vfs.gc().unwrap();

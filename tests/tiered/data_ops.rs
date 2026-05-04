@@ -1,8 +1,8 @@
 //! Data operation tests: UPDATE/DELETE, VACUUM, rollback, multiple tables, BLOBs, journal modes.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_rollback_discards_dirty_pages() {
@@ -15,8 +15,7 @@ fn test_rollback_discards_dirty_pages() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "rollback_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -67,7 +66,10 @@ fn test_rollback_discards_dirty_pages() {
     let count2: i64 = conn
         .query_row("SELECT COUNT(*) FROM rb", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(count2, 10, "checkpoint after rollback should preserve only committed data");
+    assert_eq!(
+        count2, 10,
+        "checkpoint after rollback should preserve only committed data"
+    );
 
     // Bulk insert more after rollback — should work fine
     {
@@ -105,8 +107,7 @@ fn test_large_representative_db() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "large_db_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -132,8 +133,14 @@ fn test_large_representative_db() {
     let total_rows: i64 = 100_000;
     let batch_size = 10_000;
     let devices = [
-        "sensor-A1", "sensor-A2", "sensor-B1", "sensor-B2",
-        "sensor-C1", "sensor-C2", "sensor-D1", "sensor-D2",
+        "sensor-A1",
+        "sensor-A2",
+        "sensor-B1",
+        "sensor-B2",
+        "sensor-C1",
+        "sensor-C2",
+        "sensor-D1",
+        "sensor-D2",
     ];
     let statuses = ["ok", "warning", "critical", "offline", "maintenance"];
     // ~128 byte payload to simulate realistic sensor data blobs
@@ -156,7 +163,9 @@ fn test_large_representative_db() {
             let battery = 100 - (i % 100) as i32;
             tx.execute(
                 "INSERT INTO sensor_readings VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![i, device, ts, temp, humidity, pressure, battery, status, payload],
+                rusqlite::params![
+                    i, device, ts, temp, humidity, pressure, battery, status, payload
+                ],
             )
             .unwrap();
         }
@@ -198,12 +207,12 @@ fn test_large_representative_db() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_large_reader");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "large_db_test.db",
@@ -288,7 +297,10 @@ fn test_large_representative_db() {
     assert_eq!(blob_data.len(), 128);
     assert!(blob_data.iter().all(|&b| b == 0xAB));
 
-    eprintln!("Large representative DB test passed: {} rows, bulk insert + S3 checkpoint + cold read", total_rows);
+    eprintln!(
+        "Large representative DB test passed: {} rows, bulk insert + S3 checkpoint + cold read",
+        total_rows
+    );
 }
 
 #[test]
@@ -306,8 +318,7 @@ fn test_oltp_with_indexes() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "oltp_idx_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -403,12 +414,12 @@ fn test_oltp_with_indexes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_oltp_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "oltp_idx_test.db",
@@ -420,7 +431,10 @@ fn test_oltp_with_indexes() {
     let cold_count: i64 = reader
         .query_row("SELECT COUNT(*) FROM orders", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(cold_count, 900, "cold read should see 900 rows after deletes");
+    assert_eq!(
+        cold_count, 900,
+        "cold read should see 900 rows after deletes"
+    );
 
     // Index-assisted queries should work
     let cust_count: i64 = reader
@@ -472,8 +486,7 @@ fn test_update_delete_operations() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "upd_del_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -539,12 +552,12 @@ fn test_update_delete_operations() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_upddel_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "upd_del_test.db",
@@ -560,21 +573,17 @@ fn test_update_delete_operations() {
 
     // Verify updated values
     let val: String = reader
-        .query_row(
-            "SELECT value FROM kv WHERE key = 'key_0000'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM kv WHERE key = 'key_0000'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(val.starts_with("updated_"), "key_0000 should be updated");
 
     // Verify non-updated values
     let val2: String = reader
-        .query_row(
-            "SELECT value FROM kv WHERE key = 'key_0001'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM kv WHERE key = 'key_0001'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(val2.starts_with("original_"), "key_0001 should be original");
 
@@ -606,8 +615,7 @@ fn test_multiple_tables() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "multi_tbl_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -663,12 +671,12 @@ fn test_multiple_tables() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_multitbl_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "multi_tbl_test.db",
@@ -678,7 +686,12 @@ fn test_multiple_tables() {
     .unwrap();
 
     // Verify all 4 tables
-    for (table, expected) in [("users", 100), ("products", 100), ("orders", 100), ("audit_log", 100)] {
+    for (table, expected) in [
+        ("users", 100),
+        ("products", 100),
+        ("orders", 100),
+        ("audit_log", 100),
+    ] {
         let count: i64 = reader
             .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
                 row.get(0)
@@ -715,8 +728,7 @@ fn test_large_overflow_blobs() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "overflow_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -757,12 +769,12 @@ fn test_large_overflow_blobs() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_overflow_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "overflow_test.db",
@@ -789,20 +801,11 @@ fn test_large_overflow_blobs() {
         );
         // Verify content pattern
         for (j, &byte) in data.iter().enumerate() {
-            assert_eq!(
-                byte,
-                (j % 256) as u8,
-                "blob {} byte {} mismatch",
-                i,
-                j
-            );
+            assert_eq!(byte, (j % 256) as u8, "blob {} byte {} mismatch", i, j);
         }
     }
 
-    eprintln!(
-        "Overflow blob test passed: sizes {:?}",
-        sizes
-    );
+    eprintln!("Overflow blob test passed: sizes {:?}", sizes);
 }
 
 /// VACUUM after deletes reorganizes pages. Verifies that the VFS
@@ -822,8 +825,7 @@ fn test_vacuum_reorganizes() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "vacuum_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -896,12 +898,12 @@ fn test_vacuum_reorganizes() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_vacuum_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "vacuum_test.db",
@@ -913,14 +915,15 @@ fn test_vacuum_reorganizes() {
     let cold_count: i64 = reader
         .query_row("SELECT COUNT(*) FROM bulk", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(cold_count, 200, "cold read after VACUUM should see 200 rows");
+    assert_eq!(
+        cold_count, 200,
+        "cold read after VACUUM should see 200 rows"
+    );
 
     let val: String = reader
-        .query_row(
-            "SELECT payload FROM bulk WHERE id = 199",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT payload FROM bulk WHERE id = 199", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(val.starts_with("payload_"));
 }
@@ -945,8 +948,7 @@ fn test_delete_preserves_s3() {
     {
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "del_s3_test.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -995,12 +997,12 @@ fn test_delete_preserves_s3() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_del_s3_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "del_s3_test.db",
@@ -1032,8 +1034,7 @@ fn test_delete_journal_mode() {
 
     let conn = rusqlite::Connection::open_with_flags_and_vfs(
         "jdel_test.db",
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
         &vfs_name,
     )
     .unwrap();
@@ -1079,12 +1080,12 @@ fn test_delete_journal_mode() {
         endpoint_url: endpoint,
         read_only: true,
         region,
-        runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+        runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        ..Default::default()
     };
     let reader_vfs_name = unique_vfs_name("tiered_jdel_r");
     let reader_vfs = TurboliteVfs::new_local(reader_config).unwrap();
-    turbolite::tiered::register(&reader_vfs_name, reader_vfs)
-        .unwrap();
+    turbolite::tiered::register(&reader_vfs_name, reader_vfs).unwrap();
 
     let reader = rusqlite::Connection::open_with_flags_and_vfs(
         "jdel_test.db",

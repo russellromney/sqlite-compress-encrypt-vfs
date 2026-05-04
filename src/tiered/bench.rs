@@ -11,9 +11,10 @@ use hadb_storage::StorageBackend;
 
 use super::storage as storage_helpers;
 use super::{
-    cache_tracking, compact, decode_page_group, decode_page_group_seekable_full, encode_page_group,
-    encode_page_group_seekable, flush, keys, query_plan, read_change_counter_from_cache, staging,
-    DiskCache, FrameEntry, GroupState, Manifest, PrefetchPool, SubChunkId,
+    cache_tracking, compact, decode_page_group, decode_page_group_seekable_full,
+    decode_seekable_subchunk, encode_page_group, encode_page_group_seekable, flush, keys,
+    query_plan, read_change_counter_from_cache, staging, DiskCache, FrameEntry, GroupState,
+    Manifest, PrefetchPool, SubChunkId,
 };
 
 /// Lightweight handle for benchmarking / embedder flush + cache ops. Shares
@@ -294,13 +295,25 @@ impl TurboliteSharedState {
         let mut tracker = self.cache.tracker.lock();
         let target_tiers: Vec<cache_tracking::SubChunkTier> = match tier {
             "data" => vec![cache_tracking::SubChunkTier::Data],
-            "index" => vec![cache_tracking::SubChunkTier::Index, cache_tracking::SubChunkTier::Data],
-            "all" => vec![cache_tracking::SubChunkTier::Index, cache_tracking::SubChunkTier::Data],
+            "index" => vec![
+                cache_tracking::SubChunkTier::Index,
+                cache_tracking::SubChunkTier::Data,
+            ],
+            "all" => vec![
+                cache_tracking::SubChunkTier::Index,
+                cache_tracking::SubChunkTier::Data,
+            ],
             _ => return 0,
         };
-        let to_evict: Vec<SubChunkId> = tracker.present.iter()
+        let to_evict: Vec<SubChunkId> = tracker
+            .present
+            .iter()
             .filter(|id| {
-                let t = tracker.tiers.get(id).copied().unwrap_or(cache_tracking::SubChunkTier::Data);
+                let t = tracker
+                    .tiers
+                    .get(id)
+                    .copied()
+                    .unwrap_or(cache_tracking::SubChunkTier::Data);
                 target_tiers.contains(&t) && !pending.contains(&(id.group_id as u64))
             })
             .copied()
@@ -315,8 +328,12 @@ impl TurboliteSharedState {
             self.cache.clear_pages_from_disk(&page_nums);
             evicted += 1;
         }
-        self.cache.stat_evictions.fetch_add(evicted as u64, Ordering::Relaxed);
-        self.cache.stat_bytes_evicted.fetch_add(evicted as u64 * scbs, Ordering::Relaxed);
+        self.cache
+            .stat_evictions
+            .fetch_add(evicted as u64, Ordering::Relaxed);
+        self.cache
+            .stat_bytes_evicted
+            .fetch_add(evicted as u64 * scbs, Ordering::Relaxed);
         evicted
     }
 
@@ -376,14 +393,22 @@ impl TurboliteSharedState {
             \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
             \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
             \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{}}}",
-            total_bytes, peak_bytes,
+            total_bytes,
+            peak_bytes,
             groups_with_data.len(),
             total_groups,
-            pinned_chunks, pinned_bytes,
-            index_chunks, index_bytes,
-            data_chunks, data_bytes,
-            hits, misses, hit_rate,
-            evictions, bytes_evicted, last_eviction,
+            pinned_chunks,
+            pinned_bytes,
+            index_chunks,
+            index_bytes,
+            data_chunks,
+            data_bytes,
+            hits,
+            misses,
+            hit_rate,
+            evictions,
+            bytes_evicted,
+            last_eviction,
         )
     }
 
@@ -407,9 +432,21 @@ impl TurboliteSharedState {
                         if key.is_empty() {
                             continue;
                         }
-                        let ft = manifest.frame_tables.get(gid as usize).cloned().unwrap_or_default();
-                        let gp = manifest.group_pages.get(gid as usize).cloned().unwrap_or_default();
-                        let ovrs = manifest.subframe_overrides.get(gid as usize).cloned().unwrap_or_default();
+                        let ft = manifest
+                            .frame_tables
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let gp = manifest
+                            .group_pages
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        let ovrs = manifest
+                            .subframe_overrides
+                            .get(gid as usize)
+                            .cloned()
+                            .unwrap_or_default();
                         pool.submit(
                             gid,
                             key.clone(),
@@ -428,7 +465,11 @@ impl TurboliteSharedState {
 
         format!(
             "{{\"trees_warmed\":[{}],\"groups_submitted\":{}}}",
-            trees_warmed.iter().map(|n| format!("\"{}\"", n)).collect::<Vec<_>>().join(","),
+            trees_warmed
+                .iter()
+                .map(|n| format!("\"{}\"", n))
+                .collect::<Vec<_>>()
+                .join(","),
             groups_submitted,
         )
     }
@@ -483,26 +524,24 @@ impl TurboliteSharedState {
             }
 
             let root = btree_info.root_page;
-            let compact_result = match compact::compact_btree(
-                &manifest,
-                root,
-                ppg,
-                page_size,
-                &|pnum| {
+            let compact_result =
+                match compact::compact_btree(&manifest, root, ppg, page_size, &|pnum| {
                     let mut buf = vec![0u8; page_size as usize];
                     if self.cache.read_page(pnum, &mut buf).is_ok() {
                         Some(buf)
                     } else {
                         None
                     }
-                },
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[compact] ERROR compacting B-tree {}: {}", btree_info.name, e);
-                    continue;
-                }
-            };
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[compact] ERROR compacting B-tree {}: {}",
+                            btree_info.name, e
+                        );
+                        continue;
+                    }
+                };
 
             eprintln!(
                 "[compact] {} : {} pages -> {} pages ({} freed), {} groups -> {} groups",
@@ -570,7 +609,11 @@ impl TurboliteSharedState {
                 while manifest.group_pages.len() <= gid as usize {
                     manifest.group_pages.push(Vec::new());
                 }
-                let old_key = manifest.page_group_keys.get(gid as usize).cloned().unwrap_or_default();
+                let old_key = manifest
+                    .page_group_keys
+                    .get(gid as usize)
+                    .cloned()
+                    .unwrap_or_default();
                 if !old_key.is_empty() {
                     replaced_keys.push(old_key);
                 }
@@ -620,7 +663,10 @@ impl TurboliteSharedState {
         self.shared_manifest.store(Arc::new(manifest));
 
         if !replaced_keys.is_empty() && self.gc_enabled {
-            eprintln!("[compact] GC: deleting {} replaced objects", replaced_keys.len());
+            eprintln!(
+                "[compact] GC: deleting {} replaced objects",
+                replaced_keys.len()
+            );
             if let Err(e) = storage_helpers::delete_objects(
                 self.storage.as_ref(),
                 &self.runtime,
@@ -637,26 +683,60 @@ impl TurboliteSharedState {
     }
 
     /// Materialize the full database from backend page groups into a local
-    /// SQLite file. Returns the manifest's change_counter for walrust replay.
+    /// SQLite file using the VFS's current `shared_manifest`. Convenience
+    /// wrapper around [`materialize_manifest_to_file`] for callers that
+    /// have already adopted the target manifest via `set_manifest_bytes`.
     pub fn materialize_to_file(&self, output: &std::path::Path) -> io::Result<u64> {
         let manifest = (**self.shared_manifest.load()).clone();
+        self.materialize_manifest_to_file(&manifest, output)
+    }
+
+    /// Materialize the full database from backend page groups into a local
+    /// SQLite file using the supplied `manifest` directly. Returns the
+    /// manifest's change_counter for walrust replay.
+    ///
+    /// Decoupled from `shared_manifest` so callers can materialize a
+    /// candidate manifest BEFORE committing it to the live VFS. The
+    /// follower apply path uses this to keep the VFS untouched until
+    /// the page-group fetches have all succeeded — a missing-group race
+    /// against the leader's publish then leaves the live cache in its
+    /// previous (still-valid) state instead of half-applied.
+    ///
+    /// Pre-flights ALL page-group fetches before opening the output file.
+    /// `File::create` truncates the existing file via `O_TRUNC`, so any
+    /// reader holding an open fd to the old `data.cache` would see an
+    /// empty file the moment we truncate. If a fetch then failed
+    /// mid-loop, the cache would stay in that empty state until a later
+    /// successful materialize overwrote it. By staging all decoded
+    /// page-bytes in memory first, a missing-group / fetch / decode
+    /// failure returns BEFORE the truncate and leaves the existing
+    /// cache untouched.
+    pub fn materialize_manifest_to_file(
+        &self,
+        manifest: &Manifest,
+        output: &std::path::Path,
+    ) -> io::Result<u64> {
         let page_size = manifest.page_size;
         let page_count = manifest.page_count;
 
         if page_count == 0 || page_size == 0 {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "empty manifest, no data to materialize"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "empty manifest, no data to materialize",
+            ));
         }
 
         eprintln!(
             "[materialize] page_count={}, page_size={}, groups={}, version={}",
-            page_count, page_size, manifest.page_group_keys.len(), manifest.version,
+            page_count,
+            page_size,
+            manifest.page_group_keys.len(),
+            manifest.version,
         );
 
-        let file = std::fs::File::create(output)?;
-        let total_size = page_count * page_size as u64;
-        file.set_len(total_size)?;
-
-        let keys_with_gids: Vec<(u64, String)> = manifest.page_group_keys.iter()
+        let keys_with_gids: Vec<(u64, String)> = manifest
+            .page_group_keys
+            .iter()
             .enumerate()
             .filter(|(_, k)| !k.is_empty())
             .map(|(gid, k)| (gid as u64, k.clone()))
@@ -665,6 +745,12 @@ impl TurboliteSharedState {
         let batch_size = 50;
         let total = keys_with_gids.len();
         let use_seekable = manifest.sub_pages_per_frame > 0;
+        let ps = page_size as usize;
+
+        // Stage all decoded page writes in memory first. Format:
+        // (offset_in_file, bytes). Hard-error on any fetch / missing /
+        // decode failure BEFORE touching the output file.
+        let mut staged_writes: Vec<(u64, Vec<u8>)> = Vec::new();
 
         for (batch_idx, batch) in keys_with_gids.chunks(batch_size).enumerate() {
             let key_strs: Vec<String> = batch.iter().map(|(_, k)| k.clone()).collect();
@@ -678,8 +764,18 @@ impl TurboliteSharedState {
                 let pg_data = match data_map.get(key) {
                     Some(d) => d,
                     None => {
-                        eprintln!("[materialize] WARNING: missing object for group {} key {}", gid, key);
-                        continue;
+                        // Hard error before any cache mutation: leader
+                        // publish may have raced the page-group upload,
+                        // or a higher version's churn may have re-keyed
+                        // the object. Caller retries on next poll.
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "materialize: missing page-group object for group {} key {} \
+                                 (manifest v{}); leader publish may race the upload, retry on next poll",
+                                gid, key, manifest.version
+                            ),
+                        ));
                     }
                 };
 
@@ -711,7 +807,6 @@ impl TurboliteSharedState {
                     pages.into_iter().flatten().collect()
                 };
 
-                let ps = page_size as usize;
                 for (i, &pnum) in page_nums.iter().enumerate() {
                     if pnum >= page_count {
                         break;
@@ -719,13 +814,87 @@ impl TurboliteSharedState {
                     let start = i * ps;
                     let end = start + ps;
                     if end <= decoded_pages.len() {
-                        file.write_all_at(&decoded_pages[start..end], pnum * page_size as u64)?;
+                        staged_writes
+                            .push((pnum * page_size as u64, decoded_pages[start..end].to_vec()));
+                    }
+                }
+
+                if use_seekable {
+                    if let Some(overrides) = manifest.subframe_overrides.get(gid as usize) {
+                        let spf = manifest.sub_pages_per_frame as usize;
+                        for (&frame_idx, ovr) in overrides {
+                            let ovr_data = match storage_helpers::get_page_group(
+                                self.storage.as_ref(),
+                                &self.runtime,
+                                &ovr.key,
+                            )? {
+                                Some(data) => data,
+                                None => {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        format!(
+                                            "materialize: missing override object for group {} frame {} key {} \
+                                             (manifest v{}); retry on next poll",
+                                            gid, frame_idx, ovr.key, manifest.version
+                                        ),
+                                    ));
+                                }
+                            };
+                            let decompressed = decode_seekable_subchunk(
+                                &ovr_data,
+                                #[cfg(feature = "zstd")]
+                                None,
+                                self.encryption_key.as_ref(),
+                            )?;
+                            let frame_start = frame_idx * spf;
+                            let frame_end = std::cmp::min(frame_start + spf, page_nums.len());
+                            if frame_start >= frame_end {
+                                continue;
+                            }
+                            let frame_page_nums = &page_nums[frame_start..frame_end];
+                            let data_len = frame_page_nums.len() * ps;
+                            if data_len > decompressed.len() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "materialize: override object too short for group {} frame {} key {} \
+                                         (need {} bytes, got {})",
+                                        gid,
+                                        frame_idx,
+                                        ovr.key,
+                                        data_len,
+                                        decompressed.len()
+                                    ),
+                                ));
+                            }
+                            for (i, &pnum) in frame_page_nums.iter().enumerate() {
+                                if pnum >= page_count {
+                                    break;
+                                }
+                                let start = i * ps;
+                                let end = start + ps;
+                                staged_writes.push((
+                                    pnum * page_size as u64,
+                                    decompressed[start..end].to_vec(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
 
             let done = std::cmp::min((batch_idx + 1) * batch_size, total);
             eprintln!("[materialize] downloaded {}/{} page groups", done, total);
+        }
+
+        // All fetches/decodes succeeded. Now safe to truncate and
+        // rewrite the output file: any failure here is a real I/O
+        // error on a healthy backend, not a transient publish race.
+        let file = std::fs::File::create(output)?;
+        let total_size = page_count * page_size as u64;
+        file.set_len(total_size)?;
+        for (offset, bytes) in &staged_writes {
+            file.write_all_at(bytes, *offset)?;
         }
 
         eprintln!(
@@ -743,8 +912,7 @@ impl TurboliteSharedState {
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
 
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());
@@ -777,5 +945,196 @@ impl TurboliteSharedState {
             eprintln!("[gc] deleted {} orphaned objects", count);
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiered::encode_override_frame;
+    use crate::tiered::manifest::SubframeOverride;
+    use crate::tiered::{CacheConfig, GroupingStrategy, TurboliteConfig, TurboliteVfs};
+    use std::collections::HashMap;
+    use std::fs;
+
+    fn filled_page(byte: u8, page_size: usize) -> Vec<u8> {
+        vec![byte; page_size]
+    }
+
+    #[test]
+    fn materialize_manifest_to_file_applies_subframe_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = TurboliteConfig {
+            cache_dir: tmp.path().join("cache"),
+            cache: CacheConfig {
+                pages_per_group: 4,
+                sub_pages_per_frame: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let vfs = TurboliteVfs::new_local(config).unwrap();
+        let shared = vfs.shared_state();
+
+        let page_size = 64u32;
+        let base_pages = vec![
+            Some(filled_page(b'A', page_size as usize)),
+            Some(filled_page(b'B', page_size as usize)),
+            Some(filled_page(b'C', page_size as usize)),
+            Some(filled_page(b'D', page_size as usize)),
+        ];
+        let (base_blob, frame_table) = encode_page_group_seekable(
+            &base_pages,
+            page_size,
+            2,
+            shared.compression_level,
+            #[cfg(feature = "zstd")]
+            None,
+            None,
+        )
+        .unwrap();
+
+        let override_pages = vec![
+            (2, filled_page(b'X', page_size as usize)),
+            (3, filled_page(b'Y', page_size as usize)),
+        ];
+        let override_blob = encode_override_frame(
+            &override_pages,
+            page_size,
+            shared.compression_level,
+            #[cfg(feature = "zstd")]
+            None,
+            None,
+        )
+        .unwrap();
+
+        let base_key = "p/d/0_v1".to_string();
+        let override_key = "p/d/0_f1_v2".to_string();
+        storage_helpers::put_page_groups(
+            shared.storage.as_ref(),
+            &shared.runtime,
+            &[
+                (base_key.clone(), base_blob),
+                (override_key.clone(), override_blob.clone()),
+            ],
+        )
+        .unwrap();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            1,
+            SubframeOverride {
+                key: override_key,
+                entry: FrameEntry {
+                    offset: 0,
+                    len: override_blob.len() as u32,
+                },
+            },
+        );
+
+        let mut manifest = Manifest {
+            version: 2,
+            change_counter: 2,
+            page_count: 4,
+            page_size,
+            pages_per_group: 4,
+            page_group_keys: vec![base_key],
+            frame_tables: vec![frame_table],
+            sub_pages_per_frame: 2,
+            subframe_overrides: vec![overrides],
+            strategy: GroupingStrategy::BTreeAware,
+            group_pages: vec![vec![0, 1, 2, 3]],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        let output = tmp.path().join("materialized.db");
+        shared
+            .materialize_manifest_to_file(&manifest, &output)
+            .unwrap();
+
+        let bytes = fs::read(output).unwrap();
+        let ps = page_size as usize;
+        assert_eq!(&bytes[0..ps], filled_page(b'A', ps).as_slice());
+        assert_eq!(&bytes[ps..2 * ps], filled_page(b'B', ps).as_slice());
+        assert_eq!(&bytes[2 * ps..3 * ps], filled_page(b'X', ps).as_slice());
+        assert_eq!(&bytes[3 * ps..4 * ps], filled_page(b'Y', ps).as_slice());
+    }
+
+    #[test]
+    fn materialize_manifest_to_file_missing_override_fails_before_output_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = TurboliteConfig {
+            cache_dir: tmp.path().join("cache"),
+            cache: CacheConfig {
+                pages_per_group: 4,
+                sub_pages_per_frame: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let vfs = TurboliteVfs::new_local(config).unwrap();
+        let shared = vfs.shared_state();
+
+        let page_size = 64u32;
+        let base_pages = vec![
+            Some(filled_page(b'A', page_size as usize)),
+            Some(filled_page(b'B', page_size as usize)),
+            Some(filled_page(b'C', page_size as usize)),
+            Some(filled_page(b'D', page_size as usize)),
+        ];
+        let (base_blob, frame_table) = encode_page_group_seekable(
+            &base_pages,
+            page_size,
+            2,
+            shared.compression_level,
+            #[cfg(feature = "zstd")]
+            None,
+            None,
+        )
+        .unwrap();
+
+        let base_key = "p/d/0_v1".to_string();
+        storage_helpers::put_page_groups(
+            shared.storage.as_ref(),
+            &shared.runtime,
+            &[(base_key.clone(), base_blob)],
+        )
+        .unwrap();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            1,
+            SubframeOverride {
+                key: "p/d/missing_override".to_string(),
+                entry: FrameEntry { offset: 0, len: 1 },
+            },
+        );
+
+        let mut manifest = Manifest {
+            version: 2,
+            change_counter: 2,
+            page_count: 4,
+            page_size,
+            pages_per_group: 4,
+            page_group_keys: vec![base_key],
+            frame_tables: vec![frame_table],
+            sub_pages_per_frame: 2,
+            subframe_overrides: vec![overrides],
+            strategy: GroupingStrategy::BTreeAware,
+            group_pages: vec![vec![0, 1, 2, 3]],
+            ..Manifest::empty()
+        };
+        manifest.build_page_index();
+
+        let output = tmp.path().join("materialized.db");
+        let err = shared
+            .materialize_manifest_to_file(&manifest, &output)
+            .expect_err("missing override should abort materialize");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            !output.exists(),
+            "materialize must not create/truncate output until all base and override objects are decoded"
+        );
     }
 }

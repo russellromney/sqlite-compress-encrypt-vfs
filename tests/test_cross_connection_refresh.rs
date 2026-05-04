@@ -1,5 +1,5 @@
 use rusqlite::{Connection, OpenFlags};
-use turbolite::tiered::{TurboliteVfs, TurboliteConfig};
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 /// Test refresh when one connection writes and another reads the new data
 #[test]
@@ -20,15 +20,22 @@ fn test_cross_connection_refresh() {
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             "test_cross",
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", [])
+            .unwrap();
 
         for i in 0..500 {
-            conn.execute("INSERT INTO test (data) VALUES (?)", (format!("initial_{}", i),)).unwrap();
+            conn.execute(
+                "INSERT INTO test (data) VALUES (?)",
+                (format!("initial_{}", i),),
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Initial data created: 500 rows");
     }
 
@@ -37,9 +44,12 @@ fn test_cross_connection_refresh() {
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
         "test_cross",
-    ).unwrap();
+    )
+    .unwrap();
 
-    let count: i64 = reader_conn.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0)).unwrap();
+    let count: i64 = reader_conn
+        .query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))
+        .unwrap();
     println!("Reader initial count: {}", count);
 
     // Now write NEW data with a different connection
@@ -48,14 +58,22 @@ fn test_cross_connection_refresh() {
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE,
             "test_cross",
-        ).unwrap();
+        )
+        .unwrap();
 
         for i in 500..1500 {
-            writer_conn.execute("INSERT INTO test (data) VALUES (?)", (format!("new_{}", i),)).unwrap();
+            writer_conn
+                .execute(
+                    "INSERT INTO test (data) VALUES (?)",
+                    (format!("new_{}", i),),
+                )
+                .unwrap();
         }
 
         // Checkpoint to move data from WAL to main DB - this is key!
-        writer_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        writer_conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
         println!("Writer added 1000 new rows and checkpointed");
     }
 
@@ -68,20 +86,21 @@ fn test_cross_connection_refresh() {
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
         "test_cross",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Now reader should see new data after refresh
     println!("Reader attempting to read new data after checkpoint...");
-    let new_count: i64 = reader_conn.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0)).unwrap();
+    let new_count: i64 = reader_conn
+        .query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))
+        .unwrap();
     println!("Reader new count: {}", new_count);
 
     // Try reading specific new rows
     for rowid in [501, 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400] {
-        match reader_conn.query_row(
-            "SELECT data FROM test WHERE id = ?",
-            [rowid],
-            |row| row.get::<_, String>(0),
-        ) {
+        match reader_conn.query_row("SELECT data FROM test WHERE id = ?", [rowid], |row| {
+            row.get::<_, String>(0)
+        }) {
             Ok(data) => println!("  Read row {}: {}", rowid, &data[..20.min(data.len())]),
             Err(e) => println!("  ERROR reading row {}: {}", rowid, e),
         }

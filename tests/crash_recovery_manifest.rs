@@ -12,7 +12,8 @@ use hadb_storage::StorageBackend;
 use hadb_storage_mem::MemStorage;
 use tempfile::TempDir;
 use turbolite::tiered::{
-    register_shared, CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig, TurboliteVfs,
+    register_shared, CacheConfig, CompressionConfig, SharedTurboliteVfs, TurboliteConfig,
+    TurboliteVfs,
 };
 
 fn unique_vfs_name(label: &str) -> String {
@@ -27,7 +28,12 @@ fn unique_vfs_name(label: &str) -> String {
 fn build_remote_vfs(
     dir: &std::path::Path,
     label: &str,
-) -> (String, SharedTurboliteVfs, Arc<MemStorage>, tokio::runtime::Runtime) {
+) -> (
+    String,
+    SharedTurboliteVfs,
+    Arc<MemStorage>,
+    tokio::runtime::Runtime,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -38,8 +44,14 @@ fn build_remote_vfs(
     let backend: Arc<dyn StorageBackend> = mem.clone();
     let cfg = TurboliteConfig {
         cache_dir: dir.to_path_buf(),
-        compression: CompressionConfig { level: 1, ..Default::default() },
-        cache: CacheConfig { pages_per_group: 4, ..Default::default() },
+        compression: CompressionConfig {
+            level: 1,
+            ..Default::default()
+        },
+        cache: CacheConfig {
+            pages_per_group: 4,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let vfs = TurboliteVfs::with_backend(cfg, backend, handle).expect("vfs");
@@ -50,10 +62,10 @@ fn build_remote_vfs(
 }
 
 fn write_one_row(vfs_name: &str) {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
-    let conn = rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, vfs_name)
-        .expect("open");
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn =
+        rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, vfs_name).expect("open");
     conn.execute_batch("PRAGMA journal_mode=WAL;").expect("wal");
     conn.execute_batch("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v INTEGER);")
         .expect("schema");
@@ -95,11 +107,10 @@ fn reopen_after_checkpoint_recovers_pending_flush() {
     // Open the connection just to force VFS initialisation (it should
     // replay/recover from disk state during construction).
     {
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
-        let _conn =
-            rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, &vfs_name2)
-                .expect("reopen");
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        let _conn = rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, &vfs_name2)
+            .expect("reopen");
     }
 
     // The recovered VFS must know there are pending page groups to flush.
@@ -113,8 +124,7 @@ fn reopen_after_checkpoint_recovers_pending_flush() {
 
     // Drain to the fresh backend. Before the drain, backend is empty (since
     // it's a new MemStorage); after, it must see the manifest + page groups.
-    let before = rt2
-        .block_on(async { mem2.list("", None).await.expect("list").len() });
+    let before = rt2.block_on(async { mem2.list("", None).await.expect("list").len() });
     assert_eq!(
         before, 0,
         "fresh backend starts empty; baseline for measuring the drain"
@@ -122,8 +132,7 @@ fn reopen_after_checkpoint_recovers_pending_flush() {
 
     shared2.flush_to_storage().expect("drain");
 
-    let after = rt2
-        .block_on(async { mem2.list("", None).await.expect("list").len() });
+    let after = rt2.block_on(async { mem2.list("", None).await.expect("list").len() });
     assert!(
         after >= 1,
         "flush_to_storage() after recovery must push at least the manifest; got {after}"
@@ -163,9 +172,8 @@ fn reopen_with_missing_dirty_groups_file_does_not_panic() {
     // Reopen. Must not panic, must surface a consistent manifest.
     let (vfs_name2, _shared2, _mem2, _rt2) = build_remote_vfs(dir.path(), "s2");
     let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
-    let conn =
-        rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, &vfs_name2)
-            .expect("reopen after partial crash");
+    let conn = rusqlite::Connection::open_with_flags_and_vfs("recover.db", flags, &vfs_name2)
+        .expect("reopen after partial crash");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
         .expect("query");

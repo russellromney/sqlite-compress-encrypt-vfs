@@ -35,7 +35,11 @@ fn cold_read_and_verify(
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
         .expect("count query");
-    assert_eq!(count, expected_count, "{}: expected {} rows, got {}", label, expected_count, count);
+    assert_eq!(
+        count, expected_count,
+        "{}: expected {} rows, got {}",
+        label, expected_count, count
+    );
 
     let first: i64 = conn
         .query_row("SELECT MIN(id) FROM data", [], |row| row.get(0))
@@ -45,18 +49,32 @@ fn cold_read_and_verify(
     let last: i64 = conn
         .query_row("SELECT MAX(id) FROM data", [], |row| row.get(0))
         .expect("max query");
-    assert_eq!(last, expected_count - 1, "{}: last row should be {}", label, expected_count - 1);
+    assert_eq!(
+        last,
+        expected_count - 1,
+        "{}: last row should be {}",
+        label,
+        expected_count - 1
+    );
 
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity");
-    assert_eq!(integrity, "ok", "{}: integrity check failed: {}", label, integrity);
+    assert_eq!(
+        integrity, "ok",
+        "{}: integrity check failed: {}",
+        label, integrity
+    );
 }
 
 /// Core crash recovery test: incremental checkpoints with cold-read after each.
 fn run_crash_incremental(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config_mode(&format!("crash_incr_{}", mode.name()), writer_dir.path(), mode);
+    let config = test_config_mode(
+        &format!("crash_incr_{}", mode.name()),
+        writer_dir.path(),
+        mode,
+    );
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
@@ -82,42 +100,86 @@ fn run_crash_incremental(mode: TestMode) {
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 0..100 {
-            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("v{}", i)])
-                .expect("insert");
+            tx.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v{}", i)],
+            )
+            .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp1");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 100, &format!("[{}] phase1", mode.name()));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp1");
+    cold_read_and_verify(
+        &bucket,
+        &prefix,
+        &endpoint,
+        mode,
+        100,
+        &format!("[{}] phase1", mode.name()),
+    );
 
     // Phase 2: insert 100 more, checkpoint, cold-verify
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 100..200 {
-            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("v{}", i)])
-                .expect("insert");
+            tx.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("v{}", i)],
+            )
+            .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp2");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 200, &format!("[{}] phase2", mode.name()));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp2");
+    cold_read_and_verify(
+        &bucket,
+        &prefix,
+        &endpoint,
+        mode,
+        200,
+        &format!("[{}] phase2", mode.name()),
+    );
 
     // Phase 3: update all, checkpoint, cold-verify
-    conn.execute_batch("UPDATE data SET value = 'updated_' || id;").expect("update");
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp3");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 200, &format!("[{}] phase3", mode.name()));
+    conn.execute_batch("UPDATE data SET value = 'updated_' || id;")
+        .expect("update");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp3");
+    cold_read_and_verify(
+        &bucket,
+        &prefix,
+        &endpoint,
+        mode,
+        200,
+        &format!("[{}] phase3", mode.name()),
+    );
 
     // Phase 4: delete half, vacuum, checkpoint, cold-verify
-    conn.execute_batch("DELETE FROM data WHERE id >= 100;").expect("delete");
+    conn.execute_batch("DELETE FROM data WHERE id >= 100;")
+        .expect("delete");
     conn.execute_batch("VACUUM;").expect("vacuum");
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp4");
-    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 100, &format!("[{}] phase4", mode.name()));
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp4");
+    cold_read_and_verify(
+        &bucket,
+        &prefix,
+        &endpoint,
+        mode,
+        100,
+        &format!("[{}] phase4", mode.name()),
+    );
 }
 
 /// Uncommitted data must not be visible in S3.
 fn run_uncommitted_not_visible(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config_mode(&format!("crash_uncommit_{}", mode.name()), writer_dir.path(), mode);
+    let config = test_config_mode(
+        &format!("crash_uncommit_{}", mode.name()),
+        writer_dir.path(),
+        mode,
+    );
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
@@ -143,31 +205,49 @@ fn run_uncommitted_not_visible(mode: TestMode) {
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 0..50 {
-            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("baseline_{}", i)])
-                .expect("insert");
+            tx.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("baseline_{}", i)],
+            )
+            .expect("insert");
         }
         tx.commit().expect("commit");
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("cp");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("cp");
 
     // 50 more rows, NO checkpoint
     {
         let tx = conn.unchecked_transaction().expect("tx");
         for i in 50..100 {
-            tx.execute("INSERT INTO data VALUES (?1, ?2)", rusqlite::params![i, format!("uncheckpointed_{}", i)])
-                .expect("insert");
+            tx.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("uncheckpointed_{}", i)],
+            )
+            .expect("insert");
         }
         tx.commit().expect("commit");
     }
 
     // Cold reader should only see baseline
-    cold_read_and_verify(&bucket, &prefix, &endpoint, mode, 50, &format!("[{}] uncommitted", mode.name()));
+    cold_read_and_verify(
+        &bucket,
+        &prefix,
+        &endpoint,
+        mode,
+        50,
+        &format!("[{}] uncommitted", mode.name()),
+    );
 }
 
 /// Large dataset spanning multiple page groups.
 fn run_large_dataset(mode: TestMode) {
     let writer_dir = TempDir::new().expect("writer dir");
-    let config = test_config_mode(&format!("crash_large_{}", mode.name()), writer_dir.path(), mode);
+    let config = test_config_mode(
+        &format!("crash_large_{}", mode.name()),
+        writer_dir.path(),
+        mode,
+    );
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
@@ -202,7 +282,8 @@ fn run_large_dataset(mode: TestMode) {
         tx.commit().expect("commit");
     }
 
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").expect("checkpoint");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
 
     // Cold read: verify count and spot-check rows
     let cold_dir = TempDir::new().expect("cold dir");
@@ -225,23 +306,45 @@ fn run_large_dataset(mode: TestMode) {
 
     for check_id in [0, 42, 999, 5000, 9999] {
         let val: String = cold
-            .query_row("SELECT value FROM data WHERE id = ?1", rusqlite::params![check_id], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM data WHERE id = ?1",
+                rusqlite::params![check_id],
+                |row| row.get(0),
+            )
             .expect("get row");
-        assert_eq!(val, format!("row_{}", check_id), "[{}] value mismatch for id {}", mode.name(), check_id);
+        assert_eq!(
+            val,
+            format!("row_{}", check_id),
+            "[{}] value mismatch for id {}",
+            mode.name(),
+            check_id
+        );
 
         let payload_len: i64 = cold
-            .query_row("SELECT length(payload) FROM data WHERE id = ?1", rusqlite::params![check_id], |row| row.get(0))
+            .query_row(
+                "SELECT length(payload) FROM data WHERE id = ?1",
+                rusqlite::params![check_id],
+                |row| row.get(0),
+            )
             .expect("get payload len");
         assert_eq!(
-            payload_len, ((check_id % 500) + 100) as i64,
-            "[{}] payload length mismatch for id {}", mode.name(), check_id
+            payload_len,
+            ((check_id % 500) + 100) as i64,
+            "[{}] payload length mismatch for id {}",
+            mode.name(),
+            check_id
         );
     }
 
     let integrity: String = cold
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("integrity");
-    assert_eq!(integrity, "ok", "[{}] large dataset integrity failed", mode.name());
+    assert_eq!(
+        integrity,
+        "ok",
+        "[{}] large dataset integrity failed",
+        mode.name()
+    );
 }
 
 // --- Parameterized tests: crash recovery x all S3 Durable mode combinations ---

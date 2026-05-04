@@ -1,7 +1,7 @@
 //! Integration tests using the VFS with SQLite
 
 use rusqlite::Connection;
-use turbolite::tiered::{CompressionConfig, TurboliteVfs, TurboliteConfig};
+use turbolite::tiered::{CompressionConfig, TurboliteConfig, TurboliteVfs};
 
 #[test]
 fn test_basic_operations() {
@@ -22,11 +22,8 @@ fn test_basic_operations() {
     .expect("Failed to open database");
 
     // Create table
-    conn.execute(
-        "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)",
-        [],
-    )
-    .expect("Failed to create table");
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", [])
+        .expect("Failed to create table");
 
     // Insert data
     conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello')", [])
@@ -35,7 +32,9 @@ fn test_basic_operations() {
         .expect("Failed to insert");
 
     // Query data
-    let mut stmt = conn.prepare("SELECT id, value FROM test ORDER BY id").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, value FROM test ORDER BY id")
+        .unwrap();
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
@@ -118,8 +117,11 @@ fn test_wal_mode() {
     println!("Journal mode: {}", mode);
 
     // Create table and insert data
-    conn.execute("CREATE TABLE wal_test (id INTEGER PRIMARY KEY, data TEXT)", [])
-        .expect("Failed to create table");
+    conn.execute(
+        "CREATE TABLE wal_test (id INTEGER PRIMARY KEY, data TEXT)",
+        [],
+    )
+    .expect("Failed to create table");
 
     for i in 0..100 {
         conn.execute(
@@ -162,8 +164,10 @@ fn test_persistence_with_reopen() {
         )
         .unwrap();
 
-        conn.execute("CREATE TABLE persist (value TEXT)", []).unwrap();
-        conn.execute("INSERT INTO persist VALUES ('test_value')", []).unwrap();
+        conn.execute("CREATE TABLE persist (value TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO persist VALUES ('test_value')", [])
+            .unwrap();
     }
 
     // Reopen and verify
@@ -187,7 +191,10 @@ fn test_passthrough_mode() {
     let dir = tempfile::tempdir().unwrap();
     let config = TurboliteConfig {
         cache_dir: dir.path().into(),
-        compression: CompressionConfig { level: 0, ..Default::default() },
+        compression: CompressionConfig {
+            level: 0,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let vfs = TurboliteVfs::new_local(config).expect("Failed to create VFS");
@@ -200,16 +207,20 @@ fn test_passthrough_mode() {
     )
     .unwrap();
 
-    conn.execute("CREATE TABLE test (id INTEGER, data TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE test (id INTEGER, data TEXT)", [])
+        .unwrap();
 
     for i in 0..50 {
         conn.execute(
             "INSERT INTO test VALUES (?1, ?2)",
             rusqlite::params![i, format!("data_{}", i)],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM test", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM test", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 50);
 }
 
@@ -230,7 +241,11 @@ fn test_delete_and_update() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)",
+        [],
+    )
+    .unwrap();
     for i in 1..=10 {
         conn.execute(
             "INSERT INTO items (id, name, qty) VALUES (?1, ?2, ?3)",
@@ -240,18 +255,26 @@ fn test_delete_and_update() {
     }
 
     // Update rows 3 and 7
-    conn.execute("UPDATE items SET qty = 999 WHERE id IN (3, 7)", []).unwrap();
+    conn.execute("UPDATE items SET qty = 999 WHERE id IN (3, 7)", [])
+        .unwrap();
 
     // Delete rows 1, 5, 10
-    conn.execute("DELETE FROM items WHERE id IN (1, 5, 10)", []).unwrap();
+    conn.execute("DELETE FROM items WHERE id IN (1, 5, 10)", [])
+        .unwrap();
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 7);
 
     // Verify updated rows
-    let qty3: i64 = conn.query_row("SELECT qty FROM items WHERE id = 3", [], |r| r.get(0)).unwrap();
+    let qty3: i64 = conn
+        .query_row("SELECT qty FROM items WHERE id = 3", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(qty3, 999);
-    let qty7: i64 = conn.query_row("SELECT qty FROM items WHERE id = 7", [], |r| r.get(0)).unwrap();
+    let qty7: i64 = conn
+        .query_row("SELECT qty FROM items WHERE id = 7", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(qty7, 999);
 
     // Verify deleted rows are gone
@@ -265,7 +288,9 @@ fn test_delete_and_update() {
     assert_eq!(deleted, vec![2, 3, 4, 6, 7, 8, 9]);
 
     // Verify an unmodified row
-    let qty4: i64 = conn.query_row("SELECT qty FROM items WHERE id = 4", [], |r| r.get(0)).unwrap();
+    let qty4: i64 = conn
+        .query_row("SELECT qty FROM items WHERE id = 4", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(qty4, 40);
 }
 
@@ -286,21 +311,34 @@ fn test_rollback_transaction() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE rb (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE rb (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
 
     // BEGIN, INSERT, ROLLBACK
-    conn.execute_batch("BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); ROLLBACK;").unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); ROLLBACK;",
+    )
+    .unwrap();
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 0, "ROLLBACK should leave no rows");
 
     // BEGIN, INSERT, COMMIT
-    conn.execute_batch("BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); COMMIT;").unwrap();
+    conn.execute_batch(
+        "BEGIN; INSERT INTO rb VALUES (1, 'a'); INSERT INTO rb VALUES (2, 'b'); COMMIT;",
+    )
+    .unwrap();
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rb", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 2, "COMMIT should persist rows");
 
-    let val: String = conn.query_row("SELECT val FROM rb WHERE id = 2", [], |r| r.get(0)).unwrap();
+    let val: String = conn
+        .query_row("SELECT val FROM rb WHERE id = 2", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(val, "b");
 }
 
@@ -321,8 +359,13 @@ fn test_create_index_and_query() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price REAL)", []).unwrap();
-    conn.execute("CREATE INDEX idx_category ON products(category)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price REAL)",
+        [],
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX idx_category ON products(category)", [])
+        .unwrap();
 
     let categories = ["electronics", "books", "clothing"];
     for i in 1..=90 {
@@ -335,7 +378,11 @@ fn test_create_index_and_query() {
 
     // Query using the indexed column
     let elec_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM products WHERE category = 'electronics'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM products WHERE category = 'electronics'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(elec_count, 30);
 
@@ -366,16 +413,27 @@ fn test_multiple_tables_and_joins() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)", []).unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", [])
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)",
+        [],
+    )
+    .unwrap();
 
-    conn.execute("INSERT INTO users VALUES (1, 'Alice')", []).unwrap();
-    conn.execute("INSERT INTO users VALUES (2, 'Bob')", []).unwrap();
-    conn.execute("INSERT INTO users VALUES (3, 'Charlie')", []).unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'Alice')", [])
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'Bob')", [])
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (3, 'Charlie')", [])
+        .unwrap();
 
-    conn.execute("INSERT INTO orders VALUES (1, 1, 100.0)", []).unwrap();
-    conn.execute("INSERT INTO orders VALUES (2, 1, 200.0)", []).unwrap();
-    conn.execute("INSERT INTO orders VALUES (3, 2, 50.0)", []).unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 1, 100.0)", [])
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 1, 200.0)", [])
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (3, 2, 50.0)", [])
+        .unwrap();
 
     // JOIN query: total per user
     let results: Vec<(String, f64)> = conn
@@ -420,13 +478,21 @@ fn test_alter_table_add_column() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-    conn.execute("INSERT INTO people VALUES (1, 'Alice')", []).unwrap();
-    conn.execute("INSERT INTO people VALUES (2, 'Bob')", []).unwrap();
+    conn.execute(
+        "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT)",
+        [],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO people VALUES (1, 'Alice')", [])
+        .unwrap();
+    conn.execute("INSERT INTO people VALUES (2, 'Bob')", [])
+        .unwrap();
 
-    conn.execute("ALTER TABLE people ADD COLUMN age INTEGER", []).unwrap();
+    conn.execute("ALTER TABLE people ADD COLUMN age INTEGER", [])
+        .unwrap();
 
-    conn.execute("INSERT INTO people VALUES (3, 'Charlie', 30)", []).unwrap();
+    conn.execute("INSERT INTO people VALUES (3, 'Charlie', 30)", [])
+        .unwrap();
 
     // Old rows should have NULL for the new column
     let alice_age: Option<i64> = conn
@@ -441,7 +507,9 @@ fn test_alter_table_add_column() {
     assert_eq!(charlie_age, Some(30));
 
     // Verify all rows still present
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM people", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 3);
 }
 
@@ -463,7 +531,8 @@ fn test_page_size_64k() {
     .expect("Failed to open database");
 
     conn.execute_batch("PRAGMA page_size = 65536;").unwrap();
-    conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, data BLOB)", []).unwrap();
+    conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, data BLOB)", [])
+        .unwrap();
 
     let page_size: i64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))
@@ -480,7 +549,9 @@ fn test_page_size_64k() {
         .unwrap();
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM big", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM big", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 200);
 
     let retrieved: Vec<u8> = conn
@@ -507,7 +578,8 @@ fn test_page_size_4k() {
     .expect("Failed to open database");
 
     conn.execute_batch("PRAGMA page_size = 4096;").unwrap();
-    conn.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, data TEXT)", [])
+        .unwrap();
 
     let page_size: i64 = conn
         .pragma_query_value(None, "page_size", |r| r.get(0))
@@ -523,7 +595,9 @@ fn test_page_size_4k() {
         .unwrap();
     }
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM small", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM small", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500);
 
     let val: String = conn
@@ -551,7 +625,8 @@ fn test_vacuum() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE vac (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE vac (id INTEGER PRIMARY KEY, data TEXT)", [])
+        .unwrap();
     for i in 0..1000 {
         conn.execute(
             "INSERT INTO vac VALUES (?1, ?2)",
@@ -567,7 +642,9 @@ fn test_vacuum() {
     conn.execute_batch("VACUUM;").unwrap();
 
     // Verify remaining data
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 500);
 
     let val: String = conn
@@ -585,7 +662,9 @@ fn test_vacuum() {
     )
     .unwrap();
 
-    let count2: i64 = conn2.query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0)).unwrap();
+    let count2: i64 = conn2
+        .query_row("SELECT COUNT(*) FROM vac", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count2, 500);
 
     // Integrity check
@@ -612,19 +691,24 @@ fn test_savepoint_release_and_rollback() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE sp (id INTEGER PRIMARY KEY, val TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE sp (id INTEGER PRIMARY KEY, val TEXT)", [])
+        .unwrap();
 
     conn.execute_batch("SAVEPOINT sp1;").unwrap();
-    conn.execute("INSERT INTO sp VALUES (1, 'first')", []).unwrap();
+    conn.execute("INSERT INTO sp VALUES (1, 'first')", [])
+        .unwrap();
 
     conn.execute_batch("SAVEPOINT sp2;").unwrap();
-    conn.execute("INSERT INTO sp VALUES (2, 'second')", []).unwrap();
+    conn.execute("INSERT INTO sp VALUES (2, 'second')", [])
+        .unwrap();
 
     conn.execute_batch("ROLLBACK TO sp2;").unwrap();
     conn.execute_batch("RELEASE sp1;").unwrap();
 
     // Only the first INSERT should exist
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM sp", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sp", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 1);
 
     let val: String = conn
@@ -633,8 +717,13 @@ fn test_savepoint_release_and_rollback() {
     assert_eq!(val, "first");
 
     // Verify second row is gone
-    let missing = conn.query_row("SELECT val FROM sp WHERE id = 2", [], |r| r.get::<_, String>(0));
-    assert!(missing.is_err(), "Row 2 should not exist after ROLLBACK TO sp2");
+    let missing = conn.query_row("SELECT val FROM sp WHERE id = 2", [], |r| {
+        r.get::<_, String>(0)
+    });
+    assert!(
+        missing.is_err(),
+        "Row 2 should not exist after ROLLBACK TO sp2"
+    );
 }
 
 #[test]
@@ -654,7 +743,11 @@ fn test_large_transaction() {
     )
     .expect("Failed to open database");
 
-    conn.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)", []).unwrap();
+    conn.execute(
+        "CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload TEXT)",
+        [],
+    )
+    .unwrap();
 
     conn.execute_batch("BEGIN;").unwrap();
     for i in 0..10_000 {
@@ -666,7 +759,9 @@ fn test_large_transaction() {
     }
     conn.execute_batch("COMMIT;").unwrap();
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM bulk", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM bulk", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 10_000);
 
     // Check random rows for integrity
@@ -712,7 +807,8 @@ fn test_checkpoint_truncate() {
             mode
         );
 
-        conn.execute("CREATE TABLE ckpt (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE ckpt (id INTEGER PRIMARY KEY, data TEXT)", [])
+            .unwrap();
         for i in 0..100 {
             conn.execute(
                 "INSERT INTO ckpt VALUES (?1, ?2)",
@@ -727,7 +823,9 @@ fn test_checkpoint_truncate() {
             .expect("Checkpoint failed");
 
         // Verify data after checkpoint
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 100);
     }
 
@@ -740,7 +838,9 @@ fn test_checkpoint_truncate() {
         )
         .unwrap();
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ckpt", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 100);
 
         let val: String = conn

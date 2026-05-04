@@ -109,9 +109,18 @@ fn test_help_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("info"), "help should mention info command");
-    assert!(stdout.contains("shell"), "help should mention shell command");
-    assert!(stdout.contains("export"), "help should mention export command");
-    assert!(stdout.contains("import"), "help should mention import command");
+    assert!(
+        stdout.contains("shell"),
+        "help should mention shell command"
+    );
+    assert!(
+        stdout.contains("export"),
+        "help should mention export command"
+    );
+    assert!(
+        stdout.contains("import"),
+        "help should mention import command"
+    );
     assert!(
         stdout.contains("download"),
         "help should mention download command"
@@ -148,7 +157,10 @@ fn test_info_local() {
     );
     assert!(stdout.contains("pages:"), "should show page count");
     assert!(stdout.contains("page size:"), "should show page size");
-    assert!(stdout.contains("local"), "should show storage type as local");
+    assert!(
+        stdout.contains("local"),
+        "should show storage type as local"
+    );
     assert!(
         stdout.contains("manifest version:"),
         "should show manifest version"
@@ -187,11 +199,13 @@ fn test_export_local() {
         stdout,
         stderr
     );
-    assert!(stdout.contains("integrity ok"), "should pass integrity check");
+    assert!(
+        stdout.contains("integrity ok"),
+        "should pass integrity check"
+    );
 
     // Verify the exported file has correct data (plain SQLite, no VFS needed)
-    let conn =
-        rusqlite::Connection::open(&output_path).expect("open exported db");
+    let conn = rusqlite::Connection::open(&output_path).expect("open exported db");
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
         .expect("query exported db");

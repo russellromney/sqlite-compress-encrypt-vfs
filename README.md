@@ -8,7 +8,7 @@ This repo is a Cargo workspace with two crates:
 
 It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest, which can be used separately from S3.
 
-> turbolite is **experimental**. It is new and contains bugs. It may corrupt your data. Please be careful.
+> turbolite is **experimental**. It is new and contains bugs. Be careful.
 
 Object storage is getting fast. [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) delivers single-digit millisecond GETs and [Tigris is also extremely fast](https://www.tigrisdata.com/blog/benchmark-small-objects/). The gap between local disk and cloud storage is shrinking, and turbolite exploits that.
 
@@ -17,6 +17,8 @@ The design and name are inspired by [turbopuffer](https://turbopuffer.com/blog/t
 If you have one database per server, use a volume. turbolite explores how to have hundreds or thousands of databases (one per tenant, one per workspace, one per device), don't want a volume for each one, and you're okay with a single write source.
 
 turbolite ships as a Rust library, a [SQLite loadable extension](#loadable-extension) (`.so`/`.dylib`), and language packages for [Python](#python) and [Node.js](#nodejs), plus Github deps for Go. Any S3-compatible storage works (AWS S3, Tigris, R2, MinIO, etc.). It's a standard SQLite VFS operating at the page level, so most SQLite features should work: FTS, R-tree, JSON, WAL mode, etc.
+
+turbolite is also part of the broader [`hadb`](https://github.com/russellromney/hadb) ecosystem. Standalone turbolite is a storage VFS with one safe writer; if you want HA leader election plus continuous WAL replication, use it through [`haqlite-turbolite`](https://github.com/russellromney/haqlite/tree/main/haqlite-turbolite), which layers HaQLite and [`walrust`](https://github.com/russellromney/walrust) on top. That HA path is very experimental, but it is where multi-node/failover work belongs.
 
 If you want to contribute to turbolite or find bugs, please create a pull request or open an issue.
 
@@ -53,9 +55,9 @@ Benchmarks are organized by **cache level** (what's already on local disk when t
 | Point lookup | 145K/s | 73K/s | 2.0x |
 | Range scan | 8.8K/s | 8.3K/s | **parity** |
 | Full table scan | 56/s | 60/s | **parity** |
-| INSERT | 19K/s | 23K/s | **faster** |
+| INSERT | 19K/s | 23K/s | **parity** |
 | UPDATE by PK | 40K/s | 27K/s | 1.5x |
-| Batch INSERT (in txn) | 685K/s | 740K/s | **faster** |
+| Batch INSERT (in txn) | 685K/s | 740K/s | **parity** |
 
 Point lookups have the highest per-page overhead (~2x). Everything else approaches or beats parity. Lock-free cache architecture means concurrent reads never block writes.
 
@@ -205,7 +207,8 @@ If encryption is enabled, turbolite encrypts everything: S3 objects, local cache
 
 ### Current limitations
 
-- **Single writer only.** Two machines writing to the same prefix will corrupt the manifest.
+- **Standalone turbolite is single-writer.** Two machines writing directly to the same prefix will corrupt the manifest.
+- **HA/failover mode is experimental and lives in `haqlite-turbolite`.** That stack combines HaQLite leases, turbolite page tiering, and walrust continuous WAL replication. It is the intended path for multi-node deployments, not direct multi-writer access to one turbolite prefix.
 - **WAL shipping is experimental.** Requires the `wal` feature flag + walrust. See [Durability](#durability).
 
 SQLite features that **do** work: FTS, R-tree, JSON, WAL mode, DELETE journal mode, VACUUM, autovacuum.

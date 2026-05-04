@@ -1,12 +1,14 @@
 //! Encryption and key rotation tests.
 
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
-use tempfile::TempDir;
 use super::helpers::*;
+use tempfile::TempDir;
+use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
 fn test_encryption_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    for (i, b) in key.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(7); }
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(7);
+    }
     key
 }
 
@@ -44,16 +46,17 @@ fn test_encrypted_write_cold_read() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "encrypted_test.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).expect("failed to open connection");
+        )
+        .expect("failed to open connection");
 
         conn.execute_batch(
             "PRAGMA page_size=65536;
              PRAGMA journal_mode=WAL;
              CREATE TABLE secrets (id INTEGER PRIMARY KEY, data TEXT);",
-        ).expect("failed to create table");
+        )
+        .expect("failed to create table");
 
         {
             let tx = conn.unchecked_transaction().unwrap();
@@ -61,7 +64,8 @@ fn test_encrypted_write_cold_read() {
                 tx.execute(
                     "INSERT INTO secrets (id, data) VALUES (?1, ?2)",
                     rusqlite::params![i, format!("secret_{}", i)],
-                ).unwrap();
+                )
+                .unwrap();
             }
             tx.commit().unwrap();
         }
@@ -84,7 +88,8 @@ fn test_encrypted_write_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(test_encryption_key()),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_read");
         let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
@@ -94,7 +99,8 @@ fn test_encrypted_write_cold_read() {
             "encrypted_test_reader.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
-        ).expect("failed to open reader connection");
+        )
+        .expect("failed to open reader connection");
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
@@ -104,11 +110,10 @@ fn test_encrypted_write_cold_read() {
         assert_eq!(count, 200, "expected 200 rows from cold read");
 
         let value: String = conn
-            .query_row(
-                "SELECT data FROM secrets WHERE id = 99",
-                [],
-                |row| row.get(0),
-            ).unwrap();
+            .query_row("SELECT data FROM secrets WHERE id = 99", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         assert_eq!(value, "secret_99", "row content mismatch on cold read");
     }
 
@@ -123,7 +128,8 @@ fn test_encrypted_write_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -148,10 +154,10 @@ fn test_encrypted_wrong_key_cold_read_fails() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "enc_wrong_key.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).expect("failed to open connection");
+        )
+        .expect("failed to open connection");
 
         conn.execute_batch(
             "PRAGMA page_size=65536;
@@ -159,7 +165,8 @@ fn test_encrypted_wrong_key_cold_read_fails() {
              CREATE TABLE t (id INTEGER PRIMARY KEY);
              INSERT INTO t VALUES (1);
              PRAGMA wal_checkpoint(TRUNCATE);",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Cold read with WRONG key — must fail (at open, pragma, or query level)
@@ -174,7 +181,8 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(wrong_key),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_wrong");
         let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
@@ -189,12 +197,16 @@ fn test_encrypted_wrong_key_cold_read_fails() {
         );
         let failed = if let Ok(conn) = conn_result {
             let pragma_result = conn.execute_batch("PRAGMA journal_mode=WAL;");
-            let query_result = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0));
+            let query_result =
+                conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0));
             pragma_result.is_err() || query_result.is_err()
         } else {
             true // open itself failed with wrong key
         };
-        assert!(failed, "wrong encryption key must cause failure, not return garbage");
+        assert!(
+            failed,
+            "wrong encryption key must cause failure, not return garbage"
+        );
     }
 
     // Cleanup
@@ -208,7 +220,8 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -234,17 +247,18 @@ fn test_encrypted_arctic_start_all_page_types() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "enc_arctic.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
-        ).expect("failed to open connection");
+        )
+        .expect("failed to open connection");
 
         conn.execute_batch(
             "PRAGMA page_size=65536;
              PRAGMA journal_mode=WAL;
              CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, value REAL);
              CREATE INDEX idx_name ON items(name);",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert enough rows to exercise multiple page types
         conn.execute_batch("BEGIN;").unwrap();
@@ -252,10 +266,12 @@ fn test_encrypted_arctic_start_all_page_types() {
             conn.execute(
                 "INSERT INTO items VALUES (?1, ?2, ?3)",
                 rusqlite::params![i, format!("item_{:05}", i), i as f64 * 1.5],
-            ).unwrap();
+            )
+            .unwrap();
         }
         conn.execute_batch("COMMIT;").unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Arctic read: completely fresh cache, no data cached at all
@@ -269,7 +285,8 @@ fn test_encrypted_arctic_start_all_page_types() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(test_encryption_key()),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_enc_arctic_r");
         let vfs = TurboliteVfs::new_local(reader_config).expect("failed to create reader VFS");
@@ -279,7 +296,8 @@ fn test_encrypted_arctic_start_all_page_types() {
             "enc_arctic_reader.db",
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             &reader_vfs_name,
-        ).expect("failed to open reader connection");
+        )
+        .expect("failed to open reader connection");
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
@@ -295,17 +313,24 @@ fn test_encrypted_arctic_start_all_page_types() {
                 "SELECT value FROM items WHERE name = 'item_00250'",
                 [],
                 |row| row.get(0),
-            ).unwrap();
-        assert!((value - 375.0).abs() < 0.001, "indexed lookup value mismatch: {}", value);
+            )
+            .unwrap();
+        assert!(
+            (value - 375.0).abs() < 0.001,
+            "indexed lookup value mismatch: {}",
+            value
+        );
 
         // Verify interior pages: point lookup by PK (traverses interior B-tree)
         let name: String = conn
-            .query_row(
-                "SELECT name FROM items WHERE id = 499",
-                [],
-                |row| row.get(0),
-            ).unwrap();
-        assert_eq!(name, "item_00499", "PK lookup mismatch on arctic encrypted read");
+            .query_row("SELECT name FROM items WHERE id = 499", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            name, "item_00499",
+            "PK lookup mismatch on arctic encrypted read"
+        );
     }
 
     // Cleanup S3
@@ -319,7 +344,8 @@ fn test_encrypted_arctic_start_all_page_types() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(test_encryption_key()),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -350,8 +376,7 @@ fn test_rotate_key_cold_read_succeeds() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rotate_test.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -391,11 +416,11 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b))
-            .expect("key rotation failed");
+        rotate_encryption_key(&rotate_config, Some(key_b)).expect("key rotation failed");
     }
 
     // Cold read with key B (fresh cache)
@@ -409,7 +434,8 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_rd");
         let vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -460,7 +486,8 @@ fn test_rotate_key_cold_read_succeeds() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -489,8 +516,7 @@ fn test_rotate_key_old_key_fails() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rotate_old_key.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -516,7 +542,8 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -532,7 +559,8 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_old_rd");
         let vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -567,7 +595,8 @@ fn test_rotate_key_old_key_fails() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -596,8 +625,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rotate_gc.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -663,7 +691,8 @@ fn test_rotate_key_gc_cleans_old_objects() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -701,7 +730,8 @@ fn test_rotate_key_gc_cleans_old_objects() {
     assert!(
         keys_after.len() <= keys_before.len() + 1,
         "rotation should not create unbounded key growth: before={}, after={}",
-        keys_before.len(), keys_after.len(),
+        keys_before.len(),
+        keys_after.len(),
     );
 
     // Manifest still exists (it's the same key, not versioned)
@@ -714,10 +744,15 @@ fn test_rotate_key_gc_cleans_old_objects() {
     // New versioned objects exist (version > any pre-rotation version)
     // After rotation, manifest.version is one higher than the checkpoint version.
     // Check that keys_after has objects NOT present in keys_before (rotation created new versions).
-    let new_keys: Vec<&String> = keys_after.iter()
+    let new_keys: Vec<&String> = keys_after
+        .iter()
         .filter(|k| !keys_before.contains(k) && k.contains("/p/d/"))
         .collect();
-    assert!(!new_keys.is_empty(), "rotation must create new versioned page group objects, got keys_after={:?}", keys_after);
+    assert!(
+        !new_keys.is_empty(),
+        "rotation must create new versioned page group objects, got keys_after={:?}",
+        keys_after
+    );
 
     // Cleanup with new key
     {
@@ -730,7 +765,8 @@ fn test_rotate_key_gc_cleans_old_objects() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -740,8 +776,8 @@ fn test_rotate_key_gc_cleans_old_objects() {
 /// Data integrity: row-level verification that rotation preserves all data.
 #[test]
 fn test_rotate_key_data_integrity() {
-    use turbolite::tiered::rotate_encryption_key;
     use std::collections::HashMap;
+    use turbolite::tiered::rotate_encryption_key;
 
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_integrity", writer_cache.path());
@@ -761,8 +797,7 @@ fn test_rotate_key_data_integrity() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rotate_integrity.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -804,7 +839,8 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
     }
@@ -820,7 +856,8 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rot_int_rd");
         let vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -835,7 +872,9 @@ fn test_rotate_key_data_integrity() {
 
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
 
-        let mut stmt = conn.prepare("SELECT id, value FROM data ORDER BY id").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, value FROM data ORDER BY id")
+            .unwrap();
         let rows: Vec<(i64, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -864,7 +903,8 @@ fn test_rotate_key_data_integrity() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -892,8 +932,7 @@ fn test_remove_encryption_cold_read() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "rmenc_test.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -932,11 +971,11 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_a),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, None)
-            .expect("remove encryption failed");
+        rotate_encryption_key(&rotate_config, None).expect("remove encryption failed");
     }
 
     // Cold read WITHOUT encryption key
@@ -950,7 +989,8 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no key needed
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_rmenc_rd");
         let vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -985,7 +1025,8 @@ fn test_remove_encryption_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: None,
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();
@@ -1013,8 +1054,7 @@ fn test_add_encryption_cold_read() {
 
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
             "addenc_test.db",
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
             &vfs_name,
         )
         .unwrap();
@@ -1053,11 +1093,11 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no old key
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b))
-            .expect("add encryption failed");
+        rotate_encryption_key(&rotate_config, Some(key_b)).expect("add encryption failed");
     }
 
     // Cold read WITH encryption key
@@ -1071,7 +1111,8 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let reader_vfs_name = unique_vfs_name("tiered_addenc_rd");
         let vfs = TurboliteVfs::new_local(reader_config).unwrap();
@@ -1106,7 +1147,8 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint.clone(),
             region: region.clone(),
             encryption_key: None, // no key, but data is now encrypted
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let fail_vfs_name = unique_vfs_name("tiered_addenc_fail");
         let vfs = TurboliteVfs::new_local(fail_config).unwrap();
@@ -1139,7 +1181,8 @@ fn test_add_encryption_cold_read() {
             endpoint_url: endpoint,
             region,
             encryption_key: Some(key_b),
-            runtime_handle: Some(super::helpers::shared_runtime_handle()), ..Default::default()
+            runtime_handle: Some(super::helpers::shared_runtime_handle()),
+            ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
         cleanup_vfs.destroy_s3().unwrap();

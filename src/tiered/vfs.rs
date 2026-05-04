@@ -53,6 +53,31 @@ pub struct TurboliteVfs {
     /// from racing on version numbers and storage keys. Also prevents a
     /// durable-mode checkpoint from interleaving with a flush in progress.
     flush_lock: Arc<Mutex<()>>,
+    /// Read/write gate for direct hybrid page replay.
+    ///
+    /// SQLite read transactions hold an Arc-owned read guard between
+    /// `xLock(SHARED)` and `xUnlock(NONE)` on `TurboliteHandle`.
+    /// `ReplayHandle::finalize` takes the write guard before installing
+    /// staged pages, so a finalize and a SQLite read transaction are
+    /// mutually exclusive: an in-flight read sees pre-replay state for
+    /// its full duration, and a read started while finalize is running
+    /// blocks until install completes and observes only the post-replay
+    /// state. Mid-read torn snapshots are impossible.
+    pub(crate) replay_gate: Arc<parking_lot::RwLock<()>>,
+    /// Monotonic epoch incremented by `ReplayHandle::finalize` while
+    /// holding `replay_gate.write()`. Background cache writers
+    /// (PrefetchPool, eager-fetch on handle open) capture the current
+    /// value at job submission and re-check it under `replay_gate.read()`
+    /// immediately before their final cache write; if the value has
+    /// advanced, they drop the work without writing. This stops a stale
+    /// prefetch fetched against the pre-replay manifest from overwriting
+    /// freshly-replayed bytes.
+    pub(crate) replay_epoch: Arc<AtomicU64>,
+    /// Test-only barrier that lets a deterministic test pause finalize
+    /// after the write-gate is held but before any page write happens.
+    /// Production builds compile this field out via #[cfg(test)].
+    #[cfg(test)]
+    pub(crate) finalize_pause: parking_lot::Mutex<Option<Arc<std::sync::Barrier>>>,
     /// WAL replication state (started lazily on first MainDb open).
     #[cfg(feature = "wal")]
     wal_state: std::sync::Mutex<wal_replication::WalReplicationState>,
@@ -117,7 +142,9 @@ impl TurboliteVfs {
             Some(m) => {
                 turbolite_debug!(
                     "[tiered] loaded local manifest (v{}, {} pages, {} dirty groups)",
-                    m.version, m.page_count, recovered_dirty_groups.len(),
+                    m.version,
+                    m.page_count,
+                    recovered_dirty_groups.len(),
                 );
                 m
             }
@@ -128,7 +155,8 @@ impl TurboliteVfs {
                     Some(m) => {
                         turbolite_debug!(
                             "[tiered] manifest fetched from backend (v{}, {} pages)",
-                            m.version, m.page_count,
+                            m.version,
+                            m.page_count,
                         );
                         m
                     }
@@ -141,7 +169,11 @@ impl TurboliteVfs {
         };
         manifest.detect_and_normalize_strategy();
 
-        let page_size = if manifest.page_size > 0 { manifest.page_size } else { 4096 };
+        let page_size = if manifest.page_size > 0 {
+            manifest.page_size
+        } else {
+            4096
+        };
         let ppg = if manifest.pages_per_group > 0 {
             manifest.pages_per_group
         } else {
@@ -185,10 +217,9 @@ impl TurboliteVfs {
             // over the one we loaded above (the background flush may not
             // have run yet, leaving the on-disk / remote manifest stale).
             for flush_entry in recovered_staging.iter().rev() {
-                if let Ok(Some(manifest_bytes)) = staging::read_staging_manifest(
-                    &flush_entry.staging_path,
-                    flush_entry.page_size,
-                ) {
+                if let Ok(Some(manifest_bytes)) =
+                    staging::read_staging_manifest(&flush_entry.staging_path, flush_entry.page_size)
+                {
                     if let Ok(m) = manifest::decode_manifest_bytes(&manifest_bytes) {
                         if m.version > manifest.version {
                             turbolite_debug!(
@@ -226,10 +257,9 @@ impl TurboliteVfs {
                         }
                     }
                 }
-                if let Ok(pages) = staging::read_staging_log(
-                    &flush_entry.staging_path,
-                    flush_entry.page_size,
-                ) {
+                if let Ok(pages) =
+                    staging::read_staging_log(&flush_entry.staging_path, flush_entry.page_size)
+                {
                     for (page_num, data) in &pages {
                         let _ = cache.write_page(*page_num, data);
                         let new_count = *page_num + 1;
@@ -269,6 +299,8 @@ impl TurboliteVfs {
             Arc::new(Mutex::new(recovered_staging))
         };
         let flush_lock = Arc::new(Mutex::new(()));
+        let replay_gate: Arc<parking_lot::RwLock<()>> = Arc::new(parking_lot::RwLock::new(()));
+        let replay_epoch = Arc::new(AtomicU64::new(0));
 
         // Prefetch pool: backend-agnostic, runs for every non-local setup
         // (local has no remote I/O to parallelise, so skip the worker
@@ -287,6 +319,8 @@ impl TurboliteVfs {
                 config.compression.dictionary.clone(),
                 config.encryption.key,
                 Arc::clone(&shared_manifest),
+                Arc::clone(&replay_gate),
+                Arc::clone(&replay_epoch),
             )))
         };
 
@@ -304,6 +338,10 @@ impl TurboliteVfs {
             pending_flushes,
             staging_seq,
             flush_lock,
+            replay_gate,
+            replay_epoch,
+            #[cfg(test)]
+            finalize_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "wal")]
             wal_state: std::sync::Mutex::new(wal_replication::WalReplicationState::new()),
         })
@@ -330,7 +368,9 @@ impl TurboliteVfs {
                     let dirty = manifest::load_dirty_groups(&self.config.cache_dir)?;
                     turbolite_debug!(
                         "[tiered] loaded local manifest (v{}, {} pages, {} dirty)",
-                        m.version, m.page_count, dirty.len(),
+                        m.version,
+                        m.page_count,
+                        dirty.len(),
                     );
                     m.build_page_index();
                     return Ok((m, dirty, false));
@@ -340,7 +380,8 @@ impl TurboliteVfs {
                     .unwrap_or_else(Manifest::empty);
                 turbolite_debug!(
                     "[tiered] manifest fetched (v{}, {} pages)",
-                    m.version, m.page_count,
+                    m.version,
+                    m.page_count,
                 );
                 Ok((m, Vec::new(), false))
             }
@@ -514,8 +555,7 @@ impl TurboliteVfs {
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
 
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());
@@ -589,12 +629,10 @@ impl TurboliteVfs {
     /// Validate the database against the backend.
     pub fn validate(&self) -> io::Result<super::ValidateResult> {
         let manifest = (**self.shared_manifest.load()).clone();
-        let all_keys: HashSet<String> = storage_helpers::list_all_keys(
-            self.storage.as_ref(),
-            &self.runtime,
-        )?
-        .into_iter()
-        .collect();
+        let all_keys: HashSet<String> =
+            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?
+                .into_iter()
+                .collect();
 
         let mut live_keys: HashSet<String> = HashSet::new();
 
@@ -605,7 +643,12 @@ impl TurboliteVfs {
                 pg_missing.push(key.clone());
             }
         }
-        let pg_present = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count() - pg_missing.len();
+        let pg_present = manifest
+            .page_group_keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .count()
+            - pg_missing.len();
 
         let mut int_missing = Vec::new();
         for key in manifest.interior_chunk_keys.values() {
@@ -647,7 +690,11 @@ impl TurboliteVfs {
         let sub_ppf = manifest.sub_pages_per_frame;
         let encryption_key = self.config.encryption.key.as_ref();
 
-        let total_pg = manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count();
+        let total_pg = manifest
+            .page_group_keys
+            .iter()
+            .filter(|k| !k.is_empty())
+            .count();
         let mut processed = 0usize;
         for (gid, key) in manifest.page_group_keys.iter().enumerate() {
             if key.is_empty() || pg_missing.contains(key) {
@@ -661,8 +708,14 @@ impl TurboliteVfs {
                         if let Some(ft) = ft {
                             if !ft.is_empty() {
                                 if let Err(e) = decode_page_group_seekable_full(
-                                    &data, ft, page_size, pages_in_group, page_count, 0,
-                                    #[cfg(feature = "zstd")] None,
+                                    &data,
+                                    ft,
+                                    page_size,
+                                    pages_in_group,
+                                    page_count,
+                                    0,
+                                    #[cfg(feature = "zstd")]
+                                    None,
                                     encryption_key,
                                 ) {
                                     decode_errors.push((key.clone(), format!("{}", e)));
@@ -671,7 +724,8 @@ impl TurboliteVfs {
                         }
                     } else if let Err(e) = decode_page_group(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
                         decode_errors.push((key.clone(), format!("{}", e)));
@@ -698,17 +752,23 @@ impl TurboliteVfs {
                 Ok(Some(data)) => {
                     if let Err(e) = decode_interior_bundle(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
-                        decode_errors.push((key.clone(), format!("interior chunk {}: {}", chunk_id, e)));
+                        decode_errors
+                            .push((key.clone(), format!("interior chunk {}: {}", chunk_id, e)));
                     }
                 }
                 Ok(None) => {
-                    decode_errors.push((key.clone(), format!("interior chunk {}: empty", chunk_id)));
+                    decode_errors
+                        .push((key.clone(), format!("interior chunk {}: empty", chunk_id)));
                 }
                 Err(e) => {
-                    decode_errors.push((key.clone(), format!("interior chunk {} fetch: {}", chunk_id, e)));
+                    decode_errors.push((
+                        key.clone(),
+                        format!("interior chunk {} fetch: {}", chunk_id, e),
+                    ));
                 }
             }
         }
@@ -721,24 +781,33 @@ impl TurboliteVfs {
                 Ok(Some(data)) => {
                     if let Err(e) = decode_interior_bundle(
                         &data,
-                        #[cfg(feature = "zstd")] None,
+                        #[cfg(feature = "zstd")]
+                        None,
                         encryption_key,
                     ) {
-                        decode_errors.push((key.clone(), format!("index chunk {}: {}", chunk_id, e)));
+                        decode_errors
+                            .push((key.clone(), format!("index chunk {}: {}", chunk_id, e)));
                     }
                 }
                 Ok(None) => {
                     decode_errors.push((key.clone(), format!("index chunk {}: empty", chunk_id)));
                 }
                 Err(e) => {
-                    decode_errors.push((key.clone(), format!("index chunk {} fetch: {}", chunk_id, e)));
+                    decode_errors.push((
+                        key.clone(),
+                        format!("index chunk {} fetch: {}", chunk_id, e),
+                    ));
                 }
             }
         }
 
         Ok(super::ValidateResult {
             manifest_version: manifest.version,
-            page_groups_total: manifest.page_group_keys.iter().filter(|k| !k.is_empty()).count(),
+            page_groups_total: manifest
+                .page_group_keys
+                .iter()
+                .filter(|k| !k.is_empty())
+                .count(),
             page_groups_present: pg_present,
             page_groups_missing: pg_missing,
             interior_chunks_total: manifest.interior_chunk_keys.len(),
@@ -754,20 +823,12 @@ impl TurboliteVfs {
 
     /// Copy the current manifest to a snapshot key.
     pub fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
-        storage_helpers::copy_manifest_to_snapshot(
-            self.storage.as_ref(),
-            &self.runtime,
-            snap_id,
-        )
+        storage_helpers::copy_manifest_to_snapshot(self.storage.as_ref(), &self.runtime, snap_id)
     }
 
     /// Delete a snapshot manifest copy.
     pub fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
-        storage_helpers::delete_snapshot_manifest(
-            self.storage.as_ref(),
-            &self.runtime,
-            snap_id,
-        )
+        storage_helpers::delete_snapshot_manifest(self.storage.as_ref(), &self.runtime, snap_id)
     }
 
     /// Load a manifest from a snapshot key.
@@ -783,11 +844,38 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// True if the backend already has a canonical turbolite manifest.
+    pub fn remote_manifest_exists(&self) -> io::Result<bool> {
+        storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime)
+    }
+
+    /// Import a local SQLite file into this VFS's backend as checkpointed base state.
+    ///
+    /// This is the fresh-bootstrap path for hybrid Turbolite + walrust deployments:
+    /// the caller already has a committed SQLite file on disk, and turbolite must
+    /// publish that file as page-group base state before walrust starts shipping
+    /// deltas against it.
+    pub fn import_sqlite_file(&self, file_path: &Path) -> io::Result<Manifest> {
+        let mut manifest = import::import_sqlite_file(
+            &self.config,
+            Arc::clone(&self.storage),
+            self.runtime.clone(),
+            file_path,
+        )?;
+        manifest.detect_and_normalize_strategy();
+        let current_version = self.manifest().version;
+        if manifest.version <= current_version {
+            manifest.version = current_version + 1;
+        }
+        self.set_manifest(manifest.clone());
+        manifest::persist_manifest_local(&self.config.cache_dir, &manifest)?;
+        Ok(manifest)
+    }
+
     /// Delete every object the backend knows about. Backend-agnostic
     /// wipe; previously `destroy_s3`.
     pub fn destroy_remote(&self) -> io::Result<()> {
-        let all_keys =
-            storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
+        let all_keys = storage_helpers::list_all_keys(self.storage.as_ref(), &self.runtime)?;
         if all_keys.is_empty() {
             return Ok(());
         }
@@ -835,6 +923,23 @@ impl TurboliteVfs {
         Ok(decoded.walrust)
     }
 
+    /// Decode manifest wire bytes without mutating local VFS state.
+    ///
+    /// Useful for higher layers that need to inspect the currently published
+    /// hybrid cursor before deciding what to publish next.
+    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<(Manifest, Option<(u64, String)>)> {
+        let decoded = super::wire::decode(bytes)?;
+        Ok((decoded.manifest, decoded.walrust))
+    }
+
+    /// Clone of the VFS-level replay gate. Higher layers (haqlite-turbolite
+    /// follower apply) take the write half around out-of-band cache writes
+    /// like `materialize_to_file` so in-flight VFS reads (which take the
+    /// read half on `xLock(SHARED)`) cannot observe a torn cache file.
+    pub fn replay_gate(&self) -> Arc<parking_lot::RwLock<()>> {
+        Arc::clone(&self.replay_gate)
+    }
+
     /// Fetch the latest manifest from the backend and apply it via `set_manifest`.
     /// Returns the new manifest version, or None if no manifest exists.
     /// Used by HA followers to catch up from the leader's turbolite state.
@@ -860,7 +965,8 @@ impl TurboliteVfs {
                 if manifest.version < current.version {
                     turbolite_debug!(
                         "[set_manifest] REJECTED: incoming v{} < current v{} (would downgrade)",
-                        manifest.version, current.version,
+                        manifest.version,
+                        current.version,
                     );
                 }
                 return;
@@ -913,7 +1019,8 @@ impl TurboliteVfs {
             let _ = self.cache.write_page(0, page0);
         }
 
-        self.page_count.store(manifest.page_count, Ordering::Release);
+        self.page_count
+            .store(manifest.page_count, Ordering::Release);
 
         self.shared_manifest.store(Arc::new(manifest.clone()));
 
@@ -942,9 +1049,52 @@ impl TurboliteVfs {
         self.config.cache_dir.join("data.cache")
     }
 
+    /// Replace the local cache contents from a materialized SQLite file.
+    ///
+    /// Used by external restore flows that rebuild a plain SQLite database file
+    /// first, then need turbolite's own cache file descriptor and in-memory page
+    /// state to adopt those bytes before the next VFS-backed connection opens.
+    pub fn replace_cache_from_sqlite_file(&self, input: &Path) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        let manifest = self.manifest();
+        if manifest.page_count == 0 || manifest.page_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "empty manifest, no data to restore into cache",
+            ));
+        }
+
+        let page_size = manifest.page_size as usize;
+        let mut page = vec![0u8; page_size];
+        let input_file = std::fs::File::open(input)?;
+        for page_num in 0..manifest.page_count {
+            input_file.read_exact_at(&mut page, page_num * page_size as u64)?;
+            self.cache.write_page(page_num, &page)?;
+        }
+
+        self.cache.mark_all_pages_present(manifest.page_count);
+        self.page_count
+            .store(manifest.page_count, Ordering::Release);
+        self.cache.bump_generation();
+        if let Err(e) = self.cache.persist_bitmap() {
+            eprintln!(
+                "[replace_cache_from_sqlite_file] warning: failed to persist bitmap: {}",
+                e,
+            );
+        }
+        Ok(())
+    }
+
     /// Sync VFS state after an external process (walrust restore) wrote pages
     /// directly to the cache file.
     pub fn sync_after_external_restore(&self, page_count: u64) {
+        // The external restore rewrote data.cache behind the VFS's back. Any
+        // in-memory decoded pages from an earlier manifest version are now stale
+        // and must be dropped so the next VFS open/read sees the restored bytes.
+        let page_nums: Vec<u64> = (0..page_count).collect();
+        self.cache.clear_pages_from_mem_cache(&page_nums);
+        self.cache.bump_generation();
         self.cache.mark_all_pages_present(page_count);
         self.page_count.store(page_count, Ordering::Release);
         if let Err(e) = self.cache.persist_bitmap() {
@@ -953,6 +1103,95 @@ impl TurboliteVfs {
                 e,
             );
         }
+    }
+
+    /// Begin a direct hybrid page replay cycle.
+    ///
+    /// Returns a [`ReplayHandle`] that the caller drives with
+    /// `apply_page` (per decoded HADBP page from walrust),
+    /// `commit_changeset(seq)` (per S3 object), then exactly one of
+    /// `finalize` (success) or `abort` (any failure). On finalize the
+    /// staged pages are atomically installed into the live cache and
+    /// emitted as a staging log under `pending_flushes` so the next
+    /// `flush_to_storage` / `publish_replayed_base` turns them into
+    /// uploaded page groups.
+    ///
+    /// See `crate::tiered::replay` for the full lifecycle contract.
+    pub fn begin_replay(&self) -> io::Result<crate::tiered::replay::ReplayHandle> {
+        let staging_dir = self.config.cache_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir)?;
+        let ctx = crate::tiered::replay::ReplayContext {
+            cache: self.cache.clone(),
+            shared_manifest: self.shared_manifest.clone(),
+            vfs_page_count: self.page_count.clone(),
+            pending_flushes: self.pending_flushes.clone(),
+            staging_seq: self.staging_seq.clone(),
+            flush_lock: self.flush_lock.clone(),
+            replay_gate: self.replay_gate.clone(),
+            replay_epoch: self.replay_epoch.clone(),
+            staging_dir,
+            #[cfg(test)]
+            finalize_pause: {
+                let guard = self.finalize_pause.lock();
+                guard.clone()
+            },
+        };
+        crate::tiered::replay::ReplayHandle::new(ctx)
+    }
+
+    /// Test-only deterministic pause hook for `ReplayHandle::finalize`.
+    ///
+    /// When a barrier is installed, finalize will call `barrier.wait()`
+    /// twice during the commit phase: once after acquiring
+    /// `replay_gate.write()` but before any page writes (so the test
+    /// can release/observe the pre-replay state under contention) and
+    /// once at the end of the commit just before releasing the write
+    /// guard (so the test can observe finalize-just-finished state).
+    /// Setting `None` removes the pause for subsequent finalize calls.
+    #[cfg(test)]
+    pub fn install_finalize_pause_for_test(&self, barrier: Option<Arc<std::sync::Barrier>>) {
+        *self.finalize_pause.lock() = barrier;
+    }
+
+    /// Promote accumulated replayed state to a remote manifest payload.
+    ///
+    /// Drives `flush_dirty_groups` over whatever staging logs and
+    /// dirty groups have accumulated since the last flush, encodes
+    /// the resulting manifest as hybrid bytes carrying the supplied
+    /// walrust cursor, and returns those bytes for the caller to
+    /// CAS-publish under its manifest key. If no replay state is
+    /// pending, the call still returns a hybrid payload built from
+    /// the current manifest with the new cursor — that covers the
+    /// "follower already caught up before promotion" case.
+    pub fn publish_replayed_base(
+        &self,
+        walrust_seq: u64,
+        walrust_prefix: &str,
+    ) -> io::Result<Vec<u8>> {
+        // Drive a flush over any pending replay state. flush_to_storage
+        // drains pending_flushes + shared_dirty_groups together and
+        // resolves dirty groups via manifest.page_location, which
+        // works for both Positional and BTreeAware manifests because
+        // ReplayHandle::finalize already extended page_count and
+        // group_pages before emitting the staging log.
+        let has_pending = self
+            .pending_flushes
+            .lock()
+            .map(|g| !g.is_empty())
+            .unwrap_or(false)
+            || self
+                .shared_dirty_groups
+                .lock()
+                .map(|g| !g.is_empty())
+                .unwrap_or(false);
+        if has_pending {
+            self.flush_to_storage()?;
+        }
+        // Whether we flushed or not, the in-memory manifest is the
+        // source of truth for the published payload. Encode it with
+        // the walrust delta extension so the caller (haqlite-turbolite)
+        // can CAS it under its manifest key.
+        self.manifest_bytes_with_walrust_delta(walrust_seq, walrust_prefix)
     }
 }
 
@@ -979,7 +1218,8 @@ impl Vfs for TurboliteVfs {
                     if old_manifest.version > manifest.version {
                         turbolite_debug!(
                             "[cache-validate] local v{} ahead of manifest v{}, full invalidation",
-                            old_manifest.version, manifest.version,
+                            old_manifest.version,
+                            manifest.version,
                         );
                         let states = self.cache.group_states.lock();
                         for state in states.iter() {
@@ -1017,7 +1257,9 @@ impl Vfs for TurboliteVfs {
                             self.cache.group_condvar.notify_all();
                             turbolite_debug!(
                                 "[cache-validate] manifest v{} -> v{}: invalidated {} groups",
-                                old_manifest.version, manifest.version, invalidated,
+                                old_manifest.version,
+                                manifest.version,
+                                invalidated,
                             );
                         }
                     }
@@ -1101,6 +1343,8 @@ impl Vfs for TurboliteVfs {
                 self.config.cache.max_bytes,
                 self.config.cache.evict_on_checkpoint,
                 self.is_local,
+                Arc::clone(&self.replay_gate),
+                Arc::clone(&self.replay_epoch),
             )
         } else {
             if let Some(parent) = path.parent() {
@@ -1111,7 +1355,11 @@ impl Vfs for TurboliteVfs {
                 .write(true)
                 .create(true)
                 .open(&path)?;
-            Ok(TurboliteHandle::new_passthrough(file, path, self.config.encryption.key))
+            Ok(TurboliteHandle::new_passthrough(
+                file,
+                path,
+                self.config.encryption.key,
+            ))
         }
     }
 
@@ -1158,6 +1406,18 @@ impl Vfs for TurboliteVfs {
     fn sleep(&self, duration: Duration) -> Duration {
         std::thread::sleep(duration);
         duration
+    }
+}
+
+impl Drop for TurboliteVfs {
+    fn drop(&mut self) {
+        // Drop prefetch pool first so worker threads join before the
+        // tokio runtime is shut down. Then pause briefly to let reqwest's
+        // background connection-pool tasks finish gracefully. Without the
+        // sleep, aborted in-flight connections log noisy hyper
+        // IncompleteMessage errors during teardown (harmless but distracting).
+        self.prefetch_pool = None;
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

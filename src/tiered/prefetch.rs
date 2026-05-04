@@ -7,7 +7,7 @@
 //! mode (there's no remote I/O to parallelise).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -35,14 +35,32 @@ pub(crate) struct PrefetchJob {
     pub(crate) overrides: HashMap<usize, SubframeOverride>,
     /// Manifest version when this job was submitted.
     pub(crate) manifest_version: u64,
+    /// Replay epoch captured at submission. The worker re-reads the
+    /// shared epoch under `replay_gate.read()` immediately before its
+    /// final cache write; if the value has advanced, replay finalize
+    /// has installed new bytes for these pages and the prefetch's
+    /// version of the bytes is stale. The job is dropped without
+    /// writing.
+    pub(crate) replay_epoch_at_submit: u64,
 }
 
 /// Fixed thread pool for background page group prefetching.
 pub(crate) struct PrefetchPool {
     job_tx: flume::Sender<PrefetchJob>,
+    /// Wake-up signal for `wait_idle`. Worker may drop sends when full —
+    /// `in_flight` is the source of truth, the channel is just a doorbell.
     done_rx: flume::Receiver<u64>,
-    in_flight: AtomicU64,
+    /// Outstanding jobs: incremented by `submit`, decremented by the worker
+    /// at the end of each job (on every code path). `wait_idle` polls this.
+    in_flight: Arc<AtomicU64>,
     workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Set to true when the pool is shutting down; suppresses noisy
+    /// fetch/decode/write error logs during teardown.
+    shutdown: Arc<AtomicBool>,
+    /// Replay epoch reference held by the pool so `submit` can
+    /// snapshot it into each `PrefetchJob`. Workers reload from the
+    /// shared atomic under `replay_gate.read()` later.
+    replay_epoch_at_pool: Arc<AtomicU64>,
 }
 
 impl PrefetchPool {
@@ -56,10 +74,18 @@ impl PrefetchPool {
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         encryption_key: Option<[u8; 32]>,
         shared_manifest: Arc<ArcSwap<Manifest>>,
+        replay_gate: Arc<parking_lot::RwLock<()>>,
+        replay_epoch: Arc<AtomicU64>,
     ) -> Self {
         let (job_tx, job_rx) = flume::bounded::<PrefetchJob>(num_workers as usize * 2);
-        let (done_tx, done_rx) = flume::unbounded::<u64>();
+        // Bounded so the completion signal can't grow without limit if no one
+        // is calling `wait_idle`. Sized to comfortably absorb a wake-up backlog
+        // (`num_workers * 4`); workers `try_send` and drop on full because
+        // `in_flight` (atomic) is the authoritative outstanding-job count.
+        let (done_tx, done_rx) = flume::bounded::<u64>(num_workers as usize * 4);
+        let in_flight = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(num_workers as usize);
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
@@ -77,22 +103,46 @@ impl PrefetchPool {
             let dictionary = dictionary.clone();
             let encryption_key = Arc::clone(&encryption_key);
             let shared_manifest = Arc::clone(&shared_manifest);
+            let shutdown = Arc::clone(&shutdown);
+            let in_flight = Arc::clone(&in_flight);
+            let replay_gate = Arc::clone(&replay_gate);
+            let replay_epoch = Arc::clone(&replay_epoch);
 
             workers.push(std::thread::spawn(move || {
+                // Mark a job as finished: drop the in-flight counter (so
+                // wait_idle can observe completion) and best-effort wake any
+                // waiter via the bounded done channel. Dropped wake-ups are
+                // fine — the next call to wait_idle reads the atomic directly.
+                let finish = |gid: u64| {
+                    in_flight.fetch_sub(1, Ordering::Release);
+                    let _ = done_tx.try_send(gid);
+                };
+
+                // Worker error / stale paths use `unclaim_if_fetching`
+                // (CAS Fetching → None) rather than the unconditional
+                // `unclaim_group`. Replay finalize calls
+                // `mark_pages_present` on the group's pages, which
+                // also flips the group state to Present. If a worker
+                // is still in flight when that happens (e.g., it
+                // captured an old manifest version, or its
+                // captured replay_epoch was bumped), it must not
+                // reset Present → None: that would force a re-fetch
+                // against a stale manifest key and could re-install
+                // pre-replay bytes over the freshly-replayed ones.
                 while let Ok(job) = job_rx.recv() {
                     let gid = job.gid;
 
                     let current = cache.group_state(gid);
                     if current == GroupState::None {
                         if !cache.try_claim_group(gid) {
-                            let _ = done_tx.send(gid);
+                            finish(gid);
                             continue;
                         }
                     } else if current != GroupState::Fetching {
                         if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
-                        let _ = done_tx.send(gid);
+                        finish(gid);
                         continue;
                     }
 
@@ -102,17 +152,19 @@ impl PrefetchPool {
                     let pg_data = match block_on(&runtime, storage.get(&job.key)) {
                         Ok(data) => data,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
-                            cache.unclaim_group(gid);
-                            let _ = done_tx.send(gid);
+                            if !shutdown.load(Ordering::Acquire) {
+                                eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
+                            }
+                            cache.unclaim_if_fetching(gid);
+                            finish(gid);
                             continue;
                         }
                     };
                     let fetch_ms = fetch_start.elapsed().as_millis();
 
                     let Some(pg_data) = pg_data else {
-                        cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        cache.unclaim_if_fetching(gid);
+                        finish(gid);
                         continue;
                     };
 
@@ -146,9 +198,11 @@ impl PrefetchPool {
                     let (pg_count, _pg_size, page_data) = match decode_result {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[prefetch] gid={} decode error: {}", gid, e);
-                            cache.unclaim_group(gid);
-                            let _ = done_tx.send(gid);
+                            if !shutdown.load(Ordering::Acquire) {
+                                eprintln!("[prefetch] gid={} decode error: {}", gid, e);
+                            }
+                            cache.unclaim_if_fetching(gid);
+                            finish(gid);
                             continue;
                         }
                     };
@@ -160,8 +214,28 @@ impl PrefetchPool {
                             "[prefetch] gid={} manifest changed (v{} -> v{}), discarding stale fetch",
                             gid, job.manifest_version, current_version,
                         );
-                        cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        cache.unclaim_if_fetching(gid);
+                        finish(gid);
+                        continue;
+                    }
+
+                    // Hold the replay-gate read lock across both the
+                    // epoch re-check and the cache write. This blocks
+                    // concurrent finalize, which takes the write
+                    // guard, and means we cannot race between
+                    // "epoch matches" and "we wrote bytes". If
+                    // finalize ran between submit and here, the
+                    // captured epoch will not match the current value
+                    // and we drop without writing.
+                    let _replay_read_guard = replay_gate.read();
+                    let current_epoch = replay_epoch.load(Ordering::Acquire);
+                    if current_epoch != job.replay_epoch_at_submit {
+                        turbolite_debug!(
+                            "[prefetch] gid={} replay epoch advanced ({} -> {}), discarding stale fetch",
+                            gid, job.replay_epoch_at_submit, current_epoch,
+                        );
+                        cache.unclaim_if_fetching(gid);
+                        finish(gid);
                         continue;
                     }
 
@@ -183,9 +257,11 @@ impl PrefetchPool {
                         Ok(())
                     };
                     if let Err(e) = write_result {
-                        eprintln!("[prefetch] gid={} write error: {}", gid, e);
-                        cache.unclaim_group(gid);
-                        let _ = done_tx.send(gid);
+                        if !shutdown.load(Ordering::Acquire) {
+                            eprintln!("[prefetch] gid={} write error: {}", gid, e);
+                        }
+                        cache.unclaim_if_fetching(gid);
+                        finish(gid);
                         continue;
                     }
                     let write_ms = write_start.elapsed().as_millis();
@@ -223,10 +299,12 @@ impl PrefetchPool {
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "[prefetch] gid={} override frame {} fetch error: {}",
-                                        gid, frame_idx, e,
-                                    );
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch] gid={} override frame {} fetch error: {}",
+                                            gid, frame_idx, e,
+                                        );
+                                    }
                                     continue;
                                 }
                             };
@@ -265,7 +343,7 @@ impl PrefetchPool {
                             worker_start.elapsed().as_millis(),
                         );
                     }
-                    let _ = done_tx.send(gid);
+                    finish(gid);
                 }
             }));
         }
@@ -273,8 +351,10 @@ impl PrefetchPool {
         Self {
             job_tx,
             done_rx,
-            in_flight: AtomicU64::new(0),
+            in_flight,
             workers: parking_lot::Mutex::new(workers),
+            shutdown,
+            replay_epoch_at_pool: replay_epoch,
         }
     }
 
@@ -291,6 +371,11 @@ impl PrefetchPool {
         manifest_version: u64,
     ) -> bool {
         self.in_flight.fetch_add(1, Ordering::Acquire);
+        // Snapshot the replay epoch at submission. The worker re-reads
+        // it under the replay_gate read lock before its final cache
+        // write; if it has advanced, replay finalize ran in between
+        // and the prefetch's bytes are stale.
+        let replay_epoch_at_submit = self.replay_epoch_at_pool.load(Ordering::Acquire);
         match self.job_tx.send(PrefetchJob {
             gid,
             key,
@@ -300,6 +385,7 @@ impl PrefetchPool {
             sub_pages_per_frame: sub_ppf,
             group_page_nums,
             overrides,
+            replay_epoch_at_submit,
         }) {
             Ok(()) => true,
             Err(_) => {
@@ -310,17 +396,26 @@ impl PrefetchPool {
     }
 
     /// Wait until all in-flight prefetch jobs complete.
+    ///
+    /// Workers decrement `in_flight` when they finish a job, so the atomic
+    /// is the source of truth. The done channel is best-effort wake-up: if
+    /// a wake-up was dropped because the channel was full, we still make
+    /// progress via the short timeout.
     pub(crate) fn wait_idle(&self) {
         loop {
             let remaining = self.in_flight.load(Ordering::Acquire);
             if remaining == 0 {
                 break;
             }
-            match self.done_rx.recv() {
-                Ok(_gid) => {
-                    self.in_flight.fetch_sub(1, Ordering::Release);
-                }
-                Err(_) => break,
+            // Sleep until a worker rings the bell, or 50ms — whichever first.
+            // Either way we re-check in_flight on the next iteration.
+            match self
+                .done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(_gid) => {}
+                Err(flume::RecvTimeoutError::Timeout) => {}
+                Err(flume::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -328,6 +423,12 @@ impl PrefetchPool {
 
 impl Drop for PrefetchPool {
     fn drop(&mut self) {
+        // Signal shutdown so workers suppress spurious fetch/decode/write
+        // error logs while the runtime/storage is torn down.
+        self.shutdown.store(true, Ordering::Release);
+        // Drain all in-flight work before shutting down the channel.
+        self.wait_idle();
+
         let (dead_tx, _) = flume::bounded(0);
         drop(std::mem::replace(&mut self.job_tx, dead_tx));
         while self.done_rx.try_recv().is_ok() {}
