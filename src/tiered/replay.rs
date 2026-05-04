@@ -550,21 +550,31 @@ impl ReplayHandle {
             // for already-present pages.
             let pre_image = if was_present {
                 let mut buf = vec![0u8; page_size_bytes];
-                if let Err(e) = self.ctx.cache.read_page(page_num, &mut buf) {
-                    return Err(handle_commit_phase_failure(
-                        &self.ctx.cache,
-                        &pre_images,
-                        &staging_log_path,
-                        format!(
-                            "replay finalize: pre-image read of page {} failed after writing {} of {} pages: {}",
-                            page_num,
-                            written.len(),
-                            self.staged.len(),
-                            e
-                        ),
-                    ));
+                match self.ctx.cache.read_page(page_num, &mut buf) {
+                    Ok(()) => Some(buf),
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        // A materialized base can have bitmap metadata ahead
+                        // of the physical cache file when the next WAL replay
+                        // extends the database. Treat a short pre-image read
+                        // as a newly allocated page: there is no complete
+                        // old image to roll back.
+                        None
+                    }
+                    Err(e) => {
+                        return Err(handle_commit_phase_failure(
+                            &self.ctx.cache,
+                            &pre_images,
+                            &staging_log_path,
+                            format!(
+                                "replay finalize: pre-image read of page {} failed after writing {} of {} pages: {}",
+                                page_num,
+                                written.len(),
+                                self.staged.len(),
+                                e
+                            ),
+                        ));
+                    }
                 }
-                Some(buf)
             } else {
                 None
             };
