@@ -1006,6 +1006,25 @@ fn test_wait_for_group_returns_on_reset_to_none() {
 }
 
 #[test]
+fn test_wait_for_group_returns_on_lost_fetching_claim() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+
+    assert!(cache.try_claim_group(0));
+
+    let start = std::time::Instant::now();
+    let final_state = cache.wait_for_group(0);
+    let elapsed = start.elapsed();
+
+    assert_eq!(final_state, GroupState::Fetching);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "lost Fetching claim should not park forever, waited {:?}",
+        elapsed
+    );
+}
+
+#[test]
 fn test_prefetch_worker_skips_already_present_group() {
     // Simulates what happens when a group is already Present by the time
     // the prefetch worker picks it up: worker should skip it.
@@ -1537,6 +1556,7 @@ fn test_compressed_read_missing_page() {
 }
 
 #[test]
+#[cfg(feature = "zstd")]
 fn test_compressed_space_savings() {
     let dir = TempDir::new().unwrap();
     let page_size = 4096u32;
@@ -1941,8 +1961,10 @@ fn test_compressed_encrypted_data_not_plaintext() {
     // Read raw bytes from disk: should NOT match plaintext or compressed plaintext
     let entry = cache.cache_index.lock().get(0).copied().unwrap();
     let mut raw = vec![0u8; entry.compressed_len as usize];
-    let file = cache.cache_file.read();
-    file.read_exact_at(&mut raw, entry.offset).unwrap();
+    cache
+        .cache_file
+        .read_exact_at(&mut raw, entry.offset)
+        .unwrap();
 
     // Raw disk bytes must differ from plaintext
     assert_ne!(

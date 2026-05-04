@@ -1,5 +1,14 @@
 //! Encryption key rotation: re-encrypt all backend data with a new key.
 
+#[cfg(feature = "encryption")]
+use std::io;
+
+#[cfg(feature = "encryption")]
+use crate::compress;
+
+#[cfg(feature = "encryption")]
+use super::{decrypt_if_needed, keys, FrameEntry, TurboliteConfig};
+
 /// Re-encrypt, encrypt, or decrypt all backend data.
 ///
 /// Three modes based on `config.encryption.key` (old) and `new_key`:
@@ -204,7 +213,11 @@ pub fn rotate_encryption_key(
         let output = maybe_encrypt(&compressed)?;
 
         let new_s3_key = keys::interior_chunk_key(*chunk_id, new_version);
-        s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
+        storage_helpers::put_page_groups(
+            backend_ref,
+            runtime_ref,
+            &[(new_s3_key.clone(), output)],
+        )?;
 
         replaced_keys.push(old_s3_key.clone());
         new_manifest
@@ -232,7 +245,11 @@ pub fn rotate_encryption_key(
         let output = maybe_encrypt(&compressed)?;
 
         let new_s3_key = keys::index_chunk_key(*chunk_id, new_version);
-        s3.put_page_groups(&[(new_s3_key.clone(), output)])?;
+        storage_helpers::put_page_groups(
+            backend_ref,
+            runtime_ref,
+            &[(new_s3_key.clone(), output)],
+        )?;
 
         replaced_keys.push(old_s3_key.clone());
         new_manifest.index_chunk_keys.insert(*chunk_id, new_s3_key);

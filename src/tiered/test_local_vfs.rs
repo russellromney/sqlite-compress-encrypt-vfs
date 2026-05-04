@@ -76,6 +76,7 @@ fn test_local_vfs_sqlite_roundtrip() {
 
 /// Local VFS with compression enabled: write + checkpoint + reopen.
 #[test]
+#[cfg(feature = "zstd")]
 fn test_local_vfs_with_compression() {
     let dir = TempDir::new().unwrap();
 
@@ -190,9 +191,7 @@ fn test_local_vfs_schema_changes() {
     assert_eq!(email, "alice@example.com");
 }
 
-/// Local VFS gc() and destroy_s3() return appropriate errors.
-/// flush_to_storage() is a valid no-op on local VFS (returns Ok).
-#[cfg(feature = "s3")]
+/// Local VFS maintenance methods should work through the StorageBackend abstraction.
 #[test]
 fn test_local_vfs_cloud_methods_error() {
     let dir = TempDir::new().unwrap();
@@ -202,19 +201,17 @@ fn test_local_vfs_cloud_methods_error() {
     };
     let vfs = TurboliteVfs::new_local(config).expect("local VFS");
 
-    // Cloud-only methods should return Unsupported errors, not panic
-    let gc_err = vfs.gc();
-    assert!(gc_err.is_err());
+    let gc_result = vfs.gc();
+    assert!(
+        gc_result.is_ok(),
+        "gc should be valid for local backend storage"
+    );
 
-    // flush_to_storage uses StorageClient abstraction, works on all backends
     let flush_result = vfs.flush_to_storage();
     assert!(
         flush_result.is_ok(),
         "flush_to_storage should be a no-op on local VFS"
     );
-
-    let destroy_err = vfs.destroy_s3();
-    assert!(destroy_err.is_err());
 }
 
 /// Local VFS can be constructed; I/O counters (previously exposed via

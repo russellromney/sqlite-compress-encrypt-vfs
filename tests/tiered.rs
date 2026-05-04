@@ -6,10 +6,10 @@
 //! # Source Tigris credentials, then:
 //! TIERED_TEST_BUCKET=sqlces-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
-//!   cargo test --features tiered,zstd tiered
+//!   cargo test --features cli-s3,zstd --test tiered
 //! ```
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "cli-s3")]
 mod tiered {
     mod advanced;
     mod basic;

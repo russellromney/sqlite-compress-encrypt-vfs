@@ -852,6 +852,7 @@ fn test_encode_override_frame_empty() {
 }
 
 #[test]
+#[cfg(feature = "zstd")]
 fn test_encode_override_frame_compression_reduces_size() {
     let page_size = 4096u32;
     // Highly compressible data (all same byte)

@@ -734,9 +734,7 @@ impl DiskCache {
         // builds compile this check out via #[cfg(test)].
         #[cfg(test)]
         {
-            let remaining = self
-                .fail_no_visibility_after
-                .fetch_sub(1, Ordering::SeqCst);
+            let remaining = self.fail_no_visibility_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -762,9 +760,7 @@ impl DiskCache {
     ) -> io::Result<()> {
         #[cfg(test)]
         {
-            let remaining = self
-                .fail_rollback_after
-                .fetch_sub(1, Ordering::SeqCst);
+            let remaining = self.fail_rollback_after.fetch_sub(1, Ordering::SeqCst);
             if remaining <= 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -823,8 +819,8 @@ impl DiskCache {
         let _write_data: Vec<u8>;
         #[cfg(feature = "encryption")]
         let data = if let Some(ref key) = self.encryption_key {
-            write_data = compress::encrypt_ctr(data, page_num, key)?;
-            write_data.as_slice()
+            _write_data = compress::encrypt_ctr(data, page_num, key)?;
+            _write_data.as_slice()
         } else {
             data
         };
@@ -871,9 +867,11 @@ impl DiskCache {
 
         // Encrypt compressed blob
         #[cfg(feature = "encryption")]
-        if let Some(ref key) = self.encryption_key {
-            blob = compress::encrypt_ctr(&blob, page_num, key)?;
-        }
+        let blob = if let Some(ref key) = self.encryption_key {
+            compress::encrypt_ctr(&blob, page_num, key)?
+        } else {
+            blob
+        };
 
         let blob_len = blob.len() as u32;
 
@@ -999,9 +997,11 @@ impl DiskCache {
             )?;
 
             #[cfg(feature = "encryption")]
-            if let Some(ref key) = self.encryption_key {
-                compressed = compress::encrypt_ctr(&compressed, start_page + i, key)?;
-            }
+            let compressed = if let Some(ref key) = self.encryption_key {
+                compress::encrypt_ctr(&compressed, start_page + i, key)?
+            } else {
+                compressed
+            };
 
             let blob_offset = blob.len() as u64;
             let compressed_len = compressed.len() as u32;
@@ -1171,9 +1171,11 @@ impl DiskCache {
             )?;
 
             #[cfg(feature = "encryption")]
-            if let Some(ref key) = self.encryption_key {
-                compressed = compress::encrypt_ctr(&compressed, pnum, key)?;
-            }
+            let compressed = if let Some(ref key) = self.encryption_key {
+                compress::encrypt_ctr(&compressed, pnum, key)?
+            } else {
+                compressed
+            };
 
             let blob_offset = blob.len() as u64;
             let compressed_len = compressed.len() as u32;
@@ -1369,25 +1371,27 @@ impl DiskCache {
     }
 
     /// Wait for a group to leave Fetching state (condvar, no spin).
-    /// Wait until the group is no longer in a "pending" state.
-    /// Returns when state is Present, or Fetching (worker claimed it),
-    /// or None after having been Fetching (worker failed).
-    /// Caller must re-check state and loop as needed.
-    pub(crate) fn wait_for_group(&self, gid: u64) {
+    /// Returns the observed state after waiting. The wait is bounded so
+    /// a lost Fetching claim cannot park a SQLite read forever.
+    pub(crate) fn wait_for_group(&self, gid: u64) -> GroupState {
         let mut guard = self.group_condvar_mutex.lock();
+        let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let state = self.group_state(gid);
             if state == GroupState::Present {
-                return;
+                return state;
             }
             if state == GroupState::Fetching {
-                self.group_condvar.wait(&mut guard);
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return state;
+                };
+                self.group_condvar.wait_for(&mut guard, remaining);
                 continue;
             }
             // state == None. Worker may not have picked up job yet.
             self.group_condvar
                 .wait_for(&mut guard, Duration::from_millis(5));
-            return;
+            return self.group_state(gid);
         }
     }
 

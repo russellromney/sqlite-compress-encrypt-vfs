@@ -239,8 +239,7 @@ impl TurboliteHandle {
                                 // only contains the actual cache writes —
                                 // I/O remains parallel with concurrent
                                 // readers.
-                                let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> =
-                                    Vec::new();
+                                let mut override_writes: Vec<(Vec<u64>, Vec<u8>, u32)> = Vec::new();
                                 let gp0 = manifest.group_page_nums(0).into_owned();
                                 if let Some(overrides) = manifest.subframe_overrides.get(0) {
                                     if !overrides.is_empty() && manifest.sub_pages_per_frame > 0 {
@@ -274,9 +273,7 @@ impl TurboliteHandle {
                                                         if data_len <= decompressed.len() {
                                                             override_writes.push((
                                                                 frame_page_nums,
-                                                                decompressed
-                                                                    [..data_len]
-                                                                    .to_vec(),
+                                                                decompressed[..data_len].to_vec(),
                                                                 frame_start as u32,
                                                             ));
                                                         }
@@ -287,11 +284,7 @@ impl TurboliteHandle {
                                     }
                                 }
 
-                                let ft = manifest
-                                    .frame_tables
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_default();
+                                let ft = manifest.frame_tables.first().cloned().unwrap_or_default();
                                 let page_size = manifest.page_size;
                                 let page_count_local = manifest.page_count;
                                 #[cfg(feature = "zstd")]
@@ -311,7 +304,11 @@ impl TurboliteHandle {
                                             0,
                                             page_size,
                                             page_count_local,
-                                            if ft.is_empty() { None } else { Some(ft.as_slice()) },
+                                            if ft.is_empty() {
+                                                None
+                                            } else {
+                                                Some(ft.as_slice())
+                                            },
                                             #[cfg(feature = "zstd")]
                                             dict_for_install,
                                             encryption_key.as_ref(),
@@ -331,7 +328,7 @@ impl TurboliteHandle {
                             } else {
                                 // Fetch failed or returned None. Release
                                 // the claim so a future open can retry.
-                                cache.unclaim_group(0);
+                                cache.unclaim_if_fetching(0);
                             }
                         }
                     }
@@ -830,7 +827,7 @@ impl TurboliteHandle {
                     }
                 }
             }
-            cache.unclaim_group(gid);
+            cache.unclaim_if_fetching(gid);
             false
         };
 
@@ -1150,13 +1147,13 @@ impl DatabaseHandle for TurboliteHandle {
                                                 ovrs,
                                                 manifest_snap.version,
                                             ) {
-                                                cache_ref.unclaim_group(plan_gid);
+                                                cache_ref.unclaim_if_fetching(plan_gid);
                                             }
                                         } else {
-                                            cache_ref.unclaim_group(plan_gid);
+                                            cache_ref.unclaim_if_fetching(plan_gid);
                                         }
                                     } else {
-                                        cache_ref.unclaim_group(plan_gid);
+                                        cache_ref.unclaim_if_fetching(plan_gid);
                                     }
                                 }
                             }
@@ -1396,13 +1393,13 @@ impl DatabaseHandle for TurboliteHandle {
                                         ovrs,
                                         manifest.version,
                                     ) {
-                                        cache.unclaim_group(gid);
+                                        cache.unclaim_if_fetching(gid);
                                     }
                                 } else {
-                                    cache.unclaim_group(gid);
+                                    cache.unclaim_if_fetching(gid);
                                 }
                             } else {
-                                cache.unclaim_group(gid);
+                                cache.unclaim_if_fetching(gid);
                             }
                         }
                     }
@@ -1539,7 +1536,9 @@ impl DatabaseHandle for TurboliteHandle {
             let state = cache.group_state(gid);
             if state == GroupState::Fetching {
                 let wait_start = Instant::now();
-                cache.wait_for_group(gid);
+                if cache.wait_for_group(gid) == GroupState::Fetching {
+                    cache.unclaim_if_fetching(gid);
+                }
                 if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                     turbolite_debug!(
                         "  [inline] page={} gid={} WAITED for prefetch worker {}ms",
@@ -1548,8 +1547,12 @@ impl DatabaseHandle for TurboliteHandle {
                         wait_start.elapsed().as_millis(),
                     );
                 }
-            } else if state != GroupState::Present {
+            }
+
+            let state = cache.group_state(gid);
+            if state != GroupState::Present {
                 if cache.try_claim_group(gid) {
+                    let mut installed_group = false;
                     self.increment_misses(current_tree_name.as_ref());
                     self.trigger_prefetch(
                         page_num,
@@ -1589,7 +1592,13 @@ impl DatabaseHandle for TurboliteHandle {
                                             self.encryption_key.as_ref(),
                                         )
                                     };
-                                    let (_pg_count, _pg_size, page_data) = decode_result?;
+                                    let (_pg_count, _pg_size, page_data) = match decode_result {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            cache.unclaim_if_fetching(gid);
+                                            return Err(e);
+                                        }
+                                    };
                                     let decode_ms = decode_start.elapsed().as_millis();
                                     let ps = manifest.page_size as usize;
                                     let actual_pages = gp.len();
@@ -1597,12 +1606,26 @@ impl DatabaseHandle for TurboliteHandle {
                                     if actual_pages > 0 {
                                         let data_len = actual_pages * ps;
                                         if data_len <= page_data.len() {
-                                            cache.write_pages_scattered(
+                                            if let Err(e) = cache.write_pages_scattered(
                                                 &gp,
                                                 &page_data[..data_len],
                                                 gid,
                                                 0,
-                                            )?;
+                                            ) {
+                                                cache.unclaim_if_fetching(gid);
+                                                return Err(e);
+                                            }
+                                        } else {
+                                            cache.unclaim_if_fetching(gid);
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                format!(
+                                                    "decoded page group gid={} too short: need {} bytes, got {}",
+                                                    gid,
+                                                    data_len,
+                                                    page_data.len()
+                                                ),
+                                            ));
                                         }
                                     }
                                     let write_ms = write_start.elapsed().as_millis();
@@ -1617,6 +1640,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         }
                                     }
                                     cache.mark_group_present(gid);
+                                    installed_group = true;
                                     cache.touch_group(gid);
                                     if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG)
                                     {
@@ -1629,18 +1653,10 @@ impl DatabaseHandle for TurboliteHandle {
                                     }
                                 }
                                 Ok(None) => {
-                                    let states = cache.group_states.lock();
-                                    if let Some(s) = states.get(gid as usize) {
-                                        s.store(GroupState::None as u8, Ordering::Release);
-                                    }
-                                    cache.group_condvar.notify_all();
+                                    cache.unclaim_if_fetching(gid);
                                 }
                                 Err(e) => {
-                                    let states = cache.group_states.lock();
-                                    if let Some(s) = states.get(gid as usize) {
-                                        s.store(GroupState::None as u8, Ordering::Release);
-                                    }
-                                    cache.group_condvar.notify_all();
+                                    cache.unclaim_if_fetching(gid);
                                     return Err(io::Error::new(
                                         io::ErrorKind::Other,
                                         format!("S3 GET failed for gid={}: {}", gid, e),
@@ -1648,6 +1664,9 @@ impl DatabaseHandle for TurboliteHandle {
                                 }
                             }
                         }
+                    }
+                    if !installed_group {
+                        cache.unclaim_if_fetching(gid);
                     }
                 } else {
                     let wait_start = Instant::now();

@@ -1,7 +1,15 @@
 use super::*;
+use arc_swap::ArcSwap;
+use hadb_storage_mem::MemStorage;
+use sqlite_vfs::DatabaseHandle;
+use std::collections::HashSet;
+#[cfg(feature = "encryption")]
 use std::fs::OpenOptions as FsOpenOptions;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
+#[cfg(feature = "encryption")]
 fn test_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     for (i, b) in key.iter_mut().enumerate() {
@@ -10,8 +18,91 @@ fn test_key() -> [u8; 32] {
     key
 }
 
+#[cfg(feature = "encryption")]
 fn wrong_key() -> [u8; 32] {
     [0xFFu8; 32]
+}
+
+fn handle_with_manifest(
+    dir: &TempDir,
+    page_group_keys: Vec<String>,
+) -> (TurboliteHandle, Arc<DiskCache>) {
+    let page_size = 64;
+    let pages_per_group = 4;
+    let page_count = 4;
+    let cache = Arc::new(
+        DiskCache::new(
+            dir.path(),
+            3600,
+            pages_per_group,
+            2,
+            page_size,
+            page_count,
+            None,
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let manifest = Manifest {
+        page_count,
+        page_size,
+        pages_per_group,
+        page_group_keys,
+        ..Manifest::empty()
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let handle = TurboliteHandle::new_tiered(
+        Some(Arc::new(MemStorage::new())),
+        Some(rt.handle().clone()),
+        Arc::clone(&cache),
+        Arc::new(ArcSwap::from_pointee(manifest)),
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        dir.path().join("db.lock"),
+        pages_per_group,
+        0,
+        true,
+        vec![0.3, 0.3, 0.4],
+        vec![0.0, 0.0, 0.0],
+        None,
+        false,
+        #[cfg(feature = "zstd")]
+        None,
+        None,
+        false,
+        None,
+        false,
+        false,
+        Arc::new(parking_lot::RwLock::new(())),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .unwrap();
+    (handle, cache)
+}
+
+#[test]
+fn tiered_read_releases_claim_when_page_group_key_missing() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, Vec::new());
+
+    let mut buf = vec![0u8; 64];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+
+    assert_eq!(cache.group_state(0), GroupState::None);
+    assert_eq!(buf, vec![0u8; 64]);
+}
+
+#[test]
+fn tiered_read_releases_claim_when_page_group_key_empty() {
+    let dir = TempDir::new().unwrap();
+    let (mut handle, cache) = handle_with_manifest(&dir, vec![String::new()]);
+
+    let mut buf = vec![0u8; 64];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+
+    assert_eq!(cache.group_state(0), GroupState::None);
+    assert_eq!(buf, vec![0u8; 64]);
 }
 
 #[test]

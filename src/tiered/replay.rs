@@ -504,9 +504,7 @@ impl ReplayHandle {
         } else {
             Some(self.ctx.replay_gate.write())
         };
-        self.ctx
-            .replay_epoch
-            .fetch_add(1, Ordering::AcqRel);
+        self.ctx.replay_epoch.fetch_add(1, Ordering::AcqRel);
 
         // Test-only barrier #1: parked here, after the write gate is
         // held and the epoch is bumped, but before any page is
@@ -517,11 +515,9 @@ impl ReplayHandle {
             pause.wait();
         }
 
-        let _flush_guard = self
-            .ctx
-            .flush_lock
-            .lock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("flush_lock poisoned: {e}")))?;
+        let _flush_guard = self.ctx.flush_lock.lock().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("flush_lock poisoned: {e}"))
+        })?;
 
         // 4. Write pages to data.cache via the no-visibility helper,
         //    capturing the pre-image of any **already-present** page
@@ -617,7 +613,10 @@ impl ReplayHandle {
             .pending_flushes
             .lock()
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("pending_flushes poisoned: {e}"))
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("pending_flushes poisoned: {e}"),
+                )
             })?
             .push(PendingFlush {
                 staging_path: staging_log_path,
@@ -783,8 +782,11 @@ mod tests {
         if initial_pages > 1 {
             let payload: Vec<u8> = (0..1024).map(|i| i as u8).collect();
             for i in 0..(initial_pages as i64 * 4) {
-                conn.execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![i, &payload])
-                    .unwrap();
+                conn.execute(
+                    "INSERT INTO t VALUES (?1, ?2)",
+                    rusqlite::params![i, &payload],
+                )
+                .unwrap();
             }
         }
         drop(conn);
@@ -1166,7 +1168,10 @@ mod tests {
         std::fs::write(&staging_dir_path, b"not a directory").unwrap();
 
         let result = handle.finalize();
-        assert!(result.is_err(), "finalize must fail when staging dir is not a directory");
+        assert!(
+            result.is_err(),
+            "finalize must fail when staging dir is not a directory"
+        );
 
         // Restore the staging dir for cleanup.
         std::fs::remove_file(&staging_dir_path).ok();
@@ -1174,8 +1179,14 @@ mod tests {
         // Live state must be unchanged — no committed mutation got past
         // the pre-flight failure.
         let post_manifest = vfs.manifest();
-        assert_eq!(post_manifest.page_count, pre_page_count, "manifest page_count must not advance on pre-flight failure");
-        assert_eq!(post_manifest.db_header, pre_db_header, "db_header must not change on pre-flight failure");
+        assert_eq!(
+            post_manifest.page_count, pre_page_count,
+            "manifest page_count must not advance on pre-flight failure"
+        );
+        assert_eq!(
+            post_manifest.db_header, pre_db_header,
+            "db_header must not change on pre-flight failure"
+        );
         assert_eq!(
             vfs_page_count_atomic(&vfs),
             pre_pc_atomic,
@@ -1373,9 +1384,7 @@ mod tests {
         // then fail on the 2nd. Rollback writes go through a
         // separate fault domain (fail_rollback_after, default
         // i64::MAX) so rollback succeeds in this test.
-        cache
-            .fail_no_visibility_after
-            .store(1, Ordering::SeqCst);
+        cache.fail_no_visibility_after.store(1, Ordering::SeqCst);
 
         let mut handle = vfs.begin_replay().unwrap();
         handle.apply_page(target_sqlite_id, &new_page_1).unwrap();
@@ -1470,9 +1479,7 @@ mod tests {
         // Forward injection: 1 success, then fail on the 2nd. This
         // is the same setup as the rollback-success test; what
         // changes is we ALSO arm the rollback fault domain.
-        cache
-            .fail_no_visibility_after
-            .store(1, Ordering::SeqCst);
+        cache.fail_no_visibility_after.store(1, Ordering::SeqCst);
         // Rollback injection: fail on the very first rollback write.
         // pre_images contains exactly one entry (page 0) so the
         // single rollback write attempt will fail.
@@ -1591,7 +1598,9 @@ mod tests {
 
             let mut handle = vfs.begin_replay().unwrap();
             handle.apply_page(1, &new_page0).unwrap(); // overwrite page 0
-            handle.apply_page(target_growth_sqlite_id, &new_grown).unwrap(); // grow
+            handle
+                .apply_page(target_growth_sqlite_id, &new_grown)
+                .unwrap(); // grow
             handle.commit_changeset(1).unwrap();
             let result = handle.finalize();
             assert!(result.is_err());
@@ -1605,7 +1614,11 @@ mod tests {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("log"))
                 .collect();
-            assert_eq!(pre_restart_logs.len(), 1, "staging log must remain pre-restart");
+            assert_eq!(
+                pre_restart_logs.len(),
+                1,
+                "staging log must remain pre-restart"
+            );
 
             (page_size, target_growth_sqlite_id)
         }; // <- old VFS dropped here
@@ -2113,8 +2126,8 @@ mod tests {
     /// purposes) does not trip the test.
     #[test]
     fn prefetch_worker_only_uses_unclaim_if_fetching_on_stale_paths() {
-        let src_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/tiered/prefetch.rs");
+        let src_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tiered/prefetch.rs");
         let src = std::fs::read_to_string(&src_path)
             .expect("read prefetch.rs source for static assertion");
         let stripped: String = src
@@ -2285,8 +2298,7 @@ mod tests {
         let bytes = vfs
             .publish_replayed_base(42, "test-prefix/")
             .expect("publish_replayed_base on empty pending state");
-        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes)
-            .expect("decode round-trip");
+        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode round-trip");
         let (seq, prefix) = walrust.expect("walrust delta extension must be present");
         assert_eq!(seq, 42);
         assert_eq!(prefix, "test-prefix/");
@@ -2337,4 +2349,3 @@ mod tests {
         );
     }
 }
-

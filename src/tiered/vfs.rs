@@ -299,8 +299,7 @@ impl TurboliteVfs {
             Arc::new(Mutex::new(recovered_staging))
         };
         let flush_lock = Arc::new(Mutex::new(()));
-        let replay_gate: Arc<parking_lot::RwLock<()>> =
-            Arc::new(parking_lot::RwLock::new(()));
+        let replay_gate: Arc<parking_lot::RwLock<()>> = Arc::new(parking_lot::RwLock::new(()));
         let replay_epoch = Arc::new(AtomicU64::new(0));
 
         // Prefetch pool: backend-agnostic, runs for every non-local setup
