@@ -63,10 +63,10 @@ rand = { version = "0.8", optional = true }
 rayon = "1.10"
 
 # Storage abstraction (trait only, concrete backends are picked by consumers).
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
 # LocalStorage is the zero-dep backend used by TurboliteVfs::new. Conceptually a
 # sibling of any other backend; it lives in hadb so other crates can share it.
-hadb-storage-local = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-local" }
+hadb-storage-local = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-local", branch = "hoist-prereq-internal-lease-store" }
 async-trait = { version = "0.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
@@ -74,7 +74,7 @@ libc = "0.2"
 
 # Concrete storage backend for binaries that talk to S3 (CLI, benchmarks).
 # Library code never references this crate.
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-s3", optional = true }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store", optional = true }
 
 # CLI dependencies
 clap = { version = "4", features = ["derive", "env"] }
@@ -92,7 +92,7 @@ lambda_runtime = { version = "0.13", optional = true }
 
 # WAL replication via walrust's core crate (optional). Use the git source until
 # the crate.io release exposes the sink/snapshot APIs Turbolite needs.
-walrust-core = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", optional = true, package = "walrust" }
+walrust-core = { git = "https://github.com/russellromney/walrust.git", version = "0.3.1", optional = true, package = "walrust", branch = "hoist-public-deps" }
 
 rmp-serde = "1.3.1"
 
@@ -106,7 +106,7 @@ arbitrary = { version = "1.3", features = ["derive"] }
 rusqlite = { version = "0.35", features = ["bundled"] }
 # In-memory StorageBackend for tests; avoids the need for a real S3 or even a
 # filesystem round-trip.
-hadb-storage-mem = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-mem" }
+hadb-storage-mem = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-mem", branch = "hoist-prereq-internal-lease-store" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 # Binary targets are all gated on cli-s3 during Phase Turbogenesis c3. They
