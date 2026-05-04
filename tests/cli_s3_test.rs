@@ -18,16 +18,38 @@ use std::process::Command;
 use std::sync::Once;
 
 fn turbolite_bin() -> PathBuf {
-    let mut path = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            path.push("target");
-            path
-        });
-    path.push("debug");
-    path.push("turbolite");
-    path
+    let bin_name = if cfg!(windows) {
+        "turbolite.exe"
+    } else {
+        "turbolite"
+    };
+
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_turbolite").map(PathBuf::from) {
+        if path.exists() {
+            return path;
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        candidates.push(target_dir.join("debug").join(bin_name));
+    }
+    if let Ok(test_exe) = std::env::current_exe() {
+        if let Some(debug_dir) = test_exe.parent().and_then(|deps| deps.parent()) {
+            candidates.push(debug_dir.join(bin_name));
+        }
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join(bin_name),
+    );
+
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| panic!("could not locate built turbolite binary"))
 }
 
 fn build_bin() {
@@ -51,6 +73,43 @@ fn endpoint_url() -> Option<String> {
     std::env::var("AWS_ENDPOINT_URL")
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+fn delete_first_live_page_group(bucket: &str, prefix: &str, endpoint: &Option<String>) -> String {
+    tokio::runtime::Runtime::new()
+        .expect("create runtime for S3 test helper")
+        .block_on(async {
+            use hadb_storage::StorageBackend;
+
+            let storage =
+                hadb_storage_s3::S3Storage::from_env(bucket.to_string(), endpoint.as_deref())
+                    .await
+                    .expect("create S3 storage")
+                    .with_prefix(prefix.to_string());
+            let manifest_bytes = storage
+                .get("manifest.msgpack")
+                .await
+                .expect("get manifest")
+                .expect("manifest must exist after import");
+            let manifest: turbolite::tiered::Manifest =
+                rmp_serde::from_slice(&manifest_bytes).expect("decode manifest");
+            let key = manifest
+                .page_group_keys
+                .iter()
+                .find(|key| !key.is_empty())
+                .expect("imported manifest should reference at least one page group")
+                .clone();
+
+            storage.delete(&key).await.expect("delete page group");
+            assert!(
+                !storage
+                    .exists(&key)
+                    .await
+                    .expect("check deleted page group"),
+                "deleted page-group object should no longer exist"
+            );
+            key
+        })
 }
 
 fn unique_prefix() -> String {
@@ -758,6 +817,70 @@ fn test_validate_clean_database() {
         "should run integrity check"
     );
     assert!(stdout.contains("ok"), "integrity check should be ok");
+}
+
+// ── missing object is a hard failure ────────────────────────────────
+
+#[test]
+fn test_validate_fails_when_page_group_object_is_missing() {
+    build_bin();
+
+    let tmpdir = tempfile::tempdir().expect("tmpdir");
+    let plain_db = create_plain_db(tmpdir.path(), "missing-object-source.db");
+    let bucket = test_bucket();
+    let endpoint = endpoint_url();
+    let prefix = unique_prefix();
+
+    let output = run_cli(&s3_args(
+        &[
+            "import",
+            "--input",
+            plain_db.to_str().expect("path"),
+            "--bucket",
+            &bucket,
+            "--prefix",
+            &prefix,
+        ],
+        &endpoint,
+    ));
+    assert!(
+        output.status.success(),
+        "import failed for missing-object test"
+    );
+
+    let missing_key = delete_first_live_page_group(&bucket, &prefix, &endpoint);
+
+    let cache_dir = tmpdir.path().join("missing-object-cache");
+    let db_path = tmpdir.path().join("missing-object.db");
+    let output = run_cli(&s3_args(
+        &[
+            "validate",
+            "--db",
+            db_path.to_str().expect("path"),
+            "--bucket",
+            &bucket,
+            "--prefix",
+            &prefix,
+            "--cache-dir",
+            cache_dir.to_str().expect("path"),
+        ],
+        &endpoint,
+    ));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "validate must fail when a live page-group object is missing.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains(&missing_key) || stderr.contains(&missing_key) || stdout.contains("MISSING"),
+        "failure should name the missing object or mark it missing. missing_key={missing_key}\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
 }
 
 // ── download from S3 ───────────────────────────────────────────────

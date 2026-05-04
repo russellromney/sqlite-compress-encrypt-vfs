@@ -13,7 +13,7 @@
 //! ```bash
 //! TIERED_TEST_BUCKET=turbolite-test \
 //!   AWS_ENDPOINT_URL=https://t3.storage.dev \
-//!   cargo run --release --features tiered,zstd --bin tiered-bench
+//!   cargo run --release --features bench-s3,zstd --bin tiered-bench
 //! ```
 
 use clap::Parser;
@@ -1122,8 +1122,7 @@ fn bench_data(
 
 /// Cache level: index — interior + index pages cached, data pages from S3.
 fn bench_index(
-    vfs_name: &str,
-    db_name: &str,
+    conn: &Connection,
     handle: &BenchCtx,
     label: &str,
     sql: &str,
@@ -1137,16 +1136,9 @@ fn bench_index(
         handle.clear_cache_data_only();
         handle.reset_s3_counters();
         let params = param_fn(i);
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("index-level connection");
-        if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        if let Err(e) = run_query_pair(conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [index] {} warmup {} error: {}", label, i, e);
         }
-        drop(conn);
     }
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -1159,13 +1151,7 @@ fn bench_index(
 
         let params = param_fn(warmup + i);
         let start = Instant::now();
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("index-level connection");
-        match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        match run_query_pair(conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -1174,7 +1160,6 @@ fn bench_index(
             }
             Err(e) => eprintln!("    [index] {} iter {} error: {}", label, i, e),
         }
-        drop(conn);
     }
 
     BenchResult {
@@ -1188,8 +1173,7 @@ fn bench_index(
 /// Cache level: interior — interior B-tree pages cached, index + data from S3.
 /// This is the realistic "first query after connection open" state.
 fn bench_interior(
-    vfs_name: &str,
-    db_name: &str,
+    conn: &Connection,
     handle: &BenchCtx,
     label: &str,
     sql: &str,
@@ -1203,16 +1187,9 @@ fn bench_interior(
         handle.clear_cache_interior_only();
         handle.reset_s3_counters();
         let params = param_fn(i);
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("interior-level connection");
-        if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        if let Err(e) = run_query_pair(conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [interior] {} warmup {} error: {}", label, i, e);
         }
-        drop(conn);
     }
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -1225,13 +1202,7 @@ fn bench_interior(
 
         let params = param_fn(warmup + i);
         let start = Instant::now();
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("interior-level connection");
-        match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        match run_query_pair(conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -1240,7 +1211,6 @@ fn bench_interior(
             }
             Err(e) => eprintln!("    [interior] {} iter {} error: {}", label, i, e),
         }
-        drop(conn);
     }
 
     BenchResult {
@@ -1254,8 +1224,7 @@ fn bench_interior(
 /// Cache level: none — everything evicted, including interior pages.
 /// Interior chunks must be re-fetched from S3 on each connection open.
 fn bench_none(
-    vfs_name: &str,
-    db_name: &str,
+    conn: &Connection,
     handle: &BenchCtx,
     label: &str,
     sql: &str,
@@ -1269,16 +1238,9 @@ fn bench_none(
         handle.clear_cache_all();
         handle.reset_s3_counters();
         let params = param_fn(i);
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("none-level connection");
-        if let Err(e) = run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        if let Err(e) = run_query_pair(conn, sql, &params, plan_aware, schedule) {
             eprintln!("    [none] {} warmup {} error: {}", label, i, e);
         }
-        drop(conn);
     }
 
     let mut latencies = Vec::with_capacity(iterations);
@@ -1291,13 +1253,7 @@ fn bench_none(
 
         let params = param_fn(warmup + i);
         let start = Instant::now();
-        let conn = Connection::open_with_flags_and_vfs(
-            db_name,
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-            vfs_name,
-        )
-        .expect("none-level connection");
-        match run_query_pair(&conn, sql, &params, plan_aware, schedule) {
+        match run_query_pair(conn, sql, &params, plan_aware, schedule) {
             Ok(_) => {
                 latencies.push(start.elapsed().as_micros() as f64);
                 let (fc, fb) = handle.s3_counters();
@@ -1306,7 +1262,6 @@ fn bench_none(
             }
             Err(e) => eprintln!("    [none] {} iter {} error: {}", label, i, e),
         }
-        drop(conn);
     }
 
     BenchResult {
@@ -1449,15 +1404,19 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
     // 3. Default: reuse existing S3 data at social_{n_posts}
     let s3_prefix = format!("social_{}_btree", n_posts);
 
-    // Each benchmark run owns its own multi-threaded tokio runtime; every
-    // S3Storage built below shares this handle so block_on calls from sync
-    // code work.
-    let bench_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("build bench runtime");
-    let rt_handle = bench_runtime.handle().clone();
+    // sqlite-vfs registration is process-lifetime (no unregister handle), so
+    // the registered VFS and its prefetch workers can outlive this function.
+    // Keep the runtime process-lifetime too; otherwise teardown can leave
+    // workers holding a handle to a shutting-down Tokio runtime.
+    let rt_handle = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("build bench runtime"),
+    ))
+    .handle()
+    .clone();
 
     if cli.import.is_some() {
         // Fast path: generate plain SQLite DB locally, then import to S3.
@@ -1809,16 +1768,13 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         }
     }
 
-    drop(warm_conn); // close warm connection before S3-fetching benchmarks
-
     if should_run_mode("index") {
         println!();
         println!("=== CACHE LEVEL: INDEX (interior + index cached, data from S3) ===");
         print_header();
         for q in &queries {
             print_result(&bench_index(
-                &reader_vfs_name,
-                &db_name,
+                &warm_conn,
                 &ctx,
                 q.label,
                 q.sql,
@@ -1837,8 +1793,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         print_header();
         for q in &queries {
             print_result(&bench_interior(
-                &reader_vfs_name,
-                &db_name,
+                &warm_conn,
                 &ctx,
                 q.label,
                 q.sql,
@@ -1857,8 +1812,7 @@ fn run_benchmark(n_posts: usize, cli: &Cli) {
         print_header();
         for q in &queries {
             print_result(&bench_none(
-                &reader_vfs_name,
-                &db_name,
+                &warm_conn,
                 &ctx,
                 q.label,
                 q.sql,
