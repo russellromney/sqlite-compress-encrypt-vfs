@@ -11,7 +11,7 @@ use crate::tiered::storage as storage_helpers;
 /// storage backend.
 ///
 /// turbolite is byte-agnostic below the VFS; the actual storage (filesystem,
-/// S3, Cinch HTTP, etc.) is an `Arc<dyn hadb_storage::StorageBackend>`. Use
+/// S3, fenced HTTP, etc.) is an `Arc<dyn hadb_storage::StorageBackend>`. Use
 /// [`TurboliteVfs::new`] for the default local-filesystem backend rooted
 /// under `config.cache_dir`, or [`TurboliteVfs::with_backend`] to
 /// inject any other backend + the tokio runtime handle the VFS should

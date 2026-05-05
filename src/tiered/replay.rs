@@ -151,9 +151,9 @@ fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> Roll
 ///   page numbers `[old_page_count..new_page_count)` to the last
 ///   existing group up to `pages_per_group`, then create new groups
 ///   at the end. Rebuild `page_index`. `flush_dirty_groups` extends
-///   `page_group_keys` for new groups (`flush.rs:396-404`). cinch
-///   tenants always reach here because `import_sqlite_file` produces
-///   BTreeAware manifests.
+///   `page_group_keys` for new groups (`flush.rs:396-404`). Imported
+///   databases reach here because `import_sqlite_file` produces BTreeAware
+///   manifests.
 fn extend_for_growth(manifest: &mut Manifest, old_page_count: u64, new_page_count: u64) {
     use crate::tiered::config::GroupingStrategy;
 
