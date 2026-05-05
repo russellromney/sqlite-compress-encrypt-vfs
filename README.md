@@ -8,11 +8,7 @@ This repo is a Cargo workspace with two crates:
 
 It also offers page-level compression (zstd) and encryption (AES-256) for efficiency and security at rest, which can be used separately from S3.
 
-> **Experimental / active development.** turbolite is useful for exploration and
-> internal integration work, but it is not yet a stable public storage
-> substrate. APIs, page/manifest formats, checkpoint behavior, and language
-> package surfaces may change without notice. Treat the README as a current
-> working model, not a compatibility promise.
+> **Experimental.** turbolite is under active development and contains bugs. Be careful.
 
 Object storage is getting fast. [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) delivers single-digit millisecond GETs and [Tigris is also extremely fast](https://www.tigrisdata.com/blog/benchmark-small-objects/). The gap between local disk and cloud storage is shrinking, and turbolite exploits that.
 
