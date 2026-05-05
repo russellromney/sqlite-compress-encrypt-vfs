@@ -1,8 +1,9 @@
 //! Shared helpers for tiered integration tests.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
-use turbolite::tiered::{Manifest, TurboliteConfig};
+use std::sync::{Arc, OnceLock};
+use std::{io, path::Path};
+use turbolite::tiered::{Manifest, SyncMode, TurboliteConfig};
 
 /// Shared tokio runtime for all integration tests.
 /// Prevents 100+ runtime creation when tests run in parallel.
@@ -137,9 +138,14 @@ impl TestMode {
             StorageTier::Local => {
                 // Local mode: no S3 fields needed, test_config already sets them
                 // but we override to local-only by clearing bucket
+                config.sync_mode = SyncMode::S3Primary;
             }
-            StorageTier::S3Durable => {}
-            StorageTier::S3LocalThenFlush => {}
+            StorageTier::S3Durable => {
+                config.sync_mode = SyncMode::S3Primary;
+            }
+            StorageTier::S3LocalThenFlush => {
+                config.sync_mode = SyncMode::LocalThenFlush;
+            }
         }
     }
 
@@ -237,6 +243,53 @@ pub fn cold_reader_config(
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     }
+}
+
+/// Build the hadb backend that replaces the old built-in S3 config path.
+pub fn backend_for_config(
+    config: &TurboliteConfig,
+) -> (
+    Arc<dyn hadb_storage::StorageBackend>,
+    tokio::runtime::Handle,
+) {
+    let runtime = config
+        .runtime_handle
+        .clone()
+        .unwrap_or_else(shared_runtime_handle);
+    let bucket = config.bucket.clone();
+    let endpoint = config.endpoint_url.clone();
+    let prefix = config.prefix.clone();
+    let storage = runtime
+        .block_on(async { hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await })
+        .expect("create S3 storage")
+        .with_prefix(prefix);
+    (Arc::new(storage), runtime)
+}
+
+pub fn import_sqlite_file_compat(
+    config: &TurboliteConfig,
+    file_path: &Path,
+) -> io::Result<Manifest> {
+    let mut config = config.clone();
+    config.apply_legacy_flat_fields();
+    let (backend, runtime) = backend_for_config(&config);
+    turbolite::tiered::import_sqlite_file(&config, backend, runtime, file_path)
+}
+
+pub fn get_manifest_compat(config: &TurboliteConfig) -> io::Result<Option<Manifest>> {
+    let (backend, runtime) = backend_for_config(config);
+    turbolite::tiered::get_manifest(backend.as_ref(), &runtime)
+}
+
+#[cfg(feature = "encryption")]
+pub fn rotate_encryption_key_compat(
+    config: &TurboliteConfig,
+    new_key: Option<[u8; 32]>,
+) -> io::Result<()> {
+    let mut config = config.clone();
+    config.apply_legacy_flat_fields();
+    let (backend, runtime) = backend_for_config(&config);
+    turbolite::tiered::rotate_encryption_key(&config, backend, runtime, new_key)
 }
 
 /// Directly read the S3 manifest and verify it has the expected properties.

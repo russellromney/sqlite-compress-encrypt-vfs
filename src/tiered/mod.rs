@@ -92,7 +92,8 @@ pub use bench::TurboliteSharedState;
 #[cfg(feature = "wal")]
 pub use config::WalConfig;
 pub use config::{
-    BTreeManifestEntry, GroupState, GroupingStrategy, ManifestSource, PageLocation, TurboliteConfig,
+    BTreeManifestEntry, GroupState, GroupingStrategy, ManifestSource, PageLocation, SyncMode,
+    TurboliteConfig,
 };
 pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
 pub use handle::TurboliteHandle;

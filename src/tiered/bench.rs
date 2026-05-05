@@ -254,6 +254,25 @@ impl TurboliteSharedState {
         )
     }
 
+    /// Legacy alias for the old S3-owned API.
+    pub fn flush_to_s3(&self) -> io::Result<()> {
+        self.flush_to_storage()
+    }
+
+    /// Legacy no-op; concrete backend counters are no longer owned here.
+    pub fn reset_s3_counters(&self) {}
+
+    /// Legacy counter shim. The backend abstraction does not expose concrete
+    /// object-store counters through this shared state.
+    pub fn s3_counters(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Legacy counter shim. See [`Self::s3_counters`].
+    pub fn s3_put_counters(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Returns true if there are dirty groups or staging logs pending upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
@@ -344,9 +363,7 @@ impl TurboliteSharedState {
         self.evict_tree(&csv)
     }
 
-    /// Return cache info as a JSON string. Backend counters are not
-    /// tracked at the VFS layer anymore; embedders that want those can
-    /// keep a reference to their concrete backend impl.
+    /// Return cache info as a JSON string.
     pub fn cache_info(&self) -> String {
         let manifest = self.shared_manifest.load();
         let page_size = manifest.page_size as u64;

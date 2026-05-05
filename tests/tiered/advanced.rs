@@ -524,8 +524,7 @@ fn test_evict_tree_by_name() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let manifest =
-        turbolite::tiered::import_sqlite_file(&config, &local_db).expect("import failed");
+    let manifest = import_sqlite_file_compat(&config, &local_db).expect("import failed");
     assert!(
         !manifest.tree_name_to_groups.is_empty(),
         "import must populate tree_name_to_groups"
@@ -665,12 +664,6 @@ fn test_cache_info_returns_valid_json() {
         "JSON should contain pinned tier: {}",
         info
     );
-    assert!(
-        info.contains("\"s3_gets_total\":"),
-        "JSON should contain s3_gets_total: {}",
-        info
-    );
-
     // After clearing cache, size should drop
     bench.clear_cache_data_only();
     let info_after = bench.cache_info();
@@ -758,8 +751,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
     let prefix = config.prefix.clone();
     let endpoint = config.endpoint_url.clone();
 
-    let manifest =
-        turbolite::tiered::import_sqlite_file(&config, &local_db).expect("import failed");
+    let manifest = import_sqlite_file_compat(&config, &local_db).expect("import failed");
     let posts_groups = manifest
         .tree_name_to_groups
         .get("posts")

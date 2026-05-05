@@ -39,7 +39,9 @@ fn insert_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 }
 
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
-    test_config(test_name, cache_dir)
+    let mut config = test_config(test_name, cache_dir);
+    config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+    config
 }
 
 fn cold_reader(

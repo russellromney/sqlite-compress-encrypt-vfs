@@ -101,7 +101,9 @@ fn update_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 
 /// Helper: create LocalThenFlush config.
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
-    test_config(test_name, cache_dir)
+    let mut config = test_config(test_name, cache_dir);
+    config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+    config
 }
 
 /// Helper: create a new TurboliteConfig with same bucket/prefix/endpoint but fresh cache_dir.
@@ -118,6 +120,7 @@ fn config_with_same_s3(
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
+        sync_mode: turbolite::tiered::SyncMode::LocalThenFlush,
         ..Default::default()
     }
 }

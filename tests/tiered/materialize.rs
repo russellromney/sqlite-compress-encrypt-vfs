@@ -22,7 +22,7 @@ fn import_and_open(
             .unwrap();
         drop(conn);
     }
-    let manifest = import_sqlite_file(&config, &local_db).unwrap();
+    let manifest = import_sqlite_file_compat(&config, &local_db).unwrap();
     let vfs_name = unique_vfs_name(prefix);
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
@@ -229,7 +229,7 @@ fn test_materialize_large_page_size() {
         drop(conn);
     }
 
-    import_sqlite_file(&config, &local_db).unwrap();
+    import_sqlite_file_compat(&config, &local_db).unwrap();
     let vfs_name = unique_vfs_name("mat_64k");
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let bench = vfs.shared_state();
@@ -482,7 +482,7 @@ fn test_materialize_matches_source_bytes() {
     }
 
     let source_bytes = std::fs::read(&local_db).unwrap();
-    import_sqlite_file(&config, &local_db).unwrap();
+    import_sqlite_file_compat(&config, &local_db).unwrap();
 
     let vfs_name = unique_vfs_name("mat_bytes");
     let vfs = TurboliteVfs::new_local(config).unwrap();

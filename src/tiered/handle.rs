@@ -188,6 +188,8 @@ impl TurboliteHandle {
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
+        override_threshold: u32,
+        compaction_threshold: u32,
         is_local: bool,
         replay_gate: Arc<parking_lot::RwLock<()>>,
         replay_epoch: Arc<AtomicU64>,
@@ -378,8 +380,8 @@ impl TurboliteHandle {
             dirty_since_sync: false,
             cached_generation: 0,
             gc_enabled,
-            override_threshold: 0,
-            compaction_threshold: 0,
+            override_threshold,
+            compaction_threshold,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict,
@@ -1779,6 +1781,32 @@ impl DatabaseHandle for TurboliteHandle {
                 }
             }
         }
+
+        if LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) && !self.is_local {
+            let page_size_u32 = self.page_size.load(Ordering::Relaxed);
+            if buf.len() != page_size_u32 as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "local-then-flush staging expects full page writes: got {} bytes, page_size={}",
+                        buf.len(),
+                        page_size_u32
+                    ),
+                ));
+            }
+            if self.staging_writer.is_none() {
+                let staging_version = self.staging_seq.fetch_add(1, Ordering::SeqCst);
+                self.staging_writer = Some(staging::StagingWriter::open(
+                    &self.staging_dir,
+                    staging_version,
+                    page_size_u32,
+                )?);
+            }
+            if let Some(writer) = self.staging_writer.as_mut() {
+                writer.append(page_num, buf)?;
+            }
+        }
+
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
 

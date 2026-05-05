@@ -63,9 +63,9 @@ fn test_local_manifest_persisted_on_checkpoint() {
         .unwrap();
 }
 
-/// Second connection open with Auto manifest source should NOT hit S3.
+/// Second connection open with Auto manifest source should reuse local/in-memory manifest state.
 #[test]
-fn test_warm_reconnect_skips_s3() {
+fn test_warm_reconnect_uses_local_manifest_state() {
     let cache_dir = TempDir::new().unwrap();
     let config = test_config("warm_reconnect", cache_dir.path());
     let vfs_name = unique_vfs_name("warm_reconnect");
@@ -74,7 +74,6 @@ fn test_warm_reconnect_skips_s3() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
-    let state = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     // First connection: fetches from S3
@@ -96,9 +95,6 @@ fn test_warm_reconnect_skips_s3() {
             .unwrap();
     }
 
-    // Record S3 GET count
-    let (gets_before, _) = state.s3_counters();
-
     // Second connection: should use in-memory manifest (Auto mode)
     {
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -113,14 +109,6 @@ fn test_warm_reconnect_skips_s3() {
         assert_eq!(count, 1);
     }
 
-    let (gets_after, _) = state.s3_counters();
-    // The second open should have zero S3 GETs for the manifest
-    // (some GETs may happen for page data on read, but manifest fetch is the one we're testing)
-    // We can't assert exact zero because page reads may trigger S3 fetches,
-    // but the manifest fetch is what we saved.
-    eprintln!("S3 GETs: before={}, after={}", gets_before, gets_after);
-
-    drop(state);
     let cleanup_config = TurboliteConfig {
         bucket,
         prefix,

@@ -104,6 +104,9 @@ proptest = "1.5"
 proptest-derive = "0.5"
 arbitrary = { version = "1.3", features = ["derive"] }
 rusqlite = { version = "0.35", features = ["bundled"] }
+aws-config = "1"
+aws-sdk-s3 = "1"
+crc32fast = "1"
 # In-memory StorageBackend for tests; avoids the need for a real S3 or even a
 # filesystem round-trip.
 hadb-storage-mem = { git = "https://github.com/russellromney/hadb.git", version = "0.4", package = "hadb-storage-mem", branch = "hoist-prereq-internal-lease-store" }

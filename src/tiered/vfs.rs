@@ -88,13 +88,20 @@ impl TurboliteVfs {
     /// `config.cache_dir` and spins up a dedicated 2-thread tokio runtime.
     /// Use [`TurboliteVfs::with_backend`] if you want to supply a remote
     /// `StorageBackend` + reuse an existing runtime.
-    pub fn new_local(config: TurboliteConfig) -> io::Result<Self> {
+    pub fn new_local(mut config: TurboliteConfig) -> io::Result<Self> {
         let owned = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build tokio rt: {e}")))?;
         let runtime = owned.handle().clone();
+        config.apply_legacy_flat_fields();
+        if config.has_legacy_backend_config() {
+            super::set_local_checkpoint_only(matches!(
+                config.sync_mode,
+                super::SyncMode::LocalThenFlush
+            ));
+        }
 
         // Ensure the cache dir exists before LocalStorage tries to write
         // under it; LocalStorage creates parents lazily on put but we
@@ -102,19 +109,44 @@ impl TurboliteVfs {
         // through synchronous helpers that assume the directory is there.
         fs::create_dir_all(&config.cache_dir)?;
 
+        #[cfg(feature = "cli-s3")]
+        if !config.bucket.is_empty() {
+            let bucket = config.bucket.clone();
+            let endpoint = config.endpoint_url.clone();
+            let prefix = config.prefix.clone();
+            let storage = owned
+                .block_on(async {
+                    hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await
+                })
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("create S3 backend: {e}"))
+                })?
+                .with_prefix(prefix);
+            let storage: Arc<dyn StorageBackend> = Arc::new(storage);
+            #[cfg(feature = "bundled-sqlite")]
+            crate::install_hook::ensure_registered();
+            return Self::assemble(config, storage, runtime, Some(owned), false);
+        }
+
         let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&config.cache_dir));
         #[cfg(feature = "bundled-sqlite")]
         crate::install_hook::ensure_registered();
         Self::assemble(config, storage, runtime, Some(owned), true)
     }
 
+    /// Legacy constructor retained for the pre-hadb S3 test corpus.
+    pub fn new(config: TurboliteConfig) -> io::Result<Self> {
+        Self::new_local(config)
+    }
+
     /// Caller-supplied backend. Checkpoints upload dirty pages to the backend
     /// synchronously (full remote durability on every checkpoint).
     pub fn with_backend(
-        config: TurboliteConfig,
+        mut config: TurboliteConfig,
         backend: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
+        config.apply_legacy_flat_fields();
         fs::create_dir_all(&config.cache_dir)?;
         #[cfg(feature = "bundled-sqlite")]
         crate::install_hook::ensure_registered();
@@ -385,7 +417,7 @@ impl TurboliteVfs {
                 );
                 Ok((m, Vec::new(), false))
             }
-            ManifestSource::Remote => {
+            ManifestSource::Remote | ManifestSource::S3 => {
                 turbolite_debug!(
                     "[tiered] fetching manifest from backend (manifest_source=Remote)",
                 );
@@ -883,6 +915,11 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// Legacy alias for the old S3-owned API.
+    pub fn destroy_s3(&self) -> io::Result<()> {
+        self.destroy_remote()
+    }
+
     /// Return a clone of the current manifest state.
     pub fn manifest(&self) -> Manifest {
         (**self.shared_manifest.load()).clone()
@@ -1319,6 +1356,8 @@ impl Vfs for TurboliteVfs {
                 self.config.prefetch.query_plan,
                 self.config.cache.max_bytes,
                 self.config.cache.evict_on_checkpoint,
+                self.config.cache.override_threshold,
+                self.config.cache.compaction_threshold,
                 self.is_local,
                 Arc::clone(&self.replay_gate),
                 Arc::clone(&self.replay_epoch),

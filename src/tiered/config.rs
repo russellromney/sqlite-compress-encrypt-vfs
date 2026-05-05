@@ -11,11 +11,33 @@ pub enum ManifestSource {
     /// Always fetch from the remote backend on open. For HA followers and
     /// multi-reader setups where another process may have checkpointed.
     Remote,
+    /// Legacy spelling for remote manifest loading.
+    S3,
 }
 
 impl Default for ManifestSource {
     fn default() -> Self {
         ManifestSource::Auto
+    }
+}
+
+// ===== Legacy sync mode =====
+
+/// Legacy test/API spelling for old S3-owned checkpoint modes.
+///
+/// Turbolite now receives storage as a `hadb_storage::StorageBackend`, so this
+/// enum is only a compatibility shim. `S3Primary` maps to durable backend
+/// checkpoint upload; `LocalThenFlush` maps to the existing
+/// `set_local_checkpoint_only` / `flush_to_storage` path used by tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncMode {
+    S3Primary,
+    LocalThenFlush,
+}
+
+impl Default for SyncMode {
+    fn default() -> Self {
+        SyncMode::S3Primary
     }
 }
 
@@ -284,7 +306,7 @@ impl WalConfig {
 /// [`TurboliteVfs::new`] for local mode (page groups on `cache_dir`) or
 /// [`TurboliteVfs::with_backend`] to inject any
 /// `Arc<dyn hadb_storage::StorageBackend>` plus a tokio runtime handle.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TurboliteConfig {
     /// Local cache/data directory. Always populated; for non-local backends
@@ -305,6 +327,58 @@ pub struct TurboliteConfig {
     /// WAL replication settings (walrust-backed durability between checkpoints).
     #[cfg(feature = "wal")]
     pub wal: WalConfig,
+
+    // ---- Legacy flat config fields ----
+    //
+    // Kept so the pre-hadb S3 integration corpus can be ported onto the new
+    // backend-injection implementation without losing its behavioral coverage.
+    // New code should use the nested config groups plus TurboliteVfs::with_backend.
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(skip)]
+    pub runtime_handle: Option<tokio::runtime::Handle>,
+    #[serde(default)]
+    pub compression_level: i32,
+    #[cfg(feature = "zstd")]
+    #[serde(default)]
+    pub dictionary: Option<Vec<u8>>,
+    #[cfg(feature = "encryption")]
+    #[serde(default)]
+    pub encryption_key: Option<[u8; 32]>,
+    #[serde(default)]
+    pub pages_per_group: u32,
+    #[serde(default)]
+    pub sub_pages_per_frame: u32,
+    #[serde(default)]
+    pub gc_enabled: bool,
+    #[serde(default)]
+    pub max_cache_bytes: Option<u64>,
+    #[serde(default)]
+    pub evict_on_checkpoint: bool,
+    #[serde(default)]
+    pub prediction_enabled: bool,
+    #[serde(default)]
+    pub eager_index_load: bool,
+    #[serde(default)]
+    pub override_threshold: u32,
+    #[serde(default)]
+    pub compaction_threshold: u32,
+    #[serde(default)]
+    pub manifest_source: ManifestSource,
+    #[serde(default)]
+    pub sync_mode: SyncMode,
+    #[cfg(feature = "wal")]
+    #[serde(default)]
+    pub wal_replication: bool,
+    #[cfg(feature = "wal")]
+    #[serde(default)]
+    pub wal_sync_interval_ms: u64,
 }
 
 impl Default for TurboliteConfig {
@@ -318,11 +392,73 @@ impl Default for TurboliteConfig {
             prefetch: PrefetchConfig::default(),
             #[cfg(feature = "wal")]
             wal: WalConfig::default(),
+            bucket: String::new(),
+            prefix: String::new(),
+            endpoint_url: None,
+            region: None,
+            runtime_handle: None,
+            compression_level: CompressionConfig::default().level,
+            #[cfg(feature = "zstd")]
+            dictionary: None,
+            #[cfg(feature = "encryption")]
+            encryption_key: None,
+            pages_per_group: CacheConfig::default().pages_per_group,
+            sub_pages_per_frame: CacheConfig::default().sub_pages_per_frame,
+            gc_enabled: CacheConfig::default().gc_enabled,
+            max_cache_bytes: CacheConfig::default().max_bytes,
+            evict_on_checkpoint: CacheConfig::default().evict_on_checkpoint,
+            prediction_enabled: PrefetchConfig::default().prediction,
+            eager_index_load: true,
+            override_threshold: CacheConfig::default().override_threshold,
+            compaction_threshold: CacheConfig::default().compaction_threshold,
+            manifest_source: ManifestSource::default(),
+            sync_mode: SyncMode::default(),
+            #[cfg(feature = "wal")]
+            wal_replication: WalConfig::default().replication,
+            #[cfg(feature = "wal")]
+            wal_sync_interval_ms: WalConfig::default().sync_interval_ms,
         }
     }
 }
 
 impl TurboliteConfig {
+    pub(crate) fn has_legacy_backend_config(&self) -> bool {
+        !self.bucket.is_empty() || !self.prefix.is_empty() || self.endpoint_url.is_some()
+    }
+
+    pub fn apply_legacy_flat_fields(&mut self) {
+        if !self.has_legacy_backend_config() {
+            return;
+        }
+        self.compression.level = self.compression_level;
+        #[cfg(feature = "zstd")]
+        {
+            self.compression.dictionary = self.dictionary.clone();
+        }
+        #[cfg(feature = "encryption")]
+        {
+            self.encryption.key = self.encryption_key;
+        }
+        self.cache.pages_per_group = self.pages_per_group;
+        self.cache.sub_pages_per_frame = self.sub_pages_per_frame;
+        self.cache.gc_enabled = self.gc_enabled;
+        self.cache.max_bytes = self.max_cache_bytes;
+        self.cache.evict_on_checkpoint = self.evict_on_checkpoint;
+        self.cache.override_threshold = self.override_threshold;
+        self.cache.compaction_threshold = self.compaction_threshold;
+        self.prefetch.prediction = self.prediction_enabled;
+        self.prefetch.query_plan = self.eager_index_load;
+        self.prefetch.manifest_source = match self.manifest_source {
+            ManifestSource::S3 => ManifestSource::Remote,
+            other => other,
+        };
+        #[cfg(feature = "wal")]
+        {
+            self.wal.replication = self.wal_replication;
+            self.wal.sync_interval_ms = self.wal_sync_interval_ms;
+        }
+    }
+
     /// Construct a TurboliteConfig by reading `TURBOLITE_*` environment variables.
     /// Fields not overridden by env vars come from `Default`. `cache_dir` reads
     /// `TURBOLITE_CACHE_DIR` (default `/tmp/turbolite-cache`).
@@ -341,6 +477,7 @@ impl TurboliteConfig {
             prefetch: PrefetchConfig::from_env(),
             #[cfg(feature = "wal")]
             wal: WalConfig::from_env(),
+            ..Default::default()
         }
     }
 }

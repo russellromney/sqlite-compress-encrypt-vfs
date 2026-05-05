@@ -420,7 +420,7 @@ fn test_rotate_key_cold_read_succeeds() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b)).expect("key rotation failed");
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).expect("key rotation failed");
     }
 
     // Cold read with key B (fresh cache)
@@ -545,7 +545,7 @@ fn test_rotate_key_old_key_fails() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // Cold read with OLD key A must fail (at open, pragma, or query level)
@@ -694,7 +694,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // List S3 objects after rotation
@@ -842,7 +842,7 @@ fn test_rotate_key_data_integrity() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // Verify every row matches
@@ -975,7 +975,7 @@ fn test_remove_encryption_cold_read() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, None).expect("remove encryption failed");
+        rotate_encryption_key_compat(&rotate_config, None).expect("remove encryption failed");
     }
 
     // Cold read WITHOUT encryption key
@@ -1097,7 +1097,7 @@ fn test_add_encryption_cold_read() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b)).expect("add encryption failed");
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).expect("add encryption failed");
     }
 
     // Cold read WITH encryption key

@@ -1,10 +1,9 @@
 //! Append-only staging log for two-phase checkpoint (legacy recovery path).
 //!
-//! turbolite is now always synchronous ("Durable"): checkpoints upload dirty
-//! pages to the backend inline. The staging-log writer is no longer invoked
-//! during writes, but the format + recovery reader are kept so a cache
-//! directory written by an older turbolite (with deferred flush) can still
-//! be recovered cleanly on reopen.
+//! The default checkpoint path uploads dirty pages to the backend inline.
+//! The staging-log writer is still used by LocalThenFlush compatibility mode:
+//! writes append page images locally, checkpoints append a manifest trailer,
+//! and `flush_to_storage()` later uploads the exact checkpointed image.
 //!
 //! Format: 4-byte header + fixed-size records:
 //! ```text

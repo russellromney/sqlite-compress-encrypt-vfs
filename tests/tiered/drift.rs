@@ -14,6 +14,7 @@ use turbolite::tiered::{import_sqlite_file, ManifestSource, TurboliteConfig, Tur
 /// Config for override tests: seekable format, low override threshold, LocalThenFlush.
 fn drift_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut c = test_config(test_name, cache_dir);
+    c.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
     c.sub_pages_per_frame = 8; // enable seekable format (required for overrides)
     c.override_threshold = 100; // low threshold so small updates produce overrides
     c.compaction_threshold = 8;
@@ -53,7 +54,7 @@ fn create_and_import(
         .expect("checkpoint local");
     drop(conn);
 
-    import_sqlite_file(config, &local_db).expect("import to S3");
+    import_sqlite_file_compat(config, &local_db).expect("import to S3");
     local_db
 }
 
@@ -132,6 +133,7 @@ fn drift_sanity_import_write_cold_read() {
     durable_config.prefix = config.prefix.clone();
     durable_config.cache_dir = config.cache_dir.clone();
     durable_config.endpoint_url = config.endpoint_url.clone();
+    durable_config.sync_mode = turbolite::tiered::SyncMode::S3Primary;
     // Re-use the same config but override sync mode
     let vfs_name = unique_vfs_name("drift_sanity");
     let vfs = TurboliteVfs::new_local(durable_config).expect("create vfs");

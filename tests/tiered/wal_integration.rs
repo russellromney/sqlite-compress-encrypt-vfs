@@ -68,7 +68,7 @@ fn import_for_wal(
             .unwrap();
         drop(conn);
     }
-    let manifest = import_sqlite_file(&config, &local_db).unwrap();
+    let manifest = import_sqlite_file_compat(&config, &local_db).unwrap();
     (params, manifest)
 }
 
@@ -121,7 +121,7 @@ fn test_version_is_change_counter() {
     }
 
     let read_cache = tempfile::tempdir().unwrap();
-    let new_manifest = turbolite::tiered::get_manifest(&params.read_config(read_cache.path()))
+    let new_manifest = get_manifest_compat(&params.read_config(read_cache.path()))
         .unwrap()
         .unwrap();
 

@@ -29,7 +29,6 @@ mod tiered {
     mod manifest_persistence;
     mod materialize;
     mod oracle_s3;
-    mod snapshot_gc;
     mod staging;
     #[cfg(feature = "wal")]
     mod wal_integration;

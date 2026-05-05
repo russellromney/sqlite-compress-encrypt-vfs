@@ -349,10 +349,7 @@ fn test_cache_info_counters_after_cold_read() {
     let (bucket, prefix, endpoint) = write_test_data("counters");
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
-    // Reset counters
-    shared.reset_s3_counters();
-
-    // Cold query - should cause S3 fetches and cache misses
+    // Cold query should populate the cache and register cache misses.
     let _: i64 = conn
         .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
         .unwrap();
@@ -365,7 +362,7 @@ fn test_cache_info_counters_after_cold_read() {
 
     let size = info["size_bytes"].as_u64().unwrap();
     let groups_cached = info["groups_cached"].as_u64().unwrap();
-    let s3_gets = info["s3_gets_total"].as_u64().unwrap();
+    let misses = info["misses"].as_u64().unwrap();
 
     assert!(
         size > 0,
@@ -375,7 +372,7 @@ fn test_cache_info_counters_after_cold_read() {
         groups_cached > 0,
         "should have cached groups after cold read"
     );
-    assert!(s3_gets > 0, "should have S3 GETs after cold read");
+    assert!(misses > 0, "cold query should register cache misses");
 
     // Run same query again - should be cache hits
     let _: i64 = conn

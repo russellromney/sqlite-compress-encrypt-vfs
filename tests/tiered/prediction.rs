@@ -69,7 +69,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     }
 
     // Read manifest from S3
-    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
+    let manifest = get_manifest_compat(&TurboliteConfig {
         bucket: bucket.clone(), prefix: prefix.clone(),
         endpoint_url: endpoint.clone(), region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
@@ -82,7 +82,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
 
     // Reopen from S3 with a fresh VFS and verify patterns survived
     let reader_cache = tempfile::tempdir().unwrap();
-    let reader_manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
+    let reader_manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: reader_cache.path().to_path_buf(),
@@ -129,7 +129,7 @@ fn test_checkpoint_no_patterns_when_disabled() {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
+    let manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
@@ -188,7 +188,7 @@ fn test_single_table_no_predictions() {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    let manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
+    let manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
         region: Some("auto".to_string()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
