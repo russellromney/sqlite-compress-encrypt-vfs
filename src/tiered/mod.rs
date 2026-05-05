@@ -78,6 +78,8 @@ mod prefetch;
 mod query_plan;
 mod replay;
 mod rotation;
+#[doc(hidden)]
+pub mod sashimono;
 pub mod settings;
 #[cfg(feature = "wal")]
 mod snapshot_source;

@@ -1,0 +1,13 @@
+{
+  "kind": "root_pointer",
+  "format_version": 1,
+  "tenant_scope": "tenant-a/scope-a",
+  "database_id": "db-alpha",
+  "root_generation": 1,
+  "writer_id": "writer-a",
+  "lease_epoch": 7,
+  "checkpoint_id": "chk-0001",
+  "latest_delta_sequence": 0,
+  "latest_database_version": 1,
+  "state_checksum": 9001
+}
