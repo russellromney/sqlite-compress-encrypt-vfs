@@ -3,18 +3,18 @@
 //!
 //! Override frames require seekable format (sub_pages_per_frame > 0), which is set in the
 //! manifest during import. Tests use import_sqlite_file to bootstrap data in seekable format,
-//! then LocalThenFlush + flush_to_s3 to exercise the override path.
+//! then LocalThenFlush + flush_to_storage to exercise the override path.
 
 use super::helpers::*;
 use tempfile::TempDir;
-use turbolite::tiered::{import_sqlite_file, ManifestSource, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{ManifestSource, TurboliteConfig, TurboliteVfs};
 
 // ===== Helpers =====
 
 /// Config for override tests: seekable format, low override threshold, LocalThenFlush.
 fn drift_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut c = test_config(test_name, cache_dir);
-    c.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+    c.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
     c.sub_pages_per_frame = 8; // enable seekable format (required for overrides)
     c.override_threshold = 100; // low threshold so small updates produce overrides
     c.compaction_threshold = 8;
@@ -133,7 +133,7 @@ fn drift_sanity_import_write_cold_read() {
     durable_config.prefix = config.prefix.clone();
     durable_config.cache_dir = config.cache_dir.clone();
     durable_config.endpoint_url = config.endpoint_url.clone();
-    durable_config.sync_mode = turbolite::tiered::SyncMode::S3Primary;
+    durable_config.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::Durable;
     // Re-use the same config but override sync mode
     let vfs_name = unique_vfs_name("drift_sanity");
     let vfs = TurboliteVfs::new_local(durable_config).expect("create vfs");
@@ -216,7 +216,7 @@ fn drift_override_write_and_cold_read() {
         .expect("update row 50");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("override checkpoint");
-    shared.flush_to_s3().expect("override flush");
+    shared.flush_to_storage().expect("override flush");
 
     // Verify override keys exist in S3 (pattern: pg/{gid}_f{frame_idx}_v{version})
     let pg_keys = list_s3_keys(&bucket, &format!("{}/p/d/", prefix), &endpoint);
@@ -319,14 +319,14 @@ fn drift_override_compaction_and_cold_read() {
         .expect("round 1 update");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("round 1 checkpoint");
-    shared.flush_to_s3().expect("round 1 flush");
+    shared.flush_to_storage().expect("round 1 flush");
 
     // Round 2: small update
     conn.execute("UPDATE data SET value = 'r2_20' WHERE id = 20", [])
         .expect("round 2 update");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("round 2 checkpoint");
-    shared.flush_to_s3().expect("round 2 flush");
+    shared.flush_to_storage().expect("round 2 flush");
 
     // Round 3: small update (should trigger compaction with threshold=3)
     conn.execute("UPDATE data SET value = 'r3_30' WHERE id = 30", [])
@@ -334,7 +334,7 @@ fn drift_override_compaction_and_cold_read() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("round 3 checkpoint");
     shared
-        .flush_to_s3()
+        .flush_to_storage()
         .expect("round 3 flush (should trigger compaction)");
 
     // Round 4: one more update to verify post-compaction overrides work
@@ -342,7 +342,7 @@ fn drift_override_compaction_and_cold_read() {
         .expect("round 4 update");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("round 4 checkpoint");
-    shared.flush_to_s3().expect("round 4 flush");
+    shared.flush_to_storage().expect("round 4 flush");
 
     // Cold read: should see all updates merged correctly
     let cold_dir = TempDir::new().expect("cold dir");
@@ -528,7 +528,7 @@ fn drift_override_with_encryption() {
         .expect("update id=42");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .expect("override checkpoint");
-    shared.flush_to_s3().expect("override flush");
+    shared.flush_to_storage().expect("override flush");
 
     // Verify override keys exist
     let pg_keys = list_s3_keys(&bucket, &format!("{}/p/d/", prefix), &endpoint);

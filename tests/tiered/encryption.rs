@@ -132,7 +132,7 @@ fn test_encrypted_write_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -224,7 +224,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -348,7 +348,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -490,7 +490,7 @@ fn test_rotate_key_cold_read_succeeds() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -599,7 +599,7 @@ fn test_rotate_key_old_key_fails() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -769,7 +769,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -907,7 +907,7 @@ fn test_rotate_key_data_integrity() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -1029,7 +1029,7 @@ fn test_remove_encryption_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -1185,6 +1185,6 @@ fn test_add_encryption_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }

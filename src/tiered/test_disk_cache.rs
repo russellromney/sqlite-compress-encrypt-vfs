@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -147,7 +146,7 @@ fn test_bitmap_clear_range_beyond_capacity() {
 #[test]
 fn test_bitmap_mark_range_zero_count() {
     let dir = TempDir::new().unwrap();
-    let mut bm = PageBitmap::new(dir.path().join("bm"));
+    let bm = PageBitmap::new(dir.path().join("bm"));
     bm.mark_range(10, 0); // no-op
     assert!(!bm.is_present(10));
 }
@@ -1313,7 +1312,7 @@ fn test_evict_to_budget_shrinks_cache() {
         assert!(cache.try_claim_group(gid));
         let start = gid * 4;
         let data = vec![0xABu8; 4 * 64]; // 4 pages
-        cache.write_pages_bulk(start, &data, 4);
+        cache.write_pages_bulk(start, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1343,7 +1342,7 @@ fn test_evict_to_budget_respects_skip_groups() {
     for gid in 0..2u64 {
         assert!(cache.try_claim_group(gid));
         let data = vec![0xABu8; 4 * 64];
-        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.write_pages_bulk(gid * 4, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1371,7 +1370,7 @@ fn test_evict_to_budget_never_evicts_pinned() {
     for gid in 0..2u64 {
         assert!(cache.try_claim_group(gid));
         let data = vec![0xABu8; 4 * 64];
-        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.write_pages_bulk(gid * 4, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1408,7 +1407,7 @@ fn test_evict_to_budget_already_under() {
 
     assert!(cache.try_claim_group(0));
     let data = vec![0xABu8; 4 * 64];
-    cache.write_pages_bulk(0, &data, 4);
+    cache.write_pages_bulk(0, &data, 4).unwrap();
     cache.mark_group_present(0);
 
     // Budget is larger than cache

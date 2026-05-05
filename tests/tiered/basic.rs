@@ -718,7 +718,7 @@ fn test_page_group_cache_populates() {
 }
 
 #[test]
-fn test_destroy_s3() {
+fn test_destroy_remote() {
     let cache_dir = TempDir::new().unwrap();
     let config = test_config("destroy", cache_dir.path());
     let vfs_name = unique_vfs_name("tiered_destroy");
@@ -768,7 +768,7 @@ fn test_destroy_s3() {
     });
     assert!(exists_before, "manifest should exist before destroy");
 
-    // Create a new VFS instance with same config to call destroy_s3
+    // Create a new VFS instance with same config to call destroy_remote
     let destroy_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
@@ -779,7 +779,7 @@ fn test_destroy_s3() {
         ..Default::default()
     };
     let destroy_vfs = TurboliteVfs::new_local(destroy_config).unwrap();
-    destroy_vfs.destroy_s3().unwrap();
+    destroy_vfs.destroy_remote().unwrap();
 
     // Verify manifest is gone
     let exists_after = rt.block_on(async {
@@ -801,7 +801,10 @@ fn test_destroy_s3() {
             .await
             .is_ok()
     });
-    assert!(!exists_after, "manifest should be gone after destroy_s3");
+    assert!(
+        !exists_after,
+        "manifest should be gone after destroy_remote"
+    );
 }
 
 #[test]

@@ -54,7 +54,7 @@ fn cold_reader(
     let cold_config = TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
-        cache_dir: cold_dir.into_path(),
+        cache_dir: cold_dir.keep(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         read_only: true,
@@ -102,7 +102,7 @@ fn update_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 /// Helper: create LocalThenFlush config.
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut config = test_config(test_name, cache_dir);
-    config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+    config.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
     config
 }
 
@@ -120,7 +120,10 @@ fn config_with_same_s3(
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
-        sync_mode: turbolite::tiered::SyncMode::LocalThenFlush,
+        cache: turbolite::tiered::CacheConfig {
+            checkpoint_mode: turbolite::tiered::CheckpointMode::LocalThenFlush,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -153,7 +156,7 @@ fn staging_race_overwrite_then_flush() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "race_ow.db");
@@ -204,7 +207,7 @@ fn staging_race_triple_overwrite() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "race_triple.db");
@@ -263,7 +266,7 @@ fn staging_race_multi_table_interleave() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "race_multi.db");
@@ -319,7 +322,7 @@ fn staging_scale_10k_rows() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "scale_10k.db");
@@ -366,7 +369,7 @@ fn staging_scale_many_small_checkpoints() {
         staging_log_count(cache_dir.path()) >= 20,
         "should have at least 20 staging logs"
     );
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     assert_eq!(
         staging_log_count(cache_dir.path()),
         0,
@@ -418,7 +421,7 @@ fn staging_schema_create_index() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "schema_idx.db");
@@ -475,7 +478,7 @@ fn staging_schema_delete_vacuum() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "schema_vacuum.db");
@@ -517,7 +520,7 @@ fn staging_schema_alter_table() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "schema_alter.db");
@@ -580,7 +583,7 @@ fn staging_crash_recover_then_continue() {
     insert_rows(&conn, 50, 100, "batch2");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
 
     // Verify all data
     let count: i64 = conn
@@ -691,7 +694,7 @@ fn staging_crash_double() {
     assert!(shared.has_pending_flush(), "should recover staging logs");
     let vfs_name = unique_vfs_name("crash_dbl_r");
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
 
     let conn = open_conn(&vfs_name, "crash_dbl.db");
     let count: i64 = conn
@@ -747,7 +750,7 @@ fn staging_active_reader_during_flush() {
     assert_eq!(count_before, 100, "reader should see 100 rows before flush");
 
     // Flush while reader is open
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
 
     // Reader should still work after flush
     let count_after: i64 = reader
@@ -826,7 +829,7 @@ fn staging_follower_sees_data_after_flush() {
     drop(follower_conn);
 
     // Now flush
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     // Follower after flush: should see 50 rows
@@ -877,7 +880,7 @@ fn staging_follower_no_staging_files() {
     insert_rows(&conn, 0, 50, "v1");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     // Follower: open read-only, verify no staging files created
@@ -920,12 +923,7 @@ fn staging_follower_no_staging_files() {
 #[test]
 fn staging_durable_overwrite_no_staging() {
     let cache_dir = TempDir::new().unwrap();
-    let mut config = test_config("durable_ow", cache_dir.path());
-    let (bucket, prefix, endpoint) = (
-        config.bucket.clone(),
-        config.prefix.clone(),
-        config.endpoint_url.clone(),
-    );
+    let config = test_config("durable_ow", cache_dir.path());
 
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let vfs_name = unique_vfs_name("durable_ow");
@@ -975,7 +973,9 @@ fn staging_edge_flush_noop() {
     let vfs = TurboliteVfs::new_local(config).unwrap();
     let shared = vfs.shared_state();
     assert!(!shared.has_pending_flush());
-    shared.flush_to_s3().expect("empty flush should succeed");
+    shared
+        .flush_to_storage()
+        .expect("empty flush should succeed");
 }
 
 /// Checkpoint with zero dirty pages: no staging file created.
@@ -1032,7 +1032,7 @@ fn staging_edge_large_single_txn() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "edge_large.db");
@@ -1046,7 +1046,7 @@ fn staging_edge_large_single_txn() {
     assert_eq!(v4999, "big_4999");
 }
 
-/// Concurrent flush_to_s3() calls: serialized by flush_lock, both succeed.
+/// Concurrent flush_to_storage() calls: serialized by flush_lock, both succeed.
 #[test]
 fn staging_edge_concurrent_flush() {
     let cache_dir = TempDir::new().unwrap();
@@ -1069,9 +1069,9 @@ fn staging_edge_concurrent_flush() {
         .unwrap();
 
     // Two flushes in sequence (flush_lock serializes them)
-    shared1.flush_to_s3().unwrap();
+    shared1.flush_to_storage().unwrap();
     // Second flush should be a no-op (first one drained everything)
-    shared2.flush_to_s3().unwrap();
+    shared2.flush_to_storage().unwrap();
 
     drop(conn);
 

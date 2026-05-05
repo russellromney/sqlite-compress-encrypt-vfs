@@ -3,13 +3,13 @@
 //! Every xSync uploads dirty frames as overrides + publishes manifest.
 //! Requires S3 credentials (TIERED_TEST_BUCKET).
 
-use turbolite::tiered::{SyncMode, TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::{CheckpointMode, TurboliteConfig, TurboliteVfs};
 use tempfile::TempDir;
 use super::helpers::*;
 
 fn s3primary_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut config = test_config(prefix, cache_dir);
-    config.sync_mode = SyncMode::S3Primary;
+    config.cache.checkpoint_mode = CheckpointMode::Durable;
     config.sub_pages_per_frame = 8; // enable seekable format (required for overrides)
     config
 }

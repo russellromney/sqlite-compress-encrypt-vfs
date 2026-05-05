@@ -107,7 +107,7 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
-    let _ = TurboliteVfs::new_local(config).unwrap().destroy_s3();
+    let _ = TurboliteVfs::new_local(config).unwrap().destroy_remote();
 }
 
 // ── turbolite_evict('data'/'index'/'all') ──
@@ -332,7 +332,7 @@ fn test_warm_already_cached_is_low_submit() {
     // Warm again - should submit few/no groups
     let accesses = turbolite::tiered::parse_eqp_output("SCAN evict_data");
     let result_json = shared.warm_from_plan(&accesses);
-    let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+    let _result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
     eprintln!("warm on cached: {}", result_json);
 
     // Most groups should already be cached, so few submitted

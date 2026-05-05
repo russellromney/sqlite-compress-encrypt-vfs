@@ -21,20 +21,44 @@ impl Default for ManifestSource {
     }
 }
 
+// ===== Checkpoint mode =====
+
+/// How checkpoints interact with the configured storage backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckpointMode {
+    /// A SQLite checkpoint uploads dirty page groups to the backend before
+    /// returning. This is the default durability mode.
+    Durable,
+    /// A SQLite checkpoint commits into the local cache/staging log and returns
+    /// without backend I/O. Call `flush_to_storage()` to publish the exact
+    /// checkpointed image to the backend later.
+    LocalThenFlush,
+}
+
+impl Default for CheckpointMode {
+    fn default() -> Self {
+        CheckpointMode::Durable
+    }
+}
+
 // ===== Legacy sync mode =====
 
-/// Legacy test/API spelling for old S3-owned checkpoint modes.
+/// Legacy spelling for old S3-owned checkpoint modes.
 ///
-/// Turbolite now receives storage as a `hadb_storage::StorageBackend`, so this
-/// enum is only a compatibility shim. `S3Primary` maps to durable backend
-/// checkpoint upload; `LocalThenFlush` maps to the existing
-/// `set_local_checkpoint_only` / `flush_to_storage` path used by tests.
+/// Prefer [`CheckpointMode`]. Turbolite receives storage as a
+/// `hadb_storage::StorageBackend`; this enum remains only to translate old
+/// flat config callers while tests and embedders move to the nested config.
+#[deprecated(
+    since = "0.2.0",
+    note = "use TurboliteConfig.cache.checkpoint_mode instead"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncMode {
     S3Primary,
     LocalThenFlush,
 }
 
+#[allow(deprecated)]
 impl Default for SyncMode {
     fn default() -> Self {
         SyncMode::S3Primary
@@ -99,6 +123,8 @@ pub struct CacheConfig {
     pub sub_pages_per_frame: u32,
     /// Automatic garbage collection after each checkpoint.
     pub gc_enabled: bool,
+    /// Checkpoint/backend durability behavior.
+    pub checkpoint_mode: CheckpointMode,
     /// Override threshold. 0 = auto (frames_per_group / 4).
     pub override_threshold: u32,
     /// Compaction threshold.
@@ -166,6 +192,7 @@ impl Default for CacheConfig {
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
             sub_pages_per_frame: DEFAULT_SUB_PAGES_PER_FRAME,
             gc_enabled: true,
+            checkpoint_mode: CheckpointMode::Durable,
             override_threshold: 0,
             compaction_threshold: 8,
         }
@@ -306,6 +333,7 @@ impl WalConfig {
 /// [`TurboliteVfs::new`] for local mode (page groups on `cache_dir`) or
 /// [`TurboliteVfs::with_backend`] to inject any
 /// `Arc<dyn hadb_storage::StorageBackend>` plus a tokio runtime handle.
+#[allow(deprecated)]
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TurboliteConfig {
@@ -371,6 +399,7 @@ pub struct TurboliteConfig {
     pub compaction_threshold: u32,
     #[serde(default)]
     pub manifest_source: ManifestSource,
+    #[allow(deprecated)]
     #[serde(default)]
     pub sync_mode: SyncMode,
     #[cfg(feature = "wal")]
@@ -412,6 +441,7 @@ impl Default for TurboliteConfig {
             override_threshold: CacheConfig::default().override_threshold,
             compaction_threshold: CacheConfig::default().compaction_threshold,
             manifest_source: ManifestSource::default(),
+            #[allow(deprecated)]
             sync_mode: SyncMode::default(),
             #[cfg(feature = "wal")]
             wal_replication: WalConfig::default().replication,
@@ -442,6 +472,12 @@ impl TurboliteConfig {
         self.cache.pages_per_group = self.pages_per_group;
         self.cache.sub_pages_per_frame = self.sub_pages_per_frame;
         self.cache.gc_enabled = self.gc_enabled;
+        #[allow(deprecated)]
+        {
+            if self.sync_mode == SyncMode::LocalThenFlush {
+                self.cache.checkpoint_mode = CheckpointMode::LocalThenFlush;
+            }
+        }
         self.cache.max_bytes = self.max_cache_bytes;
         self.cache.evict_on_checkpoint = self.evict_on_checkpoint;
         self.cache.override_threshold = self.override_threshold;

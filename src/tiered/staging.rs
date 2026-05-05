@@ -272,7 +272,6 @@ pub(crate) fn remove_staging_log(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn staging_write_read_roundtrip() {

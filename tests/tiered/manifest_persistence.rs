@@ -59,7 +59,7 @@ fn test_local_manifest_persisted_on_checkpoint() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -120,7 +120,7 @@ fn test_warm_reconnect_uses_local_manifest_state() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -128,7 +128,7 @@ fn test_warm_reconnect_uses_local_manifest_state() {
 #[test]
 fn test_dirty_groups_recovered_from_local_manifest() {
     let cache_dir = TempDir::new().unwrap();
-    let mut config = test_config("dirty_recovery", cache_dir.path());
+    let config = test_config("dirty_recovery", cache_dir.path());
     let vfs_name = unique_vfs_name("dirty_recovery");
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
@@ -208,7 +208,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     );
 
     // Flush to S3 - should upload the recovered dirty groups
-    state2.flush_to_s3().unwrap();
+    state2.flush_to_storage().unwrap();
     assert!(
         !state2.has_pending_flush(),
         "flush should clear pending groups"
@@ -236,7 +236,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -290,6 +290,6 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }

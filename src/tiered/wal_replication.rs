@@ -13,6 +13,7 @@
 //! because the WAL file path isn't known until SQLite calls open().
 
 #![cfg(feature = "wal")]
+#![allow(dead_code)]
 
 use parking_lot::Mutex;
 use std::io;

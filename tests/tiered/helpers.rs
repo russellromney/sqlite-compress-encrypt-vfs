@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::{io, path::Path};
-use turbolite::tiered::{Manifest, SyncMode, TurboliteConfig};
+use turbolite::tiered::{CheckpointMode, Manifest, TurboliteConfig};
 
 /// Shared tokio runtime for all integration tests.
 /// Prevents 100+ runtime creation when tests run in parallel.
@@ -68,49 +68,13 @@ pub struct TestMode {
 }
 
 /// Deterministic test encryption key (NOT for production).
+#[cfg(feature = "encryption")]
 const TEST_ENCRYPTION_KEY: [u8; 32] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
 impl TestMode {
-    /// All 12 combinations.
-    pub fn all() -> Vec<TestMode> {
-        let mut modes = Vec::new();
-        for &storage in &[
-            StorageTier::Local,
-            StorageTier::S3Durable,
-            StorageTier::S3LocalThenFlush,
-        ] {
-            for &compressed in &[false, true] {
-                for &encrypted in &[false, true] {
-                    modes.push(TestMode {
-                        storage,
-                        compressed,
-                        encrypted,
-                    });
-                }
-            }
-        }
-        modes
-    }
-
-    /// S3 modes only (Durable + LTF). For tests that need S3.
-    pub fn s3_modes() -> Vec<TestMode> {
-        Self::all()
-            .into_iter()
-            .filter(|m| m.storage != StorageTier::Local)
-            .collect()
-    }
-
-    /// S3 Durable modes only. For tests that need cold-read from S3.
-    pub fn s3_durable_modes() -> Vec<TestMode> {
-        Self::all()
-            .into_iter()
-            .filter(|m| m.storage == StorageTier::S3Durable)
-            .collect()
-    }
-
     /// Short name for test output and unique prefixes.
     pub fn name(&self) -> String {
         let stor = match self.storage {
@@ -138,42 +102,24 @@ impl TestMode {
             StorageTier::Local => {
                 // Local mode: no S3 fields needed, test_config already sets them
                 // but we override to local-only by clearing bucket
-                config.sync_mode = SyncMode::S3Primary;
+                config.cache.checkpoint_mode = CheckpointMode::Durable;
             }
             StorageTier::S3Durable => {
-                config.sync_mode = SyncMode::S3Primary;
+                config.cache.checkpoint_mode = CheckpointMode::Durable;
             }
             StorageTier::S3LocalThenFlush => {
-                config.sync_mode = SyncMode::LocalThenFlush;
+                config.cache.checkpoint_mode = CheckpointMode::LocalThenFlush;
             }
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_s3(&self) -> bool {
         self.storage != StorageTier::Local
     }
 
     pub fn supports_cold_read(&self) -> bool {
         self.storage == StorageTier::S3Durable
-    }
-}
-
-/// Macro to generate one #[test] fn per TestMode for a given test body function.
-/// Usage: `mode_tests!(test_fn_name, run_fn, modes_fn);`
-/// Run a test function across all S3 Durable mode combinations.
-/// Panics with mode name on failure.
-pub fn run_across_s3_durable(f: impl Fn(TestMode)) {
-    for mode in TestMode::s3_durable_modes() {
-        eprintln!("--- running mode: {} ---", mode.name());
-        f(mode);
-    }
-}
-
-/// Run a test function across all S3 mode combinations (Durable + LTF).
-pub fn run_across_all_s3(f: impl Fn(TestMode)) {
-    for mode in TestMode::s3_modes() {
-        eprintln!("--- running mode: {} ---", mode.name());
-        f(mode);
     }
 }
 

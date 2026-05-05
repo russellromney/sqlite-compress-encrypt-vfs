@@ -140,7 +140,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
         ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-    cleanup_vfs.destroy_s3().unwrap();
+    cleanup_vfs.destroy_remote().unwrap();
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn test_index_bundles_eager_load_disabled() {
         ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-    cleanup_vfs.destroy_s3().unwrap();
+    cleanup_vfs.destroy_remote().unwrap();
 }
 
 #[test]
@@ -427,7 +427,7 @@ fn test_warm_profile_query_no_corruption_after_eager_load() {
         ..Default::default()
     };
     let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-    cleanup_vfs.destroy_s3().unwrap();
+    cleanup_vfs.destroy_remote().unwrap();
 }
 
 #[test]
@@ -479,7 +479,7 @@ fn test_small_ppg_index_integrity() {
     .unwrap();
 
     // Insert enough rows to span multiple page groups (ppg=8 = 32KB per group)
-    let mut tx = conn.unchecked_transaction().unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
     for i in 0..2000 {
         tx.execute(
             "INSERT INTO items (id, value, counter) VALUES (?1, ?2, ?3)",
@@ -568,6 +568,6 @@ fn test_small_ppg_index_integrity() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }

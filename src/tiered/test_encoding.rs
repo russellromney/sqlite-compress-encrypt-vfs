@@ -1,6 +1,4 @@
 use super::*;
-use crate::tiered::*;
-use tempfile::TempDir;
 
 // =========================================================================
 // Page Group Encoding

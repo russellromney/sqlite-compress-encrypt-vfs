@@ -586,7 +586,7 @@ fn test_evict_tree_by_name() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -706,7 +706,7 @@ fn test_cache_info_returns_valid_json() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -825,7 +825,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
 
     // Flush, then evict should work fully again
     turbolite::tiered::set_local_checkpoint_only(false);
-    bench.flush_to_s3().unwrap();
+    bench.flush_to_storage().unwrap();
     assert!(!bench.has_pending_flush());
 
     // Data still readable after flush
@@ -847,7 +847,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -977,7 +977,7 @@ fn test_autovacuum_with_gc() {
     );
 
     // Verify data still readable after GC
-    let gc_conn = rusqlite::Connection::open_with_flags_and_vfs(
+    let _gc_conn = rusqlite::Connection::open_with_flags_and_vfs(
         "autovacuum_verify.db",
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         &unique_vfs_name("tiered_autovacuum_verify"),
@@ -986,7 +986,7 @@ fn test_autovacuum_with_gc() {
     // Data integrity was verified above before drop(conn).
 
     // Cleanup
-    gc_vfs.destroy_s3().unwrap();
+    gc_vfs.destroy_remote().unwrap();
 }
 
 /// Phase Marathon: verify cache file truncates after VACUUM reduces page_count.
@@ -1102,6 +1102,6 @@ fn test_cache_truncation_after_vacuum() {
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }

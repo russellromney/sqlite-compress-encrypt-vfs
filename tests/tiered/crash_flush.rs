@@ -6,7 +6,7 @@
 
 use rusqlite::OpenFlags;
 use tempfile::TempDir;
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::TurboliteVfs;
 
 use super::helpers::*;
 
@@ -347,19 +347,62 @@ fn run_large_dataset(mode: TestMode) {
     );
 }
 
-// --- Parameterized tests: crash recovery x all S3 Durable mode combinations ---
-
-#[test]
-fn crash_incremental_all_modes() {
-    run_across_s3_durable(run_crash_incremental);
+macro_rules! crash_case {
+    ($name:ident, $runner:ident, $compressed:expr, $encrypted:expr) => {
+        #[test]
+        fn $name() {
+            $runner(TestMode {
+                storage: StorageTier::S3Durable,
+                compressed: $compressed,
+                encrypted: $encrypted,
+            });
+        }
+    };
 }
 
-#[test]
-fn crash_uncommitted_all_modes() {
-    run_across_s3_durable(run_uncommitted_not_visible);
-}
+// --- Parameterized tests: crash recovery x S3 Durable mode combinations ---
 
-#[test]
-fn crash_large_all_modes() {
-    run_across_s3_durable(run_large_dataset);
-}
+crash_case!(crash_incremental_plain, run_crash_incremental, false, false);
+crash_case!(crash_incremental_zstd, run_crash_incremental, true, false);
+crash_case!(
+    crash_incremental_plain_enc,
+    run_crash_incremental,
+    false,
+    true
+);
+crash_case!(
+    crash_incremental_zstd_enc,
+    run_crash_incremental,
+    true,
+    true
+);
+
+crash_case!(
+    crash_uncommitted_plain,
+    run_uncommitted_not_visible,
+    false,
+    false
+);
+crash_case!(
+    crash_uncommitted_zstd,
+    run_uncommitted_not_visible,
+    true,
+    false
+);
+crash_case!(
+    crash_uncommitted_plain_enc,
+    run_uncommitted_not_visible,
+    false,
+    true
+);
+crash_case!(
+    crash_uncommitted_zstd_enc,
+    run_uncommitted_not_visible,
+    true,
+    true
+);
+
+crash_case!(crash_large_plain, run_large_dataset, false, false);
+crash_case!(crash_large_zstd, run_large_dataset, true, false);
+crash_case!(crash_large_plain_enc, run_large_dataset, false, true);
+crash_case!(crash_large_zstd_enc, run_large_dataset, true, true);

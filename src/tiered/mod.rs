@@ -70,6 +70,7 @@ mod encoding;
 mod flush;
 mod handle;
 mod import;
+mod instrumented_storage;
 mod keys;
 mod manifest;
 mod prediction;
@@ -89,15 +90,18 @@ mod wire;
 
 // Public API (visible outside the crate)
 pub use bench::TurboliteSharedState;
+#[allow(deprecated)]
+pub use config::SyncMode;
 #[cfg(feature = "wal")]
 pub use config::WalConfig;
 pub use config::{
-    BTreeManifestEntry, GroupState, GroupingStrategy, ManifestSource, PageLocation, SyncMode,
+    BTreeManifestEntry, CheckpointMode, GroupState, GroupingStrategy, ManifestSource, PageLocation,
     TurboliteConfig,
 };
 pub use config::{CacheConfig, CompressionConfig, EncryptionConfig, PrefetchConfig};
 pub use handle::TurboliteHandle;
 pub use import::import_sqlite_file;
+pub use instrumented_storage::{CountingStorageBackend, StorageBackendStats};
 pub use manifest::{FrameEntry, Manifest, SubframeOverride};
 pub use replay::{FinalizeReport, ReplayHandle};
 pub use vfs::TurboliteVfs;

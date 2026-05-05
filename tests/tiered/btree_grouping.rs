@@ -53,7 +53,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
     assert!(has_posts, "should have 'posts' B-tree");
     assert!(has_idx, "should have 'idx_posts_user' B-tree");
 
-    let groups_before = manifest
+    let _groups_before = manifest
         .page_group_keys
         .iter()
         .filter(|k| !k.is_empty())

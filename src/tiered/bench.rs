@@ -255,6 +255,7 @@ impl TurboliteSharedState {
     }
 
     /// Legacy alias for the old S3-owned API.
+    #[deprecated(since = "0.2.0", note = "use flush_to_storage")]
     pub fn flush_to_s3(&self) -> io::Result<()> {
         self.flush_to_storage()
     }
@@ -403,30 +404,42 @@ impl TurboliteSharedState {
             0.0
         };
 
-        format!(
-            "{{\"size_bytes\":{},\"peak_bytes\":{},\"groups_cached\":{},\"groups_total\":{},\
-            \"tiers\":{{\"pinned\":{{\"chunks\":{},\"bytes\":{}}},\
-            \"index\":{{\"chunks\":{},\"bytes\":{}}},\
-            \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
-            \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
-            \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{}}}",
-            total_bytes,
-            peak_bytes,
-            groups_with_data.len(),
-            total_groups,
-            pinned_chunks,
-            pinned_bytes,
-            index_chunks,
-            index_bytes,
-            data_chunks,
-            data_bytes,
-            hits,
-            misses,
-            hit_rate,
-            evictions,
-            bytes_evicted,
-            last_eviction,
-        )
+        serde_json::json!({
+            "size_bytes": total_bytes,
+            "peak_bytes": peak_bytes,
+            "groups_cached": groups_with_data.len(),
+            "groups_total": total_groups,
+            "tiers": {
+                "pinned": { "chunks": pinned_chunks, "bytes": pinned_bytes },
+                "index": { "chunks": index_chunks, "bytes": index_bytes },
+                "data": { "chunks": data_chunks, "bytes": data_bytes },
+            },
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": hit_rate,
+            "evictions": evictions,
+            "bytes_evicted": bytes_evicted,
+            "last_eviction_count": last_eviction,
+            "prefetch": self
+                .prefetch_pool
+                .as_ref()
+                .map(|pool| pool.stats_json())
+                .unwrap_or_else(|| serde_json::json!({
+                    "in_flight": 0,
+                    "submitted": 0,
+                    "completed": 0,
+                    "skipped_state": 0,
+                    "missing_objects": 0,
+                    "fetch_errors": 0,
+                    "decode_errors": 0,
+                    "write_errors": 0,
+                    "stale_manifest": 0,
+                    "stale_replay": 0,
+                    "bytes_fetched": 0,
+                    "trees": {},
+                })),
+        })
+        .to_string()
     }
 
     /// Warm cache for a planned query.
@@ -465,6 +478,7 @@ impl TurboliteSharedState {
                             .cloned()
                             .unwrap_or_default();
                         pool.submit(
+                            Some(access.tree_name.clone()),
                             gid,
                             key.clone(),
                             ft,

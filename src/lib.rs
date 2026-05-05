@@ -184,7 +184,7 @@ use std::fs::{File, OpenOptions as FsOpenOptions};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Public utility functions ──────────────────────────────────────────
 
@@ -822,9 +822,9 @@ mod tests {
         let _ = idx.map(2).expect("map 2");
 
         // Write distinct data to each
-        let mut buf0 = [0xAAu8; 32768];
-        let mut buf1 = [0xBBu8; 32768];
-        let mut buf2 = [0xCCu8; 32768];
+        let buf0 = [0xAAu8; 32768];
+        let buf1 = [0xBBu8; 32768];
+        let buf2 = [0xCCu8; 32768];
         idx.push(0, &buf0).expect("push 0");
         idx.push(1, &buf1).expect("push 1");
         idx.push(2, &buf2).expect("push 2");

@@ -96,12 +96,10 @@ impl TurboliteVfs {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build tokio rt: {e}")))?;
         let runtime = owned.handle().clone();
         config.apply_legacy_flat_fields();
-        if config.has_legacy_backend_config() {
-            super::set_local_checkpoint_only(matches!(
-                config.sync_mode,
-                super::SyncMode::LocalThenFlush
-            ));
-        }
+        super::set_local_checkpoint_only(matches!(
+            config.cache.checkpoint_mode,
+            super::CheckpointMode::LocalThenFlush
+        ));
 
         // Ensure the cache dir exists before LocalStorage tries to write
         // under it; LocalStorage creates parents lazily on put but we
@@ -147,6 +145,10 @@ impl TurboliteVfs {
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
         config.apply_legacy_flat_fields();
+        super::set_local_checkpoint_only(matches!(
+            config.cache.checkpoint_mode,
+            super::CheckpointMode::LocalThenFlush
+        ));
         fs::create_dir_all(&config.cache_dir)?;
         #[cfg(feature = "bundled-sqlite")]
         crate::install_hook::ensure_registered();
@@ -916,6 +918,7 @@ impl TurboliteVfs {
     }
 
     /// Legacy alias for the old S3-owned API.
+    #[deprecated(since = "0.2.0", note = "use destroy_remote")]
     pub fn destroy_s3(&self) -> io::Result<()> {
         self.destroy_remote()
     }

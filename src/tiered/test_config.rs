@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 
 #[test]
 fn test_tiered_config_default() {

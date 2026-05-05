@@ -40,7 +40,7 @@ fn insert_rows(conn: &rusqlite::Connection, start: i64, end: i64, prefix: &str) 
 
 fn ltf_config(test_name: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
     let mut config = test_config(test_name, cache_dir);
-    config.sync_mode = turbolite::tiered::SyncMode::LocalThenFlush;
+    config.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
     config
 }
 
@@ -54,7 +54,7 @@ fn cold_reader(
     let cold_config = TurboliteConfig {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
-        cache_dir: cold_dir.into_path(),
+        cache_dir: cold_dir.keep(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         read_only: true,
@@ -172,7 +172,7 @@ fn borodino_encryption_staging_roundtrip() {
     insert_rows(&conn, 0, 50, "secret");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     // Cold reader with correct key
@@ -180,7 +180,7 @@ fn borodino_encryption_staging_roundtrip() {
     let cold_config = TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
-        cache_dir: cold_dir.into_path(),
+        cache_dir: cold_dir.keep(),
         endpoint_url: endpoint.clone(),
         region: Some("auto".to_string()),
         read_only: true,
@@ -228,7 +228,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
     insert_rows(&conn, 0, 10, "secret");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     // Cold reader with WRONG key should fail
@@ -236,7 +236,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
     let cold_config = TurboliteConfig {
         bucket,
         prefix,
-        cache_dir: cold_dir.into_path(),
+        cache_dir: cold_dir.keep(),
         endpoint_url: endpoint,
         region: Some("auto".to_string()),
         read_only: true,
@@ -293,7 +293,7 @@ fn borodino_vacuum_local_then_flush() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "vac_ltf.db");
@@ -337,7 +337,7 @@ fn borodino_compact_between_checkpoint_and_flush() {
     // Try to compact (may be a no-op if no dead space, that's fine)
     let _ = conn.execute_batch("SELECT turbolite_compact();");
 
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "compact_btw.db");
@@ -380,7 +380,7 @@ fn borodino_eviction_protects_pending_staging() {
         .unwrap();
 
     // Flush must still succeed (pending pages not evicted)
-    shared.flush_to_s3().unwrap();
+    shared.flush_to_storage().unwrap();
     drop(conn);
 
     let cold = cold_reader(&bucket, &prefix, &endpoint, "evict_pend.db");
@@ -416,7 +416,7 @@ fn borodino_multi_db_separate_vfs() {
     conn1
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared1.flush_to_s3().unwrap();
+    shared1.flush_to_storage().unwrap();
     drop(conn1);
 
     // DB 2: own VFS + prefix
@@ -438,7 +438,7 @@ fn borodino_multi_db_separate_vfs() {
     conn2
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
-    shared2.flush_to_s3().unwrap();
+    shared2.flush_to_storage().unwrap();
     drop(conn2);
 
     // Verify each independently

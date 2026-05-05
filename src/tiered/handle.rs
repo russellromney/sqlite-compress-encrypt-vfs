@@ -815,6 +815,7 @@ impl TurboliteHandle {
                         .cloned()
                         .unwrap_or_default();
                     if pool.submit(
+                        None,
                         gid,
                         key.clone(),
                         ft,
@@ -1140,6 +1141,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                 .cloned()
                                                 .unwrap_or_default();
                                             if !pool.submit(
+                                                Some(access.tree_name.clone()),
                                                 plan_gid,
                                                 key.clone(),
                                                 ft,
@@ -1386,6 +1388,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         .cloned()
                                         .unwrap_or_default();
                                     if !pool.submit(
+                                        None,
                                         gid,
                                         key.clone(),
                                         ft.to_vec(),
