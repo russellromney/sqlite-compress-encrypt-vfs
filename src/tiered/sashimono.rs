@@ -205,6 +205,11 @@ impl RootPointerV1 {
         if self.root_generation <= previous.root_generation {
             return Err(ContractError::RootRollback);
         }
+        if self.latest_delta_sequence < previous.latest_delta_sequence
+            || self.latest_database_version < previous.latest_database_version
+        {
+            return Err(ContractError::RootRollback);
+        }
         if self.lease_epoch < previous.lease_epoch {
             return Err(ContractError::StaleLeaseEpoch);
         }
@@ -722,6 +727,40 @@ mod tests {
         let err = next
             .validate_update_from(&previous)
             .expect_err("same generation is rollback");
+        assert_eq!(err, ContractError::RootRollback);
+    }
+
+    #[test]
+    fn root_update_rejects_latest_delta_sequence_rollback() {
+        let mut previous = root_fixture();
+        previous.latest_delta_sequence = 5;
+        previous.latest_database_version = 6;
+
+        let mut next = previous.clone();
+        next.root_generation += 1;
+        next.latest_delta_sequence = 4;
+
+        let err = next
+            .validate_update_from(&previous)
+            .expect_err("root generation cannot hide delta sequence rollback");
+
+        assert_eq!(err, ContractError::RootRollback);
+    }
+
+    #[test]
+    fn root_update_rejects_latest_database_version_rollback() {
+        let mut previous = root_fixture();
+        previous.latest_delta_sequence = 5;
+        previous.latest_database_version = 6;
+
+        let mut next = previous.clone();
+        next.root_generation += 1;
+        next.latest_database_version = 5;
+
+        let err = next
+            .validate_update_from(&previous)
+            .expect_err("root generation cannot hide database version rollback");
+
         assert_eq!(err, ContractError::RootRollback);
     }
 
