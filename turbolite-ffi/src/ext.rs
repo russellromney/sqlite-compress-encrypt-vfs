@@ -26,7 +26,30 @@
 //! Falls back to `AWS_ENDPOINT_URL` / `AWS_REGION` if the `TURBOLITE_` variants
 //! are not set.
 
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+extern "C" {
+    fn turbolite_c_sqlite3_turbolite_init(
+        db: *mut c_void,
+        pz_err_msg: *mut *mut c_char,
+        api: *const c_void,
+    ) -> c_int;
+}
+
+/// SQLite loadable-extension entry point.
+///
+/// The implementation lives in the C shim so it can use SQLite's extension
+/// API-table macros, but the exported symbol is Rust-owned. That keeps the
+/// cdylib export behavior consistent across macOS and Linux.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_turbolite_init(
+    db: *mut c_void,
+    pz_err_msg: *mut *mut c_char,
+    api: *const c_void,
+) -> c_int {
+    turbolite_c_sqlite3_turbolite_init(db, pz_err_msg, api)
+}
 
 static LOCAL_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static TIERED_VFS_REGISTERED: AtomicBool = AtomicBool::new(false);
