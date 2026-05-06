@@ -16,6 +16,7 @@
 //! |---|---|---|---|
 //! | `TURBOLITE_BUCKET` | yes | — | S3 bucket name (triggers S3 VFS registration) |
 //! | `TURBOLITE_PREFIX` | no | `"turbolite"` | S3 key prefix |
+//! | `TURBOLITE_DATABASE_PATH` | no | — | File-first local database image path |
 //! | `TURBOLITE_CACHE_DIR` | no | `"/tmp/turbolite"` | Local cache directory |
 //! | `TURBOLITE_ENDPOINT_URL` | no | — | Custom S3 endpoint (Tigris, MinIO) |
 //! | `TURBOLITE_REGION` | no | — | AWS region |
@@ -69,22 +70,26 @@ pub extern "C" fn turbolite_ext_register_vfs() -> std::os::raw::c_int {
 
 fn register_local() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
-    use crate::tiered::{TurboliteConfig, TurboliteVfs, StorageBackend};
+    use crate::tiered::{TurboliteConfig, TurboliteVfs};
 
     let level = std::env::var("TURBOLITE_COMPRESSION_LEVEL")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
-    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-
-    let config = TurboliteConfig {
-        storage_backend: StorageBackend::Local,
-        cache_dir,
-        compression_level: level,
-        ..Default::default()
+    let mut config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
+        Ok(db_path) => TurboliteConfig::for_database_path(db_path),
+        Err(_) => TurboliteConfig {
+            cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(".")),
+            local_data_path: std::env::var("TURBOLITE_LOCAL_DATA_PATH")
+                .map(PathBuf::from)
+                .ok(),
+            ..Default::default()
+        },
     };
+    config.compression.level = level;
+    config.compression_level = level;
     let vfs = TurboliteVfs::new(config)?;
     crate::tiered::register("turbolite", vfs)
 }
@@ -92,15 +97,12 @@ fn register_local() -> Result<(), std::io::Error> {
 #[cfg(feature = "cloud")]
 fn register_tiered() -> Result<(), std::io::Error> {
     use std::path::PathBuf;
-    use crate::tiered::{TurboliteConfig, TurboliteVfs};
+    use crate::tiered::{ManifestSource, TurboliteConfig, TurboliteVfs};
 
     let bucket = std::env::var("TURBOLITE_BUCKET")
         .expect("TURBOLITE_BUCKET must be set for tiered mode");
     let prefix = std::env::var("TURBOLITE_PREFIX")
         .unwrap_or_else(|_| "turbolite".into());
-    let cache_dir = std::env::var("TURBOLITE_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/turbolite"));
     let endpoint_url = std::env::var("TURBOLITE_ENDPOINT_URL")
         .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
         .ok();
@@ -118,19 +120,36 @@ fn register_tiered() -> Result<(), std::io::Error> {
     let read_only = std::env::var("TURBOLITE_READ_ONLY")
         .map(|s| s == "1" || s == "true")
         .unwrap_or(false);
+    let manifest_source = std::env::var("TURBOLITE_MANIFEST_SOURCE")
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "remote" | "s3" => ManifestSource::Remote,
+            _ => ManifestSource::Auto,
+        })
+        .unwrap_or(ManifestSource::Auto);
 
-    let mut config = TurboliteConfig {
-        bucket,
-        prefix,
-        cache_dir,
-        endpoint_url,
-        region,
-        compression_level,
-        read_only,
-        ..Default::default()
+    let mut config = match std::env::var("TURBOLITE_DATABASE_PATH").map(PathBuf::from) {
+        Ok(db_path) => TurboliteConfig::for_database_path(db_path),
+        Err(_) => TurboliteConfig {
+            cache_dir: std::env::var("TURBOLITE_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp/turbolite")),
+            local_data_path: std::env::var("TURBOLITE_LOCAL_DATA_PATH")
+                .map(PathBuf::from)
+                .ok(),
+            ..Default::default()
+        },
     };
+    config.bucket = bucket;
+    config.prefix = prefix;
+    config.endpoint_url = endpoint_url;
+    config.region = region;
+    config.compression.level = compression_level;
+    config.compression_level = compression_level;
+    config.read_only = read_only;
+    config.prefetch.manifest_source = manifest_source;
+    config.manifest_source = manifest_source;
     if prefetch_threads > 0 {
-        config.prefetch_threads = prefetch_threads;
+        config.prefetch.threads = prefetch_threads;
     }
 
     let vfs = TurboliteVfs::new(config)?;

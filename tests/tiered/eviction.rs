@@ -72,7 +72,7 @@ fn cold_reader(
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         read_only: true,
@@ -102,12 +102,12 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
-    let _ = TurboliteVfs::new_local(config).unwrap().destroy_s3();
+    let _ = TurboliteVfs::new_local(config).unwrap().destroy_remote();
 }
 
 // ── turbolite_evict('data'/'index'/'all') ──
@@ -332,7 +332,7 @@ fn test_warm_already_cached_is_low_submit() {
     // Warm again - should submit few/no groups
     let accesses = turbolite::tiered::parse_eqp_output("SCAN evict_data");
     let result_json = shared.warm_from_plan(&accesses);
-    let result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+    let _result: serde_json::Value = serde_json::from_str(&result_json).unwrap();
     eprintln!("warm on cached: {}", result_json);
 
     // Most groups should already be cached, so few submitted
@@ -349,10 +349,7 @@ fn test_cache_info_counters_after_cold_read() {
     let (bucket, prefix, endpoint) = write_test_data("counters");
     let (conn, shared, _cache_dir) = cold_reader(&bucket, &prefix, &endpoint, |_| {});
 
-    // Reset counters
-    shared.reset_s3_counters();
-
-    // Cold query - should cause S3 fetches and cache misses
+    // Cold query should populate the cache and register cache misses.
     let _: i64 = conn
         .query_row("SELECT COUNT(*) FROM evict_data", [], |r| r.get(0))
         .unwrap();
@@ -365,7 +362,7 @@ fn test_cache_info_counters_after_cold_read() {
 
     let size = info["size_bytes"].as_u64().unwrap();
     let groups_cached = info["groups_cached"].as_u64().unwrap();
-    let s3_gets = info["s3_gets_total"].as_u64().unwrap();
+    let misses = info["misses"].as_u64().unwrap();
 
     assert!(
         size > 0,
@@ -375,7 +372,7 @@ fn test_cache_info_counters_after_cold_read() {
         groups_cached > 0,
         "should have cached groups after cold read"
     );
-    assert!(s3_gets > 0, "should have S3 GETs after cold read");
+    assert!(misses > 0, "cold query should register cache misses");
 
     // Run same query again - should be cache hits
     let _: i64 = conn

@@ -21,6 +21,9 @@ pub struct TurboliteHandle {
     /// True when the backend is local-filesystem. Some paths differ
     /// between local and remote (e.g. no eager interior fetch in local).
     is_local: bool,
+    /// True when this handle belongs to a LocalThenFlush VFS: checkpoint
+    /// locally into staging, then publish via explicit flush_to_storage().
+    local_checkpoint_only: bool,
     cache: Option<Arc<DiskCache>>,
     /// Shared manifest via ArcSwap (lock-free reads, atomic store on writes).
     ///
@@ -188,7 +191,10 @@ impl TurboliteHandle {
         query_plan_prefetch: bool,
         max_cache_bytes: Option<u64>,
         evict_on_checkpoint: bool,
+        override_threshold: u32,
+        compaction_threshold: u32,
         is_local: bool,
+        local_checkpoint_only: bool,
         replay_gate: Arc<parking_lot::RwLock<()>>,
         replay_epoch: Arc<AtomicU64>,
     ) -> io::Result<Self> {
@@ -362,6 +368,7 @@ impl TurboliteHandle {
             storage,
             runtime,
             is_local,
+            local_checkpoint_only,
             cache: Some(cache),
             manifest: shared_manifest,
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -378,8 +385,8 @@ impl TurboliteHandle {
             dirty_since_sync: false,
             cached_generation: 0,
             gc_enabled,
-            override_threshold: 0,
-            compaction_threshold: 0,
+            override_threshold,
+            compaction_threshold,
             encryption_key,
             #[cfg(feature = "zstd")]
             encoder_dict,
@@ -417,6 +424,7 @@ impl TurboliteHandle {
             storage: None,
             runtime: None,
             is_local: true,
+            local_checkpoint_only: false,
             cache: None,
             manifest: Arc::new(ArcSwap::from_pointee(Manifest::empty())),
             dirty_page_nums: RwLock::new(HashSet::new()),
@@ -813,6 +821,7 @@ impl TurboliteHandle {
                         .cloned()
                         .unwrap_or_default();
                     if pool.submit(
+                        None,
                         gid,
                         key.clone(),
                         ft,
@@ -1138,6 +1147,7 @@ impl DatabaseHandle for TurboliteHandle {
                                                 .cloned()
                                                 .unwrap_or_default();
                                             if !pool.submit(
+                                                Some(access.tree_name.clone()),
                                                 plan_gid,
                                                 key.clone(),
                                                 ft,
@@ -1384,6 +1394,7 @@ impl DatabaseHandle for TurboliteHandle {
                                         .cloned()
                                         .unwrap_or_default();
                                     if !pool.submit(
+                                        None,
                                         gid,
                                         key.clone(),
                                         ft.to_vec(),
@@ -1779,6 +1790,32 @@ impl DatabaseHandle for TurboliteHandle {
                 }
             }
         }
+
+        if self.local_checkpoint_only && !self.is_local {
+            let page_size_u32 = self.page_size.load(Ordering::Relaxed);
+            if buf.len() != page_size_u32 as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "local-then-flush staging expects full page writes: got {} bytes, page_size={}",
+                        buf.len(),
+                        page_size_u32
+                    ),
+                ));
+            }
+            if self.staging_writer.is_none() {
+                let staging_version = self.staging_seq.fetch_add(1, Ordering::SeqCst);
+                self.staging_writer = Some(staging::StagingWriter::open(
+                    &self.staging_dir,
+                    staging_version,
+                    page_size_u32,
+                )?);
+            }
+            if let Some(writer) = self.staging_writer.as_mut() {
+                writer.append(page_num, buf)?;
+            }
+        }
+
         self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
 
@@ -1864,7 +1901,7 @@ impl DatabaseHandle for TurboliteHandle {
         // Local-checkpoint-only: record dirty group IDs, scan interior pages,
         // free in-memory dirty map, but skip S3 upload entirely.
         // Pages are already in disk cache from write_all_at().
-        if LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire) {
+        if self.local_checkpoint_only {
             let cache_arc = self
                 .cache
                 .as_ref()
@@ -2218,10 +2255,12 @@ impl DatabaseHandle for TurboliteHandle {
             }
 
             // Dual counter:
-            // - version: monotonic +1, for S3 key uniqueness
-            // - change_counter: SQLite file change counter, for walrust WAL replay
-            let next_version = self.manifest.load().version + 1;
-            let change_counter = read_change_counter_from_cache(&cache, page_size);
+            // - version: monotonic +1, for object key uniqueness
+            // - change_counter: replay cursor/floor for walrust/HADBP deltas
+            let manifest_snap_for_counter = self.manifest.load();
+            let next_version = manifest_snap_for_counter.version + 1;
+            let change_counter =
+                resolve_manifest_replay_cursor(&cache, &manifest_snap_for_counter)?;
             let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
             let mut new_keys = self.manifest.load().page_group_keys.clone();
             // Track old keys being replaced (for post-checkpoint GC)

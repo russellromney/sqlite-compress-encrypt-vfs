@@ -233,6 +233,10 @@ int32_t turbolite_bench_clear_cache(int32_t mode);
 #endif
 
 #if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int32_t turbolite_bench_flush_to_storage(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
 /**
  * Reset S3 counters. Always returns 0; counters are now backend-impl
  * specific and not exposed through the generic trait.
@@ -254,6 +258,18 @@ int64_t turbolite_bench_s3_gets(void);
  * Get S3 GET bytes. Always 0; see above.
  */
 int64_t turbolite_bench_s3_bytes(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int64_t turbolite_bench_s3_puts(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))
+int64_t turbolite_bench_s3_put_bytes(void);
+#endif
+
+#if (defined(TURBOLITE_LOADABLE_EXTENSION) && !defined(TURBOLITE_CLOUD))
+int32_t turbolite_bench_flush_to_storage(void);
 #endif
 
 #if (defined(TURBOLITE_LOADABLE_EXTENSION) && defined(TURBOLITE_CLOUD))

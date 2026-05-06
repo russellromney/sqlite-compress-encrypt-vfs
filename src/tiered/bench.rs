@@ -13,7 +13,7 @@ use super::storage as storage_helpers;
 use super::{
     cache_tracking, compact, decode_page_group, decode_page_group_seekable_full,
     decode_seekable_subchunk, encode_page_group, encode_page_group_seekable, flush, keys,
-    query_plan, read_change_counter_from_cache, staging, DiskCache, FrameEntry, GroupState,
+    query_plan, resolve_manifest_replay_cursor, staging, DiskCache, FrameEntry, GroupState,
     Manifest, PrefetchPool, SubChunkId,
 };
 
@@ -254,6 +254,26 @@ impl TurboliteSharedState {
         )
     }
 
+    /// Legacy alias for the old S3-owned API.
+    #[deprecated(since = "0.2.0", note = "use flush_to_storage")]
+    pub fn flush_to_s3(&self) -> io::Result<()> {
+        self.flush_to_storage()
+    }
+
+    /// Legacy no-op; concrete backend counters are no longer owned here.
+    pub fn reset_s3_counters(&self) {}
+
+    /// Legacy counter shim. The backend abstraction does not expose concrete
+    /// object-store counters through this shared state.
+    pub fn s3_counters(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Legacy counter shim. See [`Self::s3_counters`].
+    pub fn s3_put_counters(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Returns true if there are dirty groups or staging logs pending upload.
     pub fn has_pending_flush(&self) -> bool {
         !self.shared_dirty_groups.lock().unwrap().is_empty()
@@ -344,9 +364,7 @@ impl TurboliteSharedState {
         self.evict_tree(&csv)
     }
 
-    /// Return cache info as a JSON string. Backend counters are not
-    /// tracked at the VFS layer anymore; embedders that want those can
-    /// keep a reference to their concrete backend impl.
+    /// Return cache info as a JSON string.
     pub fn cache_info(&self) -> String {
         let manifest = self.shared_manifest.load();
         let page_size = manifest.page_size as u64;
@@ -386,30 +404,42 @@ impl TurboliteSharedState {
             0.0
         };
 
-        format!(
-            "{{\"size_bytes\":{},\"peak_bytes\":{},\"groups_cached\":{},\"groups_total\":{},\
-            \"tiers\":{{\"pinned\":{{\"chunks\":{},\"bytes\":{}}},\
-            \"index\":{{\"chunks\":{},\"bytes\":{}}},\
-            \"data\":{{\"chunks\":{},\"bytes\":{}}}}},\
-            \"hits\":{},\"misses\":{},\"hit_rate\":{:.4},\
-            \"evictions\":{},\"bytes_evicted\":{},\"last_eviction_count\":{}}}",
-            total_bytes,
-            peak_bytes,
-            groups_with_data.len(),
-            total_groups,
-            pinned_chunks,
-            pinned_bytes,
-            index_chunks,
-            index_bytes,
-            data_chunks,
-            data_bytes,
-            hits,
-            misses,
-            hit_rate,
-            evictions,
-            bytes_evicted,
-            last_eviction,
-        )
+        serde_json::json!({
+            "size_bytes": total_bytes,
+            "peak_bytes": peak_bytes,
+            "groups_cached": groups_with_data.len(),
+            "groups_total": total_groups,
+            "tiers": {
+                "pinned": { "chunks": pinned_chunks, "bytes": pinned_bytes },
+                "index": { "chunks": index_chunks, "bytes": index_bytes },
+                "data": { "chunks": data_chunks, "bytes": data_bytes },
+            },
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": hit_rate,
+            "evictions": evictions,
+            "bytes_evicted": bytes_evicted,
+            "last_eviction_count": last_eviction,
+            "prefetch": self
+                .prefetch_pool
+                .as_ref()
+                .map(|pool| pool.stats_json())
+                .unwrap_or_else(|| serde_json::json!({
+                    "in_flight": 0,
+                    "submitted": 0,
+                    "completed": 0,
+                    "skipped_state": 0,
+                    "missing_objects": 0,
+                    "fetch_errors": 0,
+                    "decode_errors": 0,
+                    "write_errors": 0,
+                    "stale_manifest": 0,
+                    "stale_replay": 0,
+                    "bytes_fetched": 0,
+                    "trees": {},
+                })),
+        })
+        .to_string()
     }
 
     /// Warm cache for a planned query.
@@ -448,6 +478,7 @@ impl TurboliteSharedState {
                             .cloned()
                             .unwrap_or_default();
                         pool.submit(
+                            Some(access.tree_name.clone()),
                             gid,
                             key.clone(),
                             ft,
@@ -516,7 +547,8 @@ impl TurboliteSharedState {
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
         let mut manifest = (**self.shared_manifest.load()).clone();
-        let next_version = read_change_counter_from_cache(&self.cache, page_size);
+        let next_version = manifest.version + 1;
+        let change_counter = resolve_manifest_replay_cursor(&self.cache, &manifest)?;
 
         for btree_info in &report.btrees {
             if !report.candidates.contains(&btree_info.name) {
@@ -657,6 +689,7 @@ impl TurboliteSharedState {
         }
 
         manifest.version = next_version;
+        manifest.change_counter = change_counter;
         manifest.build_page_index();
 
         storage_helpers::put_manifest(self.storage.as_ref(), &self.runtime, &manifest)?;

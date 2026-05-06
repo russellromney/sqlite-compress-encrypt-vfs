@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 use std::time::Duration;
 use tempfile::TempDir;
 

@@ -26,7 +26,7 @@ impl WalTestParams {
             bucket: self.bucket.clone(),
             prefix: self.prefix.clone(),
             endpoint_url: self.endpoint.clone(),
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: cache_dir.to_path_buf(),
             ..Default::default()
         };
@@ -40,7 +40,7 @@ impl WalTestParams {
             bucket: self.bucket.clone(),
             prefix: self.prefix.clone(),
             endpoint_url: self.endpoint.clone(),
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: cache_dir.to_path_buf(),
             read_only: true,
             ..Default::default()
@@ -68,7 +68,7 @@ fn import_for_wal(
             .unwrap();
         drop(conn);
     }
-    let manifest = import_sqlite_file(&config, &local_db).unwrap();
+    let manifest = import_sqlite_file_compat(&config, &local_db).unwrap();
     (params, manifest)
 }
 
@@ -76,7 +76,7 @@ fn import_for_wal(
 // Version agreement
 // ============================================================================
 
-/// manifest.version uses the file change counter, not incremental integers.
+/// Imported manifests start with the SQLite file change counter as their version.
 #[test]
 fn test_version_is_change_counter() {
     let cache_dir = tempfile::tempdir().unwrap();
@@ -121,7 +121,7 @@ fn test_version_is_change_counter() {
     }
 
     let read_cache = tempfile::tempdir().unwrap();
-    let new_manifest = turbolite::tiered::get_manifest(&params.read_config(read_cache.path()))
+    let new_manifest = get_manifest_compat(&params.read_config(read_cache.path()))
         .unwrap()
         .unwrap();
 

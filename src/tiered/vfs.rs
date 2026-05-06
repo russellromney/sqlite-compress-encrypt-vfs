@@ -38,9 +38,11 @@ pub struct TurboliteVfs {
     /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
     /// read by flush_to_storage() for non-blocking storage upload.
     shared_manifest: Arc<ArcSwap<Manifest>>,
+    /// True when this VFS checkpoints into local staging and requires an
+    /// explicit `flush_to_storage()` to publish to the backend.
+    pub(crate) local_checkpoint_only: bool,
     /// Shared pending dirty groups. Accumulated by TurboliteHandle during
-    /// local-only checkpoints, drained by flush_to_storage(). Used for the
-    /// global LOCAL_CHECKPOINT_ONLY runtime flag path.
+    /// local-only checkpoints, drained by flush_to_storage().
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     /// Pending staging log flushes. Drained by flush_to_storage() for any
     /// staging logs recovered on open from older turbolite versions.
@@ -88,19 +90,38 @@ impl TurboliteVfs {
     /// `config.cache_dir` and spins up a dedicated 2-thread tokio runtime.
     /// Use [`TurboliteVfs::with_backend`] if you want to supply a remote
     /// `StorageBackend` + reuse an existing runtime.
-    pub fn new_local(config: TurboliteConfig) -> io::Result<Self> {
+    pub fn new_local(mut config: TurboliteConfig) -> io::Result<Self> {
         let owned = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build tokio rt: {e}")))?;
         let runtime = owned.handle().clone();
+        config.apply_legacy_flat_fields();
 
-        // Ensure the cache dir exists before LocalStorage tries to write
-        // under it; LocalStorage creates parents lazily on put but we
-        // also store manifest.msgpack / dirty_groups.msgpack directly
-        // through synchronous helpers that assume the directory is there.
+        // Ensure the state dir exists before local_state/staging helpers
+        // write under it. LocalStorage creates parents lazily for backend
+        // objects, but local sidecar metadata is synchronous.
         fs::create_dir_all(&config.cache_dir)?;
+
+        #[cfg(feature = "cli-s3")]
+        if !config.bucket.is_empty() {
+            let bucket = config.bucket.clone();
+            let endpoint = config.endpoint_url.clone();
+            let prefix = config.prefix.clone();
+            let storage = owned
+                .block_on(async {
+                    hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await
+                })
+                .map_err(|e| {
+                    io::Error::new(io::ErrorKind::Other, format!("create S3 backend: {e}"))
+                })?
+                .with_prefix(prefix);
+            let storage: Arc<dyn StorageBackend> = Arc::new(storage);
+            #[cfg(feature = "bundled-sqlite")]
+            crate::install_hook::ensure_registered();
+            return Self::assemble(config, storage, runtime, Some(owned), false);
+        }
 
         let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(&config.cache_dir));
         #[cfg(feature = "bundled-sqlite")]
@@ -108,13 +129,19 @@ impl TurboliteVfs {
         Self::assemble(config, storage, runtime, Some(owned), true)
     }
 
+    /// Legacy constructor retained for the pre-hadb S3 test corpus.
+    pub fn new(config: TurboliteConfig) -> io::Result<Self> {
+        Self::new_local(config)
+    }
+
     /// Caller-supplied backend. Checkpoints upload dirty pages to the backend
     /// synchronously (full remote durability on every checkpoint).
     pub fn with_backend(
-        config: TurboliteConfig,
+        mut config: TurboliteConfig,
         backend: Arc<dyn StorageBackend>,
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
+        config.apply_legacy_flat_fields();
         fs::create_dir_all(&config.cache_dir)?;
         #[cfg(feature = "bundled-sqlite")]
         crate::install_hook::ensure_registered();
@@ -132,9 +159,12 @@ impl TurboliteVfs {
         is_local: bool,
     ) -> io::Result<Self> {
         // 1. Decide which manifest to start from.
-        //    Warm cache file wins unless it's missing, in which case we
-        //    go to the backend. Dirty groups survive independently in
-        //    `dirty_groups.msgpack`.
+        //    Warm local_state wins unless missing, in which case we go to
+        //    the backend. Dirty groups also live in local_state.
+        let local_checkpoint_only = matches!(
+            config.cache.checkpoint_mode,
+            super::CheckpointMode::LocalThenFlush
+        );
         let local_manifest = manifest::load_manifest_local(&config.cache_dir)?;
         let recovered_dirty_groups = manifest::load_dirty_groups(&config.cache_dir)?;
 
@@ -180,8 +210,13 @@ impl TurboliteVfs {
             config.cache.pages_per_group
         };
 
-        let cache = DiskCache::new_with_compression(
+        let cache_file_path = config
+            .local_data_path
+            .clone()
+            .unwrap_or_else(|| config.cache_dir.join("data.cache"));
+        let cache = DiskCache::new_with_compression_at(
             &config.cache_dir,
+            &cache_file_path,
             config.cache.ttl_secs,
             ppg,
             config.cache.sub_pages_per_frame,
@@ -334,6 +369,7 @@ impl TurboliteVfs {
             page_count,
             config,
             shared_manifest,
+            local_checkpoint_only,
             shared_dirty_groups,
             pending_flushes,
             staging_seq,
@@ -385,7 +421,7 @@ impl TurboliteVfs {
                 );
                 Ok((m, Vec::new(), false))
             }
-            ManifestSource::Remote => {
+            ManifestSource::Remote | ManifestSource::S3 => {
                 turbolite_debug!(
                     "[tiered] fetching manifest from backend (manifest_source=Remote)",
                 );
@@ -550,8 +586,7 @@ impl TurboliteVfs {
     }
 
     /// Garbage collect orphaned backend objects not referenced by the current
-    /// manifest or any snapshot manifests. Returns the number of objects
-    /// deleted.
+    /// manifest. Returns the number of objects deleted.
     pub fn gc(&self) -> io::Result<usize> {
         let manifest = storage_helpers::get_manifest(self.storage.as_ref(), &self.runtime)?
             .unwrap_or_else(Manifest::empty);
@@ -560,36 +595,6 @@ impl TurboliteVfs {
         let mut live_keys: HashSet<String> = HashSet::new();
         live_keys.insert(keys::MANIFEST_KEY.to_string());
         Self::add_manifest_keys_to_set(&manifest, &mut live_keys);
-
-        let snap_prefix = "manifest-snap-";
-        let snap_suffix = ".msgpack";
-        for key in &all_keys {
-            let filename = key.rsplit('/').next().unwrap_or(key);
-            if filename.starts_with(snap_prefix) && filename.ends_with(snap_suffix) {
-                live_keys.insert(key.clone());
-                match storage_helpers::get_manifest_at_key(
-                    self.storage.as_ref(),
-                    &self.runtime,
-                    key,
-                ) {
-                    Ok(Some(snap_manifest)) => {
-                        Self::add_manifest_keys_to_set(&snap_manifest, &mut live_keys);
-                    }
-                    Ok(None) => {
-                        turbolite_debug!(
-                            "[gc] snapshot manifest {} disappeared during gc, skipping",
-                            key,
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[gc] WARNING: failed to load snapshot manifest {}: {}. Skipping.",
-                            key, e,
-                        );
-                    }
-                }
-            }
-        }
 
         let orphans: Vec<String> = all_keys
             .into_iter()
@@ -674,12 +679,6 @@ impl TurboliteVfs {
             }
         }
         live_keys.insert(keys::MANIFEST_KEY.to_string());
-
-        for key in &all_keys {
-            if key.contains("manifest-snap-") {
-                live_keys.insert(key.clone());
-            }
-        }
 
         let orphaned: Vec<String> = all_keys.difference(&live_keys).cloned().collect();
 
@@ -821,23 +820,7 @@ impl TurboliteVfs {
         })
     }
 
-    /// Copy the current manifest to a snapshot key.
-    pub fn copy_manifest_to_snapshot(&self, snap_id: &str) -> io::Result<String> {
-        storage_helpers::copy_manifest_to_snapshot(self.storage.as_ref(), &self.runtime, snap_id)
-    }
-
-    /// Delete a snapshot manifest copy.
-    pub fn delete_snapshot_manifest(&self, snap_id: &str) -> io::Result<()> {
-        storage_helpers::delete_snapshot_manifest(self.storage.as_ref(), &self.runtime, snap_id)
-    }
-
-    /// Load a manifest from a snapshot key.
-    pub fn get_snapshot_manifest(&self, snap_id: &str) -> io::Result<Option<Manifest>> {
-        let key = keys::snapshot_manifest_key(snap_id);
-        storage_helpers::get_manifest_at_key(self.storage.as_ref(), &self.runtime, &key)
-    }
-
-    /// Seed this VFS's backend with a manifest from another source (used by fork).
+    /// Seed this VFS's backend with a manifest from another source.
     pub fn seed_manifest(&self, manifest: &Manifest) -> io::Result<()> {
         storage_helpers::put_manifest(self.storage.as_ref(), &self.runtime, manifest)?;
         manifest::persist_manifest_local(&self.config.cache_dir, manifest)?;
@@ -851,7 +834,7 @@ impl TurboliteVfs {
 
     /// Import a local SQLite file into this VFS's backend as checkpointed base state.
     ///
-    /// This is the fresh-bootstrap path for hybrid Turbolite + walrust deployments:
+    /// This is the fresh-bootstrap path for Turbolite + WAL-delta deployments:
     /// the caller already has a committed SQLite file on disk, and turbolite must
     /// publish that file as page-group base state before walrust starts shipping
     /// deltas against it.
@@ -883,6 +866,12 @@ impl TurboliteVfs {
         Ok(())
     }
 
+    /// Legacy alias for the old S3-owned API.
+    #[deprecated(since = "0.2.0", note = "use destroy_remote")]
+    pub fn destroy_s3(&self) -> io::Result<()> {
+        self.destroy_remote()
+    }
+
     /// Return a clone of the current manifest state.
     pub fn manifest(&self) -> Manifest {
         (**self.shared_manifest.load()).clone()
@@ -898,38 +887,20 @@ impl TurboliteVfs {
         super::wire::encode_pure(&m)
     }
 
-    /// Serialize the current manifest + a walrust WAL delta position.
-    /// Used by "Turbolite + walrust" deployments where turbolite holds
-    /// the page-group base state and walrust ships incremental WAL
-    /// frames since the last checkpoint.
-    pub fn manifest_bytes_with_walrust_delta(
-        &self,
-        walrust_txid: u64,
-        walrust_changeset_prefix: &str,
-    ) -> io::Result<Vec<u8>> {
-        let m = self.manifest();
-        super::wire::encode_hybrid(&m, walrust_txid, walrust_changeset_prefix)
-    }
-
-    /// Decode wire bytes produced by `manifest_bytes` /
-    /// `manifest_bytes_with_walrust_delta` and apply the resulting
-    /// manifest via `set_manifest()`. If the bytes were hybrid, returns
-    /// `Some((walrust_txid, walrust_changeset_prefix))` so the caller
-    /// can hand that delta position to walrust. Pure payloads return
-    /// `Ok(None)`.
-    pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<Option<(u64, String)>> {
-        let decoded = super::wire::decode(bytes)?;
-        self.set_manifest(decoded.manifest);
-        Ok(decoded.walrust)
+    /// Decode wire bytes produced by `manifest_bytes` and apply the resulting
+    /// page/base manifest via `set_manifest()`.
+    pub fn set_manifest_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        let manifest = super::wire::decode(bytes)?;
+        self.set_manifest(manifest);
+        Ok(())
     }
 
     /// Decode manifest wire bytes without mutating local VFS state.
     ///
     /// Useful for higher layers that need to inspect the currently published
-    /// hybrid cursor before deciding what to publish next.
-    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<(Manifest, Option<(u64, String)>)> {
-        let decoded = super::wire::decode(bytes)?;
-        Ok((decoded.manifest, decoded.walrust))
+    /// base manifest before deciding what to publish next.
+    pub fn decode_manifest_bytes(bytes: &[u8]) -> io::Result<Manifest> {
+        super::wire::decode(bytes)
     }
 
     /// Clone of the VFS-level replay gate. Higher layers (haqlite-turbolite
@@ -1044,9 +1015,72 @@ impl TurboliteVfs {
         }
     }
 
-    /// Get the path to the raw cache file (data.cache).
+    /// Get the path to the raw local database image.
     pub fn cache_file_path(&self) -> PathBuf {
-        self.config.cache_dir.join("data.cache")
+        self.cache.cache_file_path.clone()
+    }
+
+    fn local_main_db_path(&self, db: &str) -> io::Result<PathBuf> {
+        if let Some(data_path) = self.config.local_data_path.as_ref() {
+            let requested = Path::new(db);
+            let requested_has_parent = requested
+                .parent()
+                .is_some_and(|parent| parent != Path::new(""));
+            let requested_matches = if requested_has_parent || requested.is_absolute() {
+                requested == data_path
+            } else {
+                // A bare "app.db" is only unambiguous when the configured
+                // data path is also bare. If the VFS is bound to
+                // /data/app.db, callers must open that same path; basename-only
+                // matching would alias unrelated cwd-local files onto it.
+                data_path
+                    .parent()
+                    .is_none_or(|parent| parent == Path::new(""))
+                    && requested.file_name() == data_path.file_name()
+            };
+            if !requested_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "file-first Turbolite VFS is bound to {}; refusing open of {}",
+                        data_path.display(),
+                        db
+                    ),
+                ));
+            }
+            Ok(data_path.clone())
+        } else {
+            Ok(self.config.cache_dir.join(db))
+        }
+    }
+
+    fn is_file_first_main_db_name(&self, db: &str) -> bool {
+        self.config
+            .local_data_path
+            .as_ref()
+            .is_some_and(|_| self.local_main_db_path(db).is_ok())
+    }
+
+    fn is_file_first_main_db_basename(&self, db: &str) -> bool {
+        let Some(data_path) = self.config.local_data_path.as_ref() else {
+            return false;
+        };
+        Path::new(db).file_name() == data_path.file_name()
+    }
+
+    fn local_sqlite_companion_path(&self, db: &str) -> PathBuf {
+        if let Some(data_path) = self.config.local_data_path.as_ref() {
+            let name = Path::new(db)
+                .file_name()
+                .map(|name| name.to_owned())
+                .unwrap_or_else(|| db.into());
+            data_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name)
+        } else {
+            self.config.cache_dir.join(db)
+        }
     }
 
     /// Replace the local cache contents from a materialized SQLite file.
@@ -1118,6 +1152,17 @@ impl TurboliteVfs {
     ///
     /// See `crate::tiered::replay` for the full lifecycle contract.
     pub fn begin_replay(&self) -> io::Result<crate::tiered::replay::ReplayHandle> {
+        self.begin_replay_after(self.manifest().change_counter)
+    }
+
+    /// Begin a direct page replay cycle after a known durable replay cursor.
+    ///
+    /// The returned handle will only accept `current_seq + 1` as its first
+    /// committed changeset sequence.
+    pub fn begin_replay_after(
+        &self,
+        current_seq: u64,
+    ) -> io::Result<crate::tiered::replay::ReplayHandle> {
         let staging_dir = self.config.cache_dir.join("staging");
         std::fs::create_dir_all(&staging_dir)?;
         let ctx = crate::tiered::replay::ReplayContext {
@@ -1136,7 +1181,9 @@ impl TurboliteVfs {
                 guard.clone()
             },
         };
-        crate::tiered::replay::ReplayHandle::new(ctx)
+        let mut handle = crate::tiered::replay::ReplayHandle::new(ctx)?;
+        handle.set_expected_next_changeset_seq(current_seq + 1)?;
+        Ok(handle)
     }
 
     /// Test-only deterministic pause hook for `ReplayHandle::finalize`.
@@ -1157,17 +1204,12 @@ impl TurboliteVfs {
     ///
     /// Drives `flush_dirty_groups` over whatever staging logs and
     /// dirty groups have accumulated since the last flush, encodes
-    /// the resulting manifest as hybrid bytes carrying the supplied
-    /// walrust cursor, and returns those bytes for the caller to
-    /// CAS-publish under its manifest key. If no replay state is
-    /// pending, the call still returns a hybrid payload built from
-    /// the current manifest with the new cursor — that covers the
+    /// the resulting manifest as pure page/base manifest bytes, and
+    /// returns those bytes for the caller to CAS-publish under its
+    /// manifest key. If no replay state is pending, the call still
+    /// returns the current pure manifest payload — that covers the
     /// "follower already caught up before promotion" case.
-    pub fn publish_replayed_base(
-        &self,
-        walrust_seq: u64,
-        walrust_prefix: &str,
-    ) -> io::Result<Vec<u8>> {
+    pub fn publish_replayed_base(&self) -> io::Result<Vec<u8>> {
         // Drive a flush over any pending replay state. flush_to_storage
         // drains pending_flushes + shared_dirty_groups together and
         // resolves dirty groups via manifest.page_location, which
@@ -1188,10 +1230,10 @@ impl TurboliteVfs {
             self.flush_to_storage()?;
         }
         // Whether we flushed or not, the in-memory manifest is the
-        // source of truth for the published payload. Encode it with
-        // the walrust delta extension so the caller (haqlite-turbolite)
-        // can CAS it under its manifest key.
-        self.manifest_bytes_with_walrust_delta(walrust_seq, walrust_prefix)
+        // source of truth for the published payload. Delta replay is
+        // discoverable from the integration layer's configured delta
+        // storage, not encoded into the page/base manifest.
+        self.manifest_bytes()
     }
 }
 
@@ -1199,7 +1241,11 @@ impl Vfs for TurboliteVfs {
     type Handle = TurboliteHandle;
 
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        let path = self.config.cache_dir.join(db);
+        let path = if matches!(opts.kind, OpenKind::MainDb) {
+            self.local_main_db_path(db)?
+        } else {
+            self.local_sqlite_companion_path(db)
+        };
 
         if matches!(opts.kind, OpenKind::MainDb) {
             let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
@@ -1285,16 +1331,42 @@ impl Vfs for TurboliteVfs {
                 );
             }
 
-            let lock_dir = self.config.cache_dir.join("locks");
-            fs::create_dir_all(&lock_dir)?;
-            let lock_path = lock_dir.join(db);
+            let lock_path = if let Some(data_path) = self.config.local_data_path.as_ref() {
+                data_path.with_file_name(format!(
+                    "{}-lock",
+                    data_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| db.into())
+                ))
+            } else {
+                let lock_dir = self.config.cache_dir.join("locks");
+                fs::create_dir_all(&lock_dir)?;
+                lock_dir.join(db)
+            };
+            if let Some(parent) = lock_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             FsOpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(&lock_path)?;
 
             if !self.config.read_only {
-                let wal_path = self.config.cache_dir.join(format!("{}-wal", db));
+                let wal_path = if let Some(data_path) = self.config.local_data_path.as_ref() {
+                    data_path.with_file_name(format!(
+                        "{}-wal",
+                        data_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| db.into())
+                    ))
+                } else {
+                    self.config.cache_dir.join(format!("{}-wal", db))
+                };
+                if let Some(parent) = wal_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let _ = FsOpenOptions::new()
                     .create(true)
                     .write(true)
@@ -1342,7 +1414,10 @@ impl Vfs for TurboliteVfs {
                 self.config.prefetch.query_plan,
                 self.config.cache.max_bytes,
                 self.config.cache.evict_on_checkpoint,
+                self.config.cache.override_threshold,
+                self.config.cache.compaction_threshold,
                 self.is_local,
+                self.local_checkpoint_only,
                 Arc::clone(&self.replay_gate),
                 Arc::clone(&self.replay_epoch),
             )
@@ -1364,7 +1439,13 @@ impl Vfs for TurboliteVfs {
     }
 
     fn delete(&self, db: &str) -> Result<(), io::Error> {
-        let path = self.config.cache_dir.join(db);
+        if self.is_file_first_main_db_name(db) || self.is_file_first_main_db_basename(db) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("refusing to delete Turbolite main database image {db}"),
+            ));
+        }
+        let path = self.local_sqlite_companion_path(db);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1374,7 +1455,18 @@ impl Vfs for TurboliteVfs {
     }
 
     fn exists(&self, db: &str) -> Result<bool, io::Error> {
-        let path = self.config.cache_dir.join(db);
+        if self.config.local_data_path.is_some() {
+            if let Ok(path) = self.local_main_db_path(db) {
+                if path.exists() {
+                    return Ok(true);
+                }
+                return storage_helpers::manifest_exists(self.storage.as_ref(), &self.runtime);
+            }
+            if self.is_file_first_main_db_basename(db) {
+                return Ok(false);
+            }
+        }
+        let path = self.local_sqlite_companion_path(db);
         if path.exists() {
             return Ok(true);
         }

@@ -19,7 +19,7 @@ fn create_and_import(
     drop(conn);
 
     // Import to S3
-    import_sqlite_file(config, local_path).unwrap()
+    import_sqlite_file_compat(config, local_path).unwrap()
 }
 
 /// After import + VFS writes + checkpoint, new pages get valid group assignments.
@@ -53,7 +53,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
     assert!(has_posts, "should have 'posts' B-tree");
     assert!(has_idx, "should have 'idx_posts_user' B-tree");
 
-    let groups_before = manifest
+    let _groups_before = manifest
         .page_group_keys
         .iter()
         .filter(|k| !k.is_empty())
@@ -62,11 +62,9 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
     // Open via VFS, insert more rows, checkpoint
     let vfs_name = unique_vfs_name("btree_cp");
     let vfs = TurboliteVfs::new_local(config).unwrap();
-    let bench = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:local.db?vfs={}", vfs_name);
-    bench.reset_s3_counters();
     {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
@@ -92,7 +90,7 @@ fn test_checkpoint_packs_new_pages_into_btree_groups() {
             bucket,
             prefix,
             endpoint_url: endpoint,
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true,
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -152,12 +150,10 @@ fn test_write_amplification_btree_grouping() {
         .count();
 
     let vfs_name = unique_vfs_name("btree_wa");
-    let vfs = TurboliteVfs::new_local(config).unwrap();
-    let bench = vfs.shared_state();
+    let vfs = TurboliteVfs::new_local(config.clone()).unwrap();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     let db_path = format!("file:wa.db?vfs={}", vfs_name);
-    bench.reset_s3_counters();
     {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
@@ -176,15 +172,23 @@ fn test_write_amplification_btree_grouping() {
             .unwrap();
     }
 
-    let (puts, _) = bench.s3_put_counters();
+    let after = get_manifest_compat(&config)
+        .expect("fetch manifest")
+        .expect("manifest exists");
+    let rewritten_groups = manifest
+        .page_group_keys
+        .iter()
+        .zip(after.page_group_keys.iter())
+        .filter(|(before, after)| !before.is_empty() && before != after)
+        .count();
     eprintln!(
-        "[test] write amplification: {} PUTs for 50 inserts ({} total groups)",
-        puts, total_groups
+        "[test] write amplification: {} rewritten groups for 50 inserts ({} total groups)",
+        rewritten_groups, total_groups
     );
     assert!(
-        puts <= (total_groups as u64 / 2).max(4),
-        "B-tree grouping should limit dirty groups: {} PUTs vs {} total",
-        puts,
+        rewritten_groups <= (total_groups / 2).max(4),
+        "B-tree grouping should limit dirty groups: {} rewritten groups vs {} total",
+        rewritten_groups,
         total_groups
     );
 }
@@ -234,11 +238,11 @@ fn test_vacuum_produces_correct_mapping() {
     }
 
     // All pages should have valid assignments
-    let mut manifest = turbolite::tiered::get_manifest(&TurboliteConfig {
+    let mut manifest = get_manifest_compat(&TurboliteConfig {
         bucket: bucket.clone(),
         prefix: prefix.clone(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
@@ -262,7 +266,7 @@ fn test_vacuum_produces_correct_mapping() {
             bucket,
             prefix,
             endpoint_url: endpoint,
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true,
             runtime_handle: Some(super::helpers::shared_runtime_handle()),

@@ -1,8 +1,9 @@
 //! Shared helpers for tiered integration tests.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
-use turbolite::tiered::{Manifest, TurboliteConfig};
+use std::sync::{Arc, OnceLock};
+use std::{io, path::Path};
+use turbolite::tiered::{CheckpointMode, Manifest, TurboliteConfig};
 
 /// Shared tokio runtime for all integration tests.
 /// Prevents 100+ runtime creation when tests run in parallel.
@@ -29,6 +30,8 @@ pub fn manifest_from_msgpack(bytes: &[u8]) -> serde_json::Value {
 
 /// Counter for unique VFS names across tests (SQLite requires unique names).
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Counter for unique object-store prefixes across parallel test runs.
+static PREFIX_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub fn unique_vfs_name(prefix: &str) -> String {
     let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -41,9 +44,23 @@ pub fn test_bucket() -> String {
         .expect("TIERED_TEST_BUCKET env var required for tiered tests")
 }
 
-/// Get S3 endpoint URL (default: Tigris).
-pub fn endpoint_url() -> String {
-    std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "https://t3.storage.dev".to_string())
+/// Get the S3-compatible endpoint override, when the test environment supplies one.
+///
+/// Real AWS uses the provider default endpoint, so an absent value must remain
+/// `None`. Tigris/S3-compatible runs provide `AWS_ENDPOINT_URL` through soup.
+pub fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+pub fn aws_region() -> String {
+    if endpoint_url().is_some() {
+        return "auto".to_string();
+    }
+    std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string())
 }
 
 /// Storage tier: local-only (no S3) or S3-backed.
@@ -67,49 +84,13 @@ pub struct TestMode {
 }
 
 /// Deterministic test encryption key (NOT for production).
+#[cfg(feature = "encryption")]
 const TEST_ENCRYPTION_KEY: [u8; 32] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
 impl TestMode {
-    /// All 12 combinations.
-    pub fn all() -> Vec<TestMode> {
-        let mut modes = Vec::new();
-        for &storage in &[
-            StorageTier::Local,
-            StorageTier::S3Durable,
-            StorageTier::S3LocalThenFlush,
-        ] {
-            for &compressed in &[false, true] {
-                for &encrypted in &[false, true] {
-                    modes.push(TestMode {
-                        storage,
-                        compressed,
-                        encrypted,
-                    });
-                }
-            }
-        }
-        modes
-    }
-
-    /// S3 modes only (Durable + LTF). For tests that need S3.
-    pub fn s3_modes() -> Vec<TestMode> {
-        Self::all()
-            .into_iter()
-            .filter(|m| m.storage != StorageTier::Local)
-            .collect()
-    }
-
-    /// S3 Durable modes only. For tests that need cold-read from S3.
-    pub fn s3_durable_modes() -> Vec<TestMode> {
-        Self::all()
-            .into_iter()
-            .filter(|m| m.storage == StorageTier::S3Durable)
-            .collect()
-    }
-
     /// Short name for test output and unique prefixes.
     pub fn name(&self) -> String {
         let stor = match self.storage {
@@ -137,37 +118,24 @@ impl TestMode {
             StorageTier::Local => {
                 // Local mode: no S3 fields needed, test_config already sets them
                 // but we override to local-only by clearing bucket
+                config.cache.checkpoint_mode = CheckpointMode::Durable;
             }
-            StorageTier::S3Durable => {}
-            StorageTier::S3LocalThenFlush => {}
+            StorageTier::S3Durable => {
+                config.cache.checkpoint_mode = CheckpointMode::Durable;
+            }
+            StorageTier::S3LocalThenFlush => {
+                config.cache.checkpoint_mode = CheckpointMode::LocalThenFlush;
+            }
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_s3(&self) -> bool {
         self.storage != StorageTier::Local
     }
 
     pub fn supports_cold_read(&self) -> bool {
         self.storage == StorageTier::S3Durable
-    }
-}
-
-/// Macro to generate one #[test] fn per TestMode for a given test body function.
-/// Usage: `mode_tests!(test_fn_name, run_fn, modes_fn);`
-/// Run a test function across all S3 Durable mode combinations.
-/// Panics with mode name on failure.
-pub fn run_across_s3_durable(f: impl Fn(TestMode)) {
-    for mode in TestMode::s3_durable_modes() {
-        eprintln!("--- running mode: {} ---", mode.name());
-        f(mode);
-    }
-}
-
-/// Run a test function across all S3 mode combinations (Durable + LTF).
-pub fn run_across_all_s3(f: impl Fn(TestMode)) {
-    for mode in TestMode::s3_modes() {
-        eprintln!("--- running mode: {} ---", mode.name());
-        f(mode);
     }
 }
 
@@ -198,9 +166,12 @@ pub fn cold_reader_config_mode(
 
 /// Create a TurboliteConfig with a unique prefix (so tests don't collide).
 pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
+    let n = PREFIX_COUNTER.fetch_add(1, Ordering::SeqCst);
     let unique_prefix = format!(
-        "test/{}/{}",
+        "test/{}/{}-{}-{}",
         prefix,
+        std::process::id(),
+        n,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -211,8 +182,8 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig
         prefix: unique_prefix,
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 3,
-        endpoint_url: Some(endpoint_url()),
-        region: Some("auto".to_string()),
+        endpoint_url: endpoint_url(),
+        region: Some(aws_region()),
         runtime_handle: Some(shared_runtime_handle()),
         gc_enabled: false, // Async GC races with cold readers under parallel tests
         ..Default::default()
@@ -232,11 +203,58 @@ pub fn cold_reader_config(
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
     }
+}
+
+/// Build the hadb backend that replaces the old built-in S3 config path.
+pub fn backend_for_config(
+    config: &TurboliteConfig,
+) -> (
+    Arc<dyn hadb_storage::StorageBackend>,
+    tokio::runtime::Handle,
+) {
+    let runtime = config
+        .runtime_handle
+        .clone()
+        .unwrap_or_else(shared_runtime_handle);
+    let bucket = config.bucket.clone();
+    let endpoint = config.endpoint_url.clone();
+    let prefix = config.prefix.clone();
+    let storage = runtime
+        .block_on(async { hadb_storage_s3::S3Storage::from_env(bucket, endpoint.as_deref()).await })
+        .expect("create S3 storage")
+        .with_prefix(prefix);
+    (Arc::new(storage), runtime)
+}
+
+pub fn import_sqlite_file_compat(
+    config: &TurboliteConfig,
+    file_path: &Path,
+) -> io::Result<Manifest> {
+    let mut config = config.clone();
+    config.apply_legacy_flat_fields();
+    let (backend, runtime) = backend_for_config(&config);
+    turbolite::tiered::import_sqlite_file(&config, backend, runtime, file_path)
+}
+
+pub fn get_manifest_compat(config: &TurboliteConfig) -> io::Result<Option<Manifest>> {
+    let (backend, runtime) = backend_for_config(config);
+    turbolite::tiered::get_manifest(backend.as_ref(), &runtime)
+}
+
+#[cfg(feature = "encryption")]
+pub fn rotate_encryption_key_compat(
+    config: &TurboliteConfig,
+    new_key: Option<[u8; 32]>,
+) -> io::Result<()> {
+    let mut config = config.clone();
+    config.apply_legacy_flat_fields();
+    let (backend, runtime) = backend_for_config(&config);
+    turbolite::tiered::rotate_encryption_key(&config, backend, runtime, new_key)
 }
 
 /// Directly read the S3 manifest and verify it has the expected properties.
@@ -251,7 +269,7 @@ pub fn verify_s3_manifest(
     let rt = shared_runtime_handle();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -301,7 +319,7 @@ pub fn verify_s3_has_page_groups(bucket: &str, prefix: &str, endpoint: &Option<S
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -329,7 +347,7 @@ pub fn count_s3_objects(bucket: &str, prefix: &str, endpoint: &Option<String>) -
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);

@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -147,7 +146,7 @@ fn test_bitmap_clear_range_beyond_capacity() {
 #[test]
 fn test_bitmap_mark_range_zero_count() {
     let dir = TempDir::new().unwrap();
-    let mut bm = PageBitmap::new(dir.path().join("bm"));
+    let bm = PageBitmap::new(dir.path().join("bm"));
     bm.mark_range(10, 0); // no-op
     assert!(!bm.is_present(10));
 }
@@ -596,6 +595,60 @@ fn test_disk_cache_bitmap_persistence() {
     let cache2 = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
     assert!(cache2.is_present(3));
     assert!(!cache2.is_present(4));
+}
+
+#[test]
+fn test_disk_cache_persists_unified_local_state() {
+    let dir = TempDir::new().unwrap();
+    {
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+        cache.write_page(3, &vec![1u8; 64]).unwrap();
+        cache.persist_bitmap().unwrap();
+    }
+
+    assert!(dir.path().join("local_state.msgpack").exists());
+    assert!(!dir.path().join("page_bitmap").exists());
+    assert!(!dir.path().join("sub_chunk_tracker").exists());
+    assert!(!dir.path().join("cache_index.json").exists());
+
+    let state = local_state::load(dir.path()).unwrap().unwrap();
+    assert!(state.page_bitmap.is_some());
+    assert!(state.sub_chunk_tracker.is_some());
+}
+
+#[test]
+fn test_disk_cache_ignores_old_split_tracking_files() {
+    let dir = TempDir::new().unwrap();
+    let bitmap_path = dir.path().join("page_bitmap");
+    {
+        let mut bitmap = PageBitmap::new(bitmap_path);
+        bitmap.ensure_capacity(5);
+        bitmap.mark_present(5);
+        bitmap.persist().unwrap();
+    }
+    std::fs::write(dir.path().join("sub_chunk_tracker"), b"old tracker").unwrap();
+    std::fs::write(
+        dir.path().join("cache_index.json"),
+        br#"{"entries":{"5":{"offset":0,"compressed_len":64}},"next_offset":64}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("manifest.msgpack"),
+        rmp_serde::to_vec(&Manifest::empty()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dirty_groups.msgpack"),
+        rmp_serde::to_vec(&vec![0u64]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("data.cache"), vec![0u8; 64 * 8]).unwrap();
+
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    assert!(
+        !cache.is_present(5),
+        "DiskCache must not resurrect state from old split tracking files"
+    );
 }
 
 #[test]
@@ -1313,7 +1366,7 @@ fn test_evict_to_budget_shrinks_cache() {
         assert!(cache.try_claim_group(gid));
         let start = gid * 4;
         let data = vec![0xABu8; 4 * 64]; // 4 pages
-        cache.write_pages_bulk(start, &data, 4);
+        cache.write_pages_bulk(start, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1343,7 +1396,7 @@ fn test_evict_to_budget_respects_skip_groups() {
     for gid in 0..2u64 {
         assert!(cache.try_claim_group(gid));
         let data = vec![0xABu8; 4 * 64];
-        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.write_pages_bulk(gid * 4, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1371,7 +1424,7 @@ fn test_evict_to_budget_never_evicts_pinned() {
     for gid in 0..2u64 {
         assert!(cache.try_claim_group(gid));
         let data = vec![0xABu8; 4 * 64];
-        cache.write_pages_bulk(gid * 4, &data, 4);
+        cache.write_pages_bulk(gid * 4, &data, 4).unwrap();
         cache.mark_group_present(gid);
     }
 
@@ -1408,7 +1461,7 @@ fn test_evict_to_budget_already_under() {
 
     assert!(cache.try_claim_group(0));
     let data = vec![0xABu8; 4 * 64];
-    cache.write_pages_bulk(0, &data, 4);
+    cache.write_pages_bulk(0, &data, 4).unwrap();
     cache.mark_group_present(0);
 
     // Budget is larger than cache
@@ -1694,11 +1747,12 @@ fn test_compressed_corrupt_index_resets() {
         cache.persist_bitmap().unwrap();
     }
 
-    // Corrupt the index file
+    // Old split index files are ignored by the DiskCache open path.
+    std::fs::remove_file(dir.path().join("local_state.msgpack")).unwrap();
     let index_path = dir.path().join("cache_index.json");
     std::fs::write(&index_path, b"this is not valid json").unwrap();
 
-    // Re-open: should start with empty index (graceful rebuild)
+    // Re-open: should start with empty unified state.
     let cache = compressed_cache(dir.path(), 64, 16);
     // Page 0 is in bitmap but NOT in cache index, so is_present returns false
     assert!(

@@ -334,10 +334,13 @@ pub fn rotate_encryption_key(
     }
 
     // Clear local cache (simpler than re-encrypting, cache repopulates on next open)
-    let _ = std::fs::remove_file(config.cache_dir.join("data.cache"));
-    let _ = std::fs::remove_file(config.cache_dir.join("sub_chunk_tracker"));
-    let _ = std::fs::remove_file(config.cache_dir.join("page_bitmap"));
-    let _ = std::fs::remove_file(config.cache_dir.join("cache_index.json"));
+    let cache_path = config
+        .local_data_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| config.cache_dir.join("data.cache"));
+    let _ = std::fs::remove_file(cache_path);
+    let _ = std::fs::remove_file(config.cache_dir.join("local_state.msgpack"));
     turbolite_debug!("[rotate] cleared local cache");
 
     turbolite_debug!("[rotate] {} complete", mode);

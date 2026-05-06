@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
@@ -91,7 +91,7 @@ fn open_evicting_reader(
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 16,
         read_only: true,

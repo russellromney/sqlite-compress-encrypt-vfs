@@ -7,12 +7,13 @@
 //! Architecture:
 //! - turbolite page groups = snapshot (managed by sync/checkpoint)
 //! - walrust WAL shipping = incremental durability (managed by this module)
-//! - Both use SQLite's file change counter as version/txid
+//! - Turbolite manifests carry the replay cursor/floor used by walrust delta replay
 //!
 //! The replication loop starts lazily on the first MainDb open (not in VFS::new)
 //! because the WAL file path isn't known until SQLite calls open().
 
 #![cfg(feature = "wal")]
+#![allow(dead_code)]
 
 use parking_lot::Mutex;
 use std::io;

@@ -929,7 +929,7 @@ fn test_vacuum_reorganizes() {
 }
 
 /// VFS delete() must NOT destroy S3 data. Regression test for the bug where
-/// delete() called destroy_s3() unconditionally. When a connection is closed,
+/// delete() called destroy_remote() unconditionally. When a connection is closed,
 /// SQLite may call delete on WAL/journal files — this must only affect local files.
 #[test]
 fn test_delete_preserves_s3() {

@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 
 #[test]
 fn test_tiered_config_default() {
@@ -22,6 +21,24 @@ fn test_tiered_config_default() {
 fn test_tiered_config_default_pages_per_group() {
     assert_eq!(DEFAULT_PAGES_PER_GROUP, 256);
     assert_eq!(TurboliteConfig::default().cache.pages_per_group, 256);
+}
+
+#[test]
+fn file_first_config_derives_state_from_database_path() {
+    let c = TurboliteConfig::for_database_path("/tmp/example/app.db");
+    assert_eq!(
+        c.local_data_path,
+        Some(PathBuf::from("/tmp/example/app.db"))
+    );
+    assert_eq!(c.cache_dir, PathBuf::from("/tmp/example/app.db-turbolite"));
+}
+
+#[test]
+fn state_dir_for_database_path_appends_suffix_to_file_name() {
+    assert_eq!(
+        TurboliteConfig::state_dir_for_database_path("/tmp/example/app.db", "-state"),
+        PathBuf::from("/tmp/example/app.db-state")
+    );
 }
 
 // ── Serde deserialization tests ────────────────────────────────────────

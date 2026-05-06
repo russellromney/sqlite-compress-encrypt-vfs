@@ -6,7 +6,7 @@
 
 use rusqlite::{Connection, OpenFlags};
 use tempfile::TempDir;
-use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
+use turbolite::tiered::TurboliteVfs;
 
 use super::helpers::*;
 
@@ -301,14 +301,131 @@ fn run_oracle_incremental(mode: TestMode) {
     assert_eq!(integrity, "ok", "[{}] integrity failed", mode.name());
 }
 
-// --- Parameterized tests: oracle x all mode combinations ---
-
-#[test]
-fn oracle_write_checkpoint_cold_read_all_modes() {
-    run_across_all_s3(run_oracle_write_checkpoint_cold_read);
+macro_rules! oracle_case {
+    ($name:ident, $runner:ident, $storage:ident, $compressed:expr, $encrypted:expr) => {
+        #[test]
+        fn $name() {
+            $runner(TestMode {
+                storage: StorageTier::$storage,
+                compressed: $compressed,
+                encrypted: $encrypted,
+            });
+        }
+    };
 }
 
-#[test]
-fn oracle_incremental_all_modes() {
-    run_across_all_s3(run_oracle_incremental);
-}
+// --- Parameterized tests: oracle x S3 mode combinations ---
+
+oracle_case!(
+    oracle_write_checkpoint_cold_read_s3_plain,
+    run_oracle_write_checkpoint_cold_read,
+    S3Durable,
+    false,
+    false
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_s3_zstd,
+    run_oracle_write_checkpoint_cold_read,
+    S3Durable,
+    true,
+    false
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_s3_plain_enc,
+    run_oracle_write_checkpoint_cold_read,
+    S3Durable,
+    false,
+    true
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_s3_zstd_enc,
+    run_oracle_write_checkpoint_cold_read,
+    S3Durable,
+    true,
+    true
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_ltf_plain,
+    run_oracle_write_checkpoint_cold_read,
+    S3LocalThenFlush,
+    false,
+    false
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_ltf_zstd,
+    run_oracle_write_checkpoint_cold_read,
+    S3LocalThenFlush,
+    true,
+    false
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_ltf_plain_enc,
+    run_oracle_write_checkpoint_cold_read,
+    S3LocalThenFlush,
+    false,
+    true
+);
+oracle_case!(
+    oracle_write_checkpoint_cold_read_ltf_zstd_enc,
+    run_oracle_write_checkpoint_cold_read,
+    S3LocalThenFlush,
+    true,
+    true
+);
+
+oracle_case!(
+    oracle_incremental_s3_plain,
+    run_oracle_incremental,
+    S3Durable,
+    false,
+    false
+);
+oracle_case!(
+    oracle_incremental_s3_zstd,
+    run_oracle_incremental,
+    S3Durable,
+    true,
+    false
+);
+oracle_case!(
+    oracle_incremental_s3_plain_enc,
+    run_oracle_incremental,
+    S3Durable,
+    false,
+    true
+);
+oracle_case!(
+    oracle_incremental_s3_zstd_enc,
+    run_oracle_incremental,
+    S3Durable,
+    true,
+    true
+);
+oracle_case!(
+    oracle_incremental_ltf_plain,
+    run_oracle_incremental,
+    S3LocalThenFlush,
+    false,
+    false
+);
+oracle_case!(
+    oracle_incremental_ltf_zstd,
+    run_oracle_incremental,
+    S3LocalThenFlush,
+    true,
+    false
+);
+oracle_case!(
+    oracle_incremental_ltf_plain_enc,
+    run_oracle_incremental,
+    S3LocalThenFlush,
+    false,
+    true
+);
+oracle_case!(
+    oracle_incremental_ltf_zstd_enc,
+    run_oracle_incremental,
+    S3LocalThenFlush,
+    true,
+    true
+);

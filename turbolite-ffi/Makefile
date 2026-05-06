@@ -23,6 +23,11 @@ LIB_FILE := $(LIB_PREFIX)$(LIB_NAME).$(LIB_EXT)
 # directory that's two levels up.
 CARGO_TARGET_DIR ?= ../../cinch-target
 TARGET_DIR := $(CARGO_TARGET_DIR)/release
+ifeq ($(UNAME),Darwin)
+  PYTHON ?= $(shell if [ -x /opt/homebrew/bin/python3 ]; then echo /opt/homebrew/bin/python3; else echo python3; fi)
+else
+  PYTHON ?= python3
+endif
 
 # Features forwarded to cargo. Override with: make lib FEATURES="zstd,encryption"
 FEATURES ?= zstd
@@ -83,7 +88,7 @@ test: ## Run Rust-level FFI integration tests
 
 .PHONY: test-auto-ext-python
 test-auto-ext-python: ext ## Python e2e: loadable-ext + sqlite3_auto_extension
-	/opt/homebrew/bin/python3 tests/test_auto_extension_python.py
+	$(PYTHON) tests/test_auto_extension_python.py
 
 # FFI integration test matrix. Each target builds the correct cdylib
 # flavor then drives it from the language in question. The legacy
@@ -92,7 +97,7 @@ test-auto-ext-python: ext ## Python e2e: loadable-ext + sqlite3_auto_extension
 
 .PHONY: test-ext
 test-ext: ext ## Loadable extension tests from Python (requires Homebrew Python)
-	/opt/homebrew/bin/python3 tests/test_loadable_ext.py
+	$(PYTHON) tests/test_loadable_ext.py
 
 .PHONY: test-ffi
 test-ffi: ## Run all standalone-cdylib FFI tests (builds once with cli-s3 + zstd)
@@ -117,6 +122,7 @@ test-ffi-c-only:
 .PHONY: test-ffi-go-only
 test-ffi-go-only:
 	cd tests/test_ffi_go && \
+		LD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
 		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
 		go run .
@@ -151,8 +157,10 @@ test-ffi-c: lib header ## C (proves turbolite.h works)
 	$(TARGET_DIR)/test_ffi_c
 
 .PHONY: test-ffi-go
-test-ffi-go: lib ## Go cgo
+test-ffi-go: ## Go cgo (builds cli-s3 so tiered symbols are linkable)
+	$(MAKE) lib FEATURES="zstd,cli-s3"
 	cd tests/test_ffi_go && \
+		LD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
 		DYLD_LIBRARY_PATH=$(CURDIR)/$(TARGET_DIR) \
 		CGO_LDFLAGS="-L$(CURDIR)/$(TARGET_DIR) -lturbolite_ffi" \
 		go run .

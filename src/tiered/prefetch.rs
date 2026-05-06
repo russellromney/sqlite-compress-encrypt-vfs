@@ -23,6 +23,10 @@ use super::{
 
 /// A job for the prefetch thread pool.
 pub(crate) struct PrefetchJob {
+    /// Logical tree that requested this prefetch. None for demand-driven
+    /// sibling prefetches where the trigger is a page miss rather than a
+    /// planned query tree.
+    pub(crate) tree_name: Option<String>,
     pub(crate) gid: u64,
     pub(crate) key: String,
     /// Frame table for seekable format (empty = legacy single-frame format).
@@ -44,6 +48,132 @@ pub(crate) struct PrefetchJob {
     pub(crate) replay_epoch_at_submit: u64,
 }
 
+#[derive(Default, Clone)]
+struct PrefetchTreeCounters {
+    submitted: u64,
+    completed: u64,
+    skipped_state: u64,
+    missing_objects: u64,
+    fetch_errors: u64,
+    decode_errors: u64,
+    write_errors: u64,
+    stale_manifest: u64,
+    stale_replay: u64,
+    bytes_fetched: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct PrefetchMetrics {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    skipped_state: AtomicU64,
+    missing_objects: AtomicU64,
+    fetch_errors: AtomicU64,
+    decode_errors: AtomicU64,
+    write_errors: AtomicU64,
+    stale_manifest: AtomicU64,
+    stale_replay: AtomicU64,
+    bytes_fetched: AtomicU64,
+    trees: parking_lot::Mutex<HashMap<String, PrefetchTreeCounters>>,
+}
+
+impl PrefetchMetrics {
+    fn with_tree(&self, tree_name: &Option<String>, f: impl FnOnce(&mut PrefetchTreeCounters)) {
+        if let Some(tree_name) = tree_name {
+            let mut trees = self.trees.lock();
+            f(trees.entry(tree_name.clone()).or_default());
+        }
+    }
+
+    fn submitted(&self, tree_name: &Option<String>) {
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.submitted += 1);
+    }
+
+    fn completed(&self, tree_name: &Option<String>, bytes: u64) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        self.bytes_fetched.fetch_add(bytes, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| {
+            tree.completed += 1;
+            tree.bytes_fetched += bytes;
+        });
+    }
+
+    fn skipped_state(&self, tree_name: &Option<String>) {
+        self.skipped_state.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.skipped_state += 1);
+    }
+
+    fn missing_object(&self, tree_name: &Option<String>) {
+        self.missing_objects.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.missing_objects += 1);
+    }
+
+    fn fetch_error(&self, tree_name: &Option<String>) {
+        self.fetch_errors.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.fetch_errors += 1);
+    }
+
+    fn decode_error(&self, tree_name: &Option<String>) {
+        self.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.decode_errors += 1);
+    }
+
+    fn write_error(&self, tree_name: &Option<String>) {
+        self.write_errors.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.write_errors += 1);
+    }
+
+    fn stale_manifest(&self, tree_name: &Option<String>) {
+        self.stale_manifest.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.stale_manifest += 1);
+    }
+
+    fn stale_replay(&self, tree_name: &Option<String>) {
+        self.stale_replay.fetch_add(1, Ordering::Relaxed);
+        self.with_tree(tree_name, |tree| tree.stale_replay += 1);
+    }
+
+    fn snapshot_json(&self, in_flight: u64) -> serde_json::Value {
+        let trees = self.trees.lock();
+        let tree_json = trees
+            .iter()
+            .map(|(name, counters)| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "submitted": counters.submitted,
+                        "completed": counters.completed,
+                        "skipped_state": counters.skipped_state,
+                        "missing_objects": counters.missing_objects,
+                        "fetch_errors": counters.fetch_errors,
+                        "decode_errors": counters.decode_errors,
+                        "write_errors": counters.write_errors,
+                        "stale_manifest": counters.stale_manifest,
+                        "stale_replay": counters.stale_replay,
+                        "bytes_fetched": counters.bytes_fetched,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+
+        serde_json::json!({
+            "in_flight": in_flight,
+            "submitted": self.submitted.load(Ordering::Relaxed),
+            "completed": self.completed.load(Ordering::Relaxed),
+            "skipped_state": self.skipped_state.load(Ordering::Relaxed),
+            "missing_objects": self.missing_objects.load(Ordering::Relaxed),
+            "fetch_errors": self.fetch_errors.load(Ordering::Relaxed),
+            "decode_errors": self.decode_errors.load(Ordering::Relaxed),
+            "write_errors": self.write_errors.load(Ordering::Relaxed),
+            "stale_manifest": self.stale_manifest.load(Ordering::Relaxed),
+            "stale_replay": self.stale_replay.load(Ordering::Relaxed),
+            "bytes_fetched": self.bytes_fetched.load(Ordering::Relaxed),
+            "trees": tree_json,
+        })
+    }
+}
+
 /// Fixed thread pool for background page group prefetching.
 pub(crate) struct PrefetchPool {
     job_tx: flume::Sender<PrefetchJob>,
@@ -61,6 +191,7 @@ pub(crate) struct PrefetchPool {
     /// snapshot it into each `PrefetchJob`. Workers reload from the
     /// shared atomic under `replay_gate.read()` later.
     replay_epoch_at_pool: Arc<AtomicU64>,
+    metrics: Arc<PrefetchMetrics>,
 }
 
 impl PrefetchPool {
@@ -86,6 +217,7 @@ impl PrefetchPool {
         let in_flight = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(num_workers as usize);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let metrics = Arc::new(PrefetchMetrics::default());
 
         #[cfg(feature = "zstd")]
         let dictionary = dictionary.map(Arc::new);
@@ -107,6 +239,7 @@ impl PrefetchPool {
             let in_flight = Arc::clone(&in_flight);
             let replay_gate = Arc::clone(&replay_gate);
             let replay_epoch = Arc::clone(&replay_epoch);
+            let metrics = Arc::clone(&metrics);
 
             workers.push(std::thread::spawn(move || {
                 // Mark a job as finished: drop the in-flight counter (so
@@ -135,6 +268,7 @@ impl PrefetchPool {
                     let current = cache.group_state(gid);
                     if current == GroupState::None {
                         if !cache.try_claim_group(gid) {
+                            metrics.skipped_state(&job.tree_name);
                             finish(gid);
                             continue;
                         }
@@ -142,6 +276,7 @@ impl PrefetchPool {
                         if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                             turbolite_debug!("  [prefetch-skip] gid={} state={:?}", gid, current);
                         }
+                        metrics.skipped_state(&job.tree_name);
                         finish(gid);
                         continue;
                     }
@@ -156,6 +291,7 @@ impl PrefetchPool {
                                 eprintln!("[prefetch] gid={} fetch error: {}", gid, e);
                             }
                             cache.unclaim_if_fetching(gid);
+                            metrics.fetch_error(&job.tree_name);
                             finish(gid);
                             continue;
                         }
@@ -164,6 +300,7 @@ impl PrefetchPool {
 
                     let Some(pg_data) = pg_data else {
                         cache.unclaim_if_fetching(gid);
+                        metrics.missing_object(&job.tree_name);
                         finish(gid);
                         continue;
                     };
@@ -195,13 +332,14 @@ impl PrefetchPool {
                             encryption_key.as_ref().as_ref(),
                         )
                     };
-                    let (pg_count, _pg_size, page_data) = match decode_result {
+                    let (pg_count, _pg_size, mut page_data) = match decode_result {
                         Ok(v) => v,
                         Err(e) => {
                             if !shutdown.load(Ordering::Acquire) {
                                 eprintln!("[prefetch] gid={} decode error: {}", gid, e);
                             }
                             cache.unclaim_if_fetching(gid);
+                            metrics.decode_error(&job.tree_name);
                             finish(gid);
                             continue;
                         }
@@ -215,6 +353,7 @@ impl PrefetchPool {
                             gid, job.manifest_version, current_version,
                         );
                         cache.unclaim_if_fetching(gid);
+                        metrics.stale_manifest(&job.tree_name);
                         finish(gid);
                         continue;
                     }
@@ -235,8 +374,83 @@ impl PrefetchPool {
                             gid, job.replay_epoch_at_submit, current_epoch,
                         );
                         cache.unclaim_if_fetching(gid);
+                        metrics.stale_replay(&job.tree_name);
                         finish(gid);
                         continue;
+                    }
+
+                    if !job.overrides.is_empty() && job.sub_pages_per_frame > 0 {
+                        let spf = job.sub_pages_per_frame as usize;
+                        let mut override_failed = false;
+                        for (&frame_idx, ovr) in &job.overrides {
+                            let ovr_data = match block_on(&runtime, storage.get(&ovr.key)) {
+                                Ok(Some(data)) => data,
+                                Ok(None) => {
+                                    turbolite_debug!(
+                                        "[prefetch] gid={} override frame {} key '{}' not found",
+                                        gid, frame_idx, ovr.key,
+                                    );
+                                    cache.unclaim_if_fetching(gid);
+                                    metrics.missing_object(&job.tree_name);
+                                    override_failed = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch] gid={} override frame {} fetch error: {}",
+                                            gid, frame_idx, e,
+                                        );
+                                    }
+                                    cache.unclaim_if_fetching(gid);
+                                    metrics.fetch_error(&job.tree_name);
+                                    override_failed = true;
+                                    break;
+                                }
+                            };
+                            #[cfg(feature = "zstd")]
+                            let ovr_decoder = dictionary
+                                .as_deref()
+                                .map(|d| zstd::dict::DecoderDictionary::copy(d));
+                            let decompressed = match decode_seekable_subchunk(
+                                &ovr_data,
+                                #[cfg(feature = "zstd")]
+                                ovr_decoder.as_ref(),
+                                encryption_key.as_ref().as_ref(),
+                            ) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    if !shutdown.load(Ordering::Acquire) {
+                                        eprintln!(
+                                            "[prefetch] gid={} override frame {} decode error: {}",
+                                            gid, frame_idx, e,
+                                        );
+                                    }
+                                    cache.unclaim_if_fetching(gid);
+                                    metrics.decode_error(&job.tree_name);
+                                    override_failed = true;
+                                    break;
+                                }
+                            };
+                            let frame_start = frame_idx * spf;
+                            let frame_end =
+                                std::cmp::min(frame_start + spf, job.group_page_nums.len());
+                            let data_len = (frame_end - frame_start) * _pg_size as usize;
+                            let dest_start = frame_start * _pg_size as usize;
+                            let dest_end = dest_start + data_len;
+                            if data_len > decompressed.len() || dest_end > page_data.len() {
+                                cache.unclaim_if_fetching(gid);
+                                metrics.decode_error(&job.tree_name);
+                                override_failed = true;
+                                break;
+                            }
+                            page_data[dest_start..dest_end]
+                                .copy_from_slice(&decompressed[..data_len]);
+                        }
+                        if override_failed {
+                            finish(gid);
+                            continue;
+                        }
                     }
 
                     turbolite_debug!(
@@ -261,6 +475,7 @@ impl PrefetchPool {
                             eprintln!("[prefetch] gid={} write error: {}", gid, e);
                         }
                         cache.unclaim_if_fetching(gid);
+                        metrics.write_error(&job.tree_name);
                         finish(gid);
                         continue;
                     }
@@ -286,54 +501,9 @@ impl PrefetchPool {
                         }
                     }
 
-                    if !job.overrides.is_empty() && job.sub_pages_per_frame > 0 {
-                        let spf = job.sub_pages_per_frame as usize;
-                        for (&frame_idx, ovr) in &job.overrides {
-                            let ovr_data = match block_on(&runtime, storage.get(&ovr.key)) {
-                                Ok(Some(data)) => data,
-                                Ok(None) => {
-                                    turbolite_debug!(
-                                        "[prefetch] gid={} override frame {} key '{}' not found",
-                                        gid, frame_idx, ovr.key,
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    if !shutdown.load(Ordering::Acquire) {
-                                        eprintln!(
-                                            "[prefetch] gid={} override frame {} fetch error: {}",
-                                            gid, frame_idx, e,
-                                        );
-                                    }
-                                    continue;
-                                }
-                            };
-                            #[cfg(feature = "zstd")]
-                            let ovr_decoder = dictionary.as_deref().map(|d| zstd::dict::DecoderDictionary::copy(d));
-                            if let Ok(decompressed) = decode_seekable_subchunk(
-                                &ovr_data,
-                                #[cfg(feature = "zstd")]
-                                ovr_decoder.as_ref(),
-                                encryption_key.as_ref().as_ref(),
-                            ) {
-                                let frame_start = frame_idx * spf;
-                                let frame_end = std::cmp::min(frame_start + spf, job.group_page_nums.len());
-                                let frame_page_nums = &job.group_page_nums[frame_start..frame_end];
-                                let data_len = frame_page_nums.len() * _pg_size as usize;
-                                if data_len <= decompressed.len() {
-                                    let _ = cache.write_pages_scattered(
-                                        frame_page_nums,
-                                        &decompressed[..data_len],
-                                        job.gid,
-                                        frame_start as u32,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
                     cache.mark_group_present(gid);
                     cache.touch_group(gid);
+                    metrics.completed(&job.tree_name, pg_data.len() as u64);
                     if ::tracing::enabled!(target: "turbolite", ::tracing::Level::DEBUG) {
                         turbolite_debug!(
                             "  [prefetch-done] gid={} ({:.1}KB) fetch={}ms decompress={}ms write={}ms total={}ms",
@@ -355,12 +525,14 @@ impl PrefetchPool {
             workers: parking_lot::Mutex::new(workers),
             shutdown,
             replay_epoch_at_pool: replay_epoch,
+            metrics,
         }
     }
 
     /// Submit a prefetch job. Returns false if channel is closed.
     pub(crate) fn submit(
         &self,
+        tree_name: Option<String>,
         gid: u64,
         key: String,
         frame_table: Vec<FrameEntry>,
@@ -376,7 +548,9 @@ impl PrefetchPool {
         // write; if it has advanced, replay finalize ran in between
         // and the prefetch's bytes are stale.
         let replay_epoch_at_submit = self.replay_epoch_at_pool.load(Ordering::Acquire);
+        self.metrics.submitted(&tree_name);
         match self.job_tx.send(PrefetchJob {
+            tree_name,
             gid,
             key,
             frame_table,
@@ -393,6 +567,11 @@ impl PrefetchPool {
                 false
             }
         }
+    }
+
+    pub(crate) fn stats_json(&self) -> serde_json::Value {
+        self.metrics
+            .snapshot_json(self.in_flight.load(Ordering::Relaxed))
     }
 
     /// Wait until all in-flight prefetch jobs complete.
@@ -436,6 +615,32 @@ impl Drop for PrefetchPool {
         for handle in workers.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::PrefetchMetrics;
+
+    #[test]
+    fn prefetch_metrics_snapshot_includes_per_tree_counters() {
+        let metrics = PrefetchMetrics::default();
+        let tree = Some("users".to_string());
+
+        metrics.submitted(&tree);
+        metrics.completed(&tree, 4096);
+        metrics.fetch_error(&tree);
+
+        let stats = metrics.snapshot_json(1);
+        assert_eq!(stats["in_flight"], 1);
+        assert_eq!(stats["submitted"], 1);
+        assert_eq!(stats["completed"], 1);
+        assert_eq!(stats["fetch_errors"], 1);
+        assert_eq!(stats["bytes_fetched"], 4096);
+        assert_eq!(stats["trees"]["users"]["submitted"], 1);
+        assert_eq!(stats["trees"]["users"]["completed"], 1);
+        assert_eq!(stats["trees"]["users"]["fetch_errors"], 1);
+        assert_eq!(stats["trees"]["users"]["bytes_fetched"], 4096);
     }
 }
 

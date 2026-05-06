@@ -1,4 +1,4 @@
-//! Phase Gallipoli: local manifest persistence integration tests.
+//! Local manifest persistence integration tests.
 //! Tests that manifest is persisted locally, survives reconnection,
 //! and dirty groups are recovered after simulated crash.
 
@@ -6,7 +6,7 @@ use super::helpers::*;
 use tempfile::TempDir;
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-/// After checkpoint, a local manifest.msgpack should exist in cache_dir.
+/// After checkpoint, local_state.msgpack should exist in cache_dir.
 #[test]
 fn test_local_manifest_persisted_on_checkpoint() {
     let cache_dir = TempDir::new().unwrap();
@@ -36,36 +36,36 @@ fn test_local_manifest_persisted_on_checkpoint() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    // Verify local manifest exists
-    let manifest_path = cache_dir.path().join("manifest.msgpack");
+    // Verify local state exists
+    let manifest_path = cache_dir.path().join("local_state.msgpack");
     assert!(
         manifest_path.exists(),
-        "local manifest should exist after checkpoint"
+        "local_state should exist after checkpoint"
     );
 
     // Verify it's valid msgpack
     let bytes = std::fs::read(&manifest_path).unwrap();
-    assert!(!bytes.is_empty(), "manifest file should not be empty");
+    assert!(!bytes.is_empty(), "local_state file should not be empty");
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
-/// Second connection open with Auto manifest source should NOT hit S3.
+/// Second connection open with Auto manifest source should reuse local/in-memory manifest state.
 #[test]
-fn test_warm_reconnect_skips_s3() {
+fn test_warm_reconnect_uses_local_manifest_state() {
     let cache_dir = TempDir::new().unwrap();
     let config = test_config("warm_reconnect", cache_dir.path());
     let vfs_name = unique_vfs_name("warm_reconnect");
@@ -74,7 +74,6 @@ fn test_warm_reconnect_skips_s3() {
     let endpoint = config.endpoint_url.clone();
 
     let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
-    let state = vfs.shared_state();
     turbolite::tiered::register(&vfs_name, vfs).unwrap();
 
     // First connection: fetches from S3
@@ -96,9 +95,6 @@ fn test_warm_reconnect_skips_s3() {
             .unwrap();
     }
 
-    // Record S3 GET count
-    let (gets_before, _) = state.s3_counters();
-
     // Second connection: should use in-memory manifest (Auto mode)
     {
         let conn = rusqlite::Connection::open_with_flags_and_vfs(
@@ -113,26 +109,18 @@ fn test_warm_reconnect_skips_s3() {
         assert_eq!(count, 1);
     }
 
-    let (gets_after, _) = state.s3_counters();
-    // The second open should have zero S3 GETs for the manifest
-    // (some GETs may happen for page data on read, but manifest fetch is the one we're testing)
-    // We can't assert exact zero because page reads may trigger S3 fetches,
-    // but the manifest fetch is what we saved.
-    eprintln!("S3 GETs: before={}, after={}", gets_before, gets_after);
-
-    drop(state);
     let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
@@ -140,7 +128,7 @@ fn test_warm_reconnect_skips_s3() {
 #[test]
 fn test_dirty_groups_recovered_from_local_manifest() {
     let cache_dir = TempDir::new().unwrap();
-    let mut config = test_config("dirty_recovery", cache_dir.path());
+    let config = test_config("dirty_recovery", cache_dir.path());
     let vfs_name = unique_vfs_name("dirty_recovery");
     let bucket = config.bucket.clone();
     let prefix = config.prefix.clone();
@@ -150,6 +138,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     {
         let mut cfg1 = test_config("dirty_recovery_placeholder", cache_dir.path());
         cfg1.prefix = prefix.clone();
+        cfg1.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
         let vfs = TurboliteVfs::new_local(cfg1).expect("TurboliteVfs");
         let state = vfs.shared_state();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -161,7 +150,6 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         )
         .unwrap();
 
-        turbolite::tiered::set_local_checkpoint_only(true);
         conn.execute_batch(
             "PRAGMA page_size=4096;
              PRAGMA journal_mode=WAL;
@@ -181,16 +169,15 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         }
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
-        turbolite::tiered::set_local_checkpoint_only(false);
 
         assert!(
             state.has_pending_flush(),
             "should have pending dirty groups"
         );
 
-        // Verify local manifest has dirty_groups
-        let manifest_path = cache_dir.path().join("manifest.msgpack");
-        assert!(manifest_path.exists(), "local manifest should exist");
+        // Verify local_state exists to carry manifest + dirty group recovery.
+        let manifest_path = cache_dir.path().join("local_state.msgpack");
+        assert!(manifest_path.exists(), "local_state should exist");
 
         // DON'T flush - simulate crash by dropping everything
         drop(conn);
@@ -220,7 +207,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     );
 
     // Flush to S3 - should upload the recovered dirty groups
-    state2.flush_to_s3().unwrap();
+    state2.flush_to_storage().unwrap();
     assert!(
         !state2.has_pending_flush(),
         "flush should clear pending groups"
@@ -241,18 +228,18 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         bucket,
         prefix,
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }
 
-/// Durable mode local manifest has no dirty groups.
+/// Durable mode persists local_state without pending dirty groups.
 #[test]
 fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     let cache_dir = TempDir::new().unwrap();
@@ -282,12 +269,12 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    // Verify local manifest exists and is valid msgpack
-    let manifest_path = cache_dir.path().join("manifest.msgpack");
+    // Verify local_state exists and is valid msgpack
+    let manifest_path = cache_dir.path().join("local_state.msgpack");
     let bytes = std::fs::read(&manifest_path).unwrap();
     assert!(
         !bytes.is_empty(),
-        "local manifest should be non-empty after Durable checkpoint"
+        "local_state should be non-empty after Durable checkpoint"
     );
 
     drop(conn);
@@ -295,13 +282,13 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
     TurboliteVfs::new_local(cleanup_config)
         .unwrap()
-        .destroy_s3()
+        .destroy_remote()
         .unwrap();
 }

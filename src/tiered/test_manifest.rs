@@ -1,5 +1,4 @@
 use super::*;
-use crate::tiered::*;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

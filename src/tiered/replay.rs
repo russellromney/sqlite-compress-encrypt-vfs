@@ -1,4 +1,4 @@
-//! Direct hybrid page replay handle.
+//! Direct page replay handle.
 //!
 //! Lets a caller feed decoded physical pages (from an external WAL
 //! delta source) straight into Turbolite without staging through a
@@ -136,7 +136,7 @@ fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> Roll
     }
 }
 
-/// Extend a manifest for replay-driven growth.
+/// Move a manifest to replay's explicit target page count.
 ///
 /// Branches on strategy because the two encodings have incompatible
 /// invariants:
@@ -147,18 +147,45 @@ fn rollback_pre_images(cache: &DiskCache, pre_images: &[(u64, Vec<u8>)]) -> Roll
 ///   `build_page_index` auto-detects "non-empty `group_pages`" and
 ///   flips strategy to `BTreeAware` (`manifest.rs:308-310`), which
 ///   would leave existing pages unindexed and break their resolution.
-/// - **BTreeAware**: `group_pages` is the source of truth. Append new
-///   page numbers `[old_page_count..new_page_count)` to the last
-///   existing group up to `pages_per_group`, then create new groups
-///   at the end. Rebuild `page_index`. `flush_dirty_groups` extends
-///   `page_group_keys` for new groups (`flush.rs:396-404`). Imported
-///   databases reach here because `import_sqlite_file` produces BTreeAware
-///   manifests.
-fn extend_for_growth(manifest: &mut Manifest, old_page_count: u64, new_page_count: u64) {
+/// - **BTreeAware**: `group_pages` is the source of truth. Shrink trims
+///   pages at or past `new_page_count`; growth appends page numbers
+///   `[old_page_count..new_page_count)` to the last existing group up to
+///   `pages_per_group`, then creates new groups at the end. Rebuild
+///   `page_index`. `flush_dirty_groups` extends `page_group_keys` for new
+///   groups (`flush.rs:396-404`). Imported databases reach here because
+///   `import_sqlite_file` produces BTreeAware manifests.
+fn set_replay_page_count(manifest: &mut Manifest, old_page_count: u64, new_page_count: u64) {
     use crate::tiered::config::GroupingStrategy;
 
     if new_page_count <= old_page_count {
         manifest.page_count = new_page_count;
+        if manifest.strategy == GroupingStrategy::BTreeAware {
+            let old_group_pages = std::mem::take(&mut manifest.group_pages);
+            let old_keys = std::mem::take(&mut manifest.page_group_keys);
+            let old_frames = std::mem::take(&mut manifest.frame_tables);
+            let old_overrides = std::mem::take(&mut manifest.subframe_overrides);
+
+            let mut new_group_pages = Vec::new();
+            let mut new_keys = Vec::new();
+            let mut new_frames = Vec::new();
+            let mut new_overrides = Vec::new();
+
+            for (idx, mut group) in old_group_pages.into_iter().enumerate() {
+                group.retain(|page| *page < new_page_count);
+                if group.is_empty() {
+                    continue;
+                }
+                new_group_pages.push(group);
+                new_keys.push(old_keys.get(idx).cloned().unwrap_or_default());
+                new_frames.push(old_frames.get(idx).cloned().unwrap_or_default());
+                new_overrides.push(old_overrides.get(idx).cloned().unwrap_or_default());
+            }
+            manifest.group_pages = new_group_pages;
+            manifest.page_group_keys = new_keys;
+            manifest.frame_tables = new_frames;
+            manifest.subframe_overrides = new_overrides;
+            manifest.build_page_index();
+        }
         return;
     }
 
@@ -263,12 +290,21 @@ pub struct ReplayHandle {
     ctx: ReplayContext,
     /// Turbolite zero-based page num -> page bytes.
     staged: BTreeMap<u64, Vec<u8>>,
+    /// Explicit end database page count from the delta stream, when known.
+    /// Required for shrink/truncation replay because changed pages alone
+    /// can only prove growth.
+    target_page_count: Option<u64>,
     /// Highest `sqlite_page_id` observed via `apply_page`. Used to
     /// detect database growth at finalize time.
     max_sqlite_page_id: u32,
     /// Sequence numbers of changesets whose pages have been observed
     /// in their entirety and committed by the driver.
     committed_seqs: Vec<u64>,
+    /// Next changeset sequence this replay handle will accept. Defaults
+    /// to 1 so the primitive fails closed on skipped initial sequences;
+    /// integration layers resuming from a later cursor must set this
+    /// explicitly before committing changesets.
+    expected_next_seq: u64,
     /// Page size pinned at `begin_replay` from the live manifest. All
     /// `apply_page` calls must match this size; mismatch is rejected
     /// as `InvalidData`.
@@ -291,8 +327,10 @@ impl ReplayHandle {
         Ok(Self {
             ctx,
             staged: BTreeMap::new(),
+            target_page_count: None,
             max_sqlite_page_id: 0,
             committed_seqs: Vec::new(),
+            expected_next_seq: 1,
             page_size,
             consumed: false,
         })
@@ -337,12 +375,54 @@ impl ReplayHandle {
         Ok(())
     }
 
+    /// Set the database page count after this replay batch. Drivers should
+    /// call this when their delta format carries an end page count, for
+    /// example SQLite's WAL commit db-size or page 1 database header.
+    pub fn set_target_page_count(&mut self, page_count: u64) -> io::Result<()> {
+        self.check_not_consumed("set_target_page_count")?;
+        self.target_page_count = Some(page_count);
+        Ok(())
+    }
+
+    /// Set the first changeset sequence expected by this handle.
+    ///
+    /// Direct replay must be driven from a caller's durable replay cursor. The
+    /// handle enforces the cursor locally instead of accepting an arbitrary
+    /// first sequence and only checking gaps after that.
+    pub fn set_expected_next_changeset_seq(&mut self, next_seq: u64) -> io::Result<()> {
+        self.check_not_consumed("set_expected_next_changeset_seq")?;
+        if !self.committed_seqs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set_expected_next_changeset_seq must be called before commit_changeset",
+            ));
+        }
+        if next_seq == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "changeset sequences are 1-based; expected next sequence cannot be 0",
+            ));
+        }
+        self.expected_next_seq = next_seq;
+        Ok(())
+    }
+
     /// Mark a changeset as fully observed. Called by the driver after
     /// every `apply_page` for that changeset succeeded. Pure
     /// telemetry: no side effects on the cache.
     pub fn commit_changeset(&mut self, seq: u64) -> io::Result<()> {
         self.check_not_consumed("commit_changeset")?;
+        if seq != self.expected_next_seq {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "commit_changeset: non-contiguous sequence {seq}; expected {}",
+                    self.expected_next_seq
+                ),
+            ));
+        }
         self.committed_seqs.push(seq);
+        self.expected_next_seq += 1;
         Ok(())
     }
 
@@ -388,9 +468,9 @@ impl ReplayHandle {
     /// Atomicity scope: per-page pwrite is OS-atomic; mid-batch
     /// failure is hidden from readers either by the bitmap gate
     /// (newly-allocated pages) or by pre-image rollback (overwrites
-    /// of already-present pages). Inter-page atomicity for in-flight
-    /// SQLite read transactions requires a separate xLock-scoped
-    /// gate not yet wired here.
+    /// of already-present pages). The replay gate below blocks
+    /// in-flight SQLite read transactions across the commit phase so
+    /// readers see either the pre-replay or post-replay snapshot.
     pub fn finalize(self) -> io::Result<FinalizeReport> {
         self.finalize_inner(/* external_write_held = */ false)
     }
@@ -420,9 +500,21 @@ impl ReplayHandle {
         // 1. Snapshot pre-state. Validate growth precondition.
         let pre_manifest = (**self.ctx.shared_manifest.load()).clone();
         let pre_page_count = pre_manifest.page_count;
-        let new_page_count = std::cmp::max(pre_page_count, self.max_sqlite_page_id as u64);
+        let max_replayed_page = self.max_sqlite_page_id as u64;
+        let new_page_count = self
+            .target_page_count
+            .unwrap_or_else(|| std::cmp::max(pre_page_count, max_replayed_page));
+        if new_page_count < max_replayed_page {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "replay finalize: target_page_count={} is smaller than replayed sqlite page id {}",
+                    new_page_count, max_replayed_page
+                ),
+            ));
+        }
 
-        if self.staged.is_empty() {
+        if self.staged.is_empty() && new_page_count == pre_page_count {
             // Empty cycle. Caller may still publish a manifest with
             // an advanced cursor for the no-pending-state case.
             return Ok(FinalizeReport {
@@ -439,7 +531,7 @@ impl ReplayHandle {
         //    publish it atomically in step 6.
         let mut post_manifest = pre_manifest.clone();
         if new_page_count != pre_page_count {
-            extend_for_growth(&mut post_manifest, pre_page_count, new_page_count);
+            set_replay_page_count(&mut post_manifest, pre_page_count, new_page_count);
         }
         if let Some(page0) = self.staged.get(&0) {
             // sqlite_page_id 1 -> turbolite page 0 carries the SQLite
@@ -458,6 +550,9 @@ impl ReplayHandle {
         // group_pages, page_index, and db_header changes are
         // adopted along with the page bytes.
         post_manifest.version = pre_manifest.version + 1;
+        if let Some(seq) = self.committed_seqs.iter().copied().max() {
+            post_manifest.change_counter = post_manifest.change_counter.max(seq);
+        }
 
         // 3. Pre-flight the staging log to disk. This is the most
         //    fallible part of the operation; doing it before any live
@@ -606,6 +701,11 @@ impl ReplayHandle {
         //    the new disk bytes.
         self.ctx.cache.clear_pages_from_mem_cache(&written);
         self.ctx.cache.mark_pages_present(&written);
+        if new_page_count < pre_page_count {
+            self.ctx
+                .cache
+                .truncate_to_page_count(new_page_count, self.page_size)?;
+        }
         self.ctx.cache.bump_generation();
 
         // 6. Publish the post-replay manifest atomically. ArcSwap is
@@ -808,7 +908,10 @@ mod tests {
             ..Default::default()
         };
         let vfs = TurboliteVfs::new_local(config).expect("local VFS");
-        let manifest = vfs.import_sqlite_file(&seed_path).expect("import");
+        let mut manifest = vfs.import_sqlite_file(&seed_path).expect("import");
+        manifest.version += 1;
+        manifest.change_counter = 0;
+        vfs.set_manifest(manifest.clone());
         let page_size = manifest.page_size;
         assert!(
             page_size >= 4096,
@@ -931,6 +1034,33 @@ mod tests {
         );
     }
 
+    /// Replay commit sequence is the durable substrate cursor for
+    /// direct page replay. It must be promoted into the base manifest
+    /// even when the replayed changeset does not include SQLite page
+    /// 1, otherwise a later opener would replay already-absorbed
+    /// deltas.
+    #[test]
+    fn finalize_promotes_committed_seq_to_manifest_change_counter() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let pre_change_counter = vfs.manifest().change_counter;
+        let seq = pre_change_counter + 100;
+        let payload = vec![0x88u8; page_size as usize];
+
+        let mut handle = vfs.begin_replay_after(seq - 1).unwrap();
+        handle.apply_page(2, &payload).unwrap();
+        handle.commit_changeset(seq).unwrap();
+        handle.finalize().unwrap();
+
+        assert_eq!(vfs.manifest().change_counter, seq);
+
+        let bytes = vfs
+            .publish_replayed_base()
+            .expect("publish replayed base after cursor promotion");
+        let published = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
+        assert_eq!(published.change_counter, seq);
+    }
+
     /// Two replay cycles back-to-back without an intervening publish
     /// each emit their own staging log; both stay pending until
     /// flush. Accumulated state across cycles must survive until
@@ -948,7 +1078,7 @@ mod tests {
         h1.commit_changeset(1).unwrap();
         h1.finalize().unwrap();
 
-        let mut h2 = vfs.begin_replay().unwrap();
+        let mut h2 = vfs.begin_replay_after(1).unwrap();
         h2.apply_page(2, &payload_b).unwrap();
         h2.commit_changeset(2).unwrap();
         h2.finalize().unwrap();
@@ -1079,7 +1209,7 @@ mod tests {
         // Now replay a page other than page 1; db_header must stay
         // identical.
         let payload = vec![0x55u8; page_size as usize];
-        let mut h1 = vfs.begin_replay().unwrap();
+        let mut h1 = vfs.begin_replay_after(1).unwrap();
         h1.apply_page(2, &payload).unwrap();
         h1.commit_changeset(2).unwrap();
         h1.finalize().unwrap();
@@ -1140,6 +1270,121 @@ mod tests {
                 new_top_sqlite_id
             );
         }
+    }
+
+    #[test]
+    fn finalize_uses_explicit_target_page_count_for_shrink() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 8);
+        let pre_page_count = vfs.manifest().page_count;
+        assert!(pre_page_count >= 8);
+
+        let mut page0 = vec![0u8; page_size as usize];
+        page0[0..16].copy_from_slice(b"SQLite format 3\0");
+        page0[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        page0[28..32].copy_from_slice(&(4u32).to_be_bytes());
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &page0).unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let report = handle.finalize().unwrap();
+
+        let post = vfs.manifest();
+        assert_eq!(report.new_page_count, 4);
+        assert_eq!(post.page_count, 4);
+        assert!(post.page_location(3).is_some());
+        assert!(post.page_location(4).is_none());
+    }
+
+    #[test]
+    fn finalize_pure_shrink_publishes_and_truncates_cache_file() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 8);
+        let pre_page_count = vfs.manifest().page_count;
+        assert!(pre_page_count > 4);
+        vfs_cache(&vfs)
+            .write_page(pre_page_count - 1, &vec![0xAA; page_size as usize])
+            .unwrap();
+        let pre_len = std::fs::metadata(vfs.cache_file_path()).unwrap().len();
+        assert!(pre_len >= pre_page_count * page_size as u64);
+        let stale_sub_chunk = {
+            let cache = vfs_cache(&vfs);
+            let mut tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(4);
+            tracker.mark_present(id, crate::tiered::SubChunkTier::Data);
+            assert!(tracker.is_sub_chunk_present(&id));
+            id
+        };
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let report = handle.finalize().unwrap();
+
+        let post = vfs.manifest();
+        assert_eq!(report.new_page_count, 4);
+        assert_eq!(post.page_count, 4);
+        assert_eq!(
+            std::fs::metadata(vfs.cache_file_path()).unwrap().len(),
+            4 * page_size as u64
+        );
+        assert!(!vfs_cache(&vfs).is_present(4));
+        assert!(
+            !vfs_cache(&vfs)
+                .tracker
+                .lock()
+                .is_sub_chunk_present(&stale_sub_chunk),
+            "shrink must prune tracker state for sub-chunks beyond the new page count"
+        );
+    }
+
+    #[test]
+    fn finalize_rejects_non_contiguous_changeset_sequences() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &payload).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let err = handle.commit_changeset(3).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("non-contiguous"));
+    }
+
+    #[test]
+    fn finalize_rejects_skipped_initial_changeset_sequence() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &payload).unwrap();
+        let err = handle.commit_changeset(3).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("expected 1"));
+    }
+
+    #[test]
+    fn finalize_rejects_target_page_count_below_replayed_page() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(5, &payload).unwrap();
+        handle.set_target_page_count(4).unwrap();
+        handle.commit_changeset(1).unwrap();
+        let err = handle.finalize().unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("target_page_count=4"),
+            "unexpected error: {err}"
+        );
     }
 
     /// A finalize whose pre-flight (the staging-log write) fails
@@ -1310,7 +1555,7 @@ mod tests {
     /// `page_location` because they were never inserted into
     /// `page_index`.
     #[test]
-    fn extend_for_growth_positional_does_not_flip_to_btreeaware() {
+    fn set_replay_page_count_positional_growth_does_not_flip_to_btreeaware() {
         use crate::tiered::config::GroupingStrategy;
         use crate::tiered::manifest::Manifest;
 
@@ -1322,7 +1567,7 @@ mod tests {
         // Critically: positional manifests have empty group_pages.
         assert!(manifest.group_pages.is_empty());
 
-        extend_for_growth(&mut manifest, 4, 10);
+        set_replay_page_count(&mut manifest, 4, 10);
 
         assert_eq!(manifest.page_count, 10);
         assert_eq!(
@@ -1341,6 +1586,27 @@ mod tests {
                 "positional page_location({p}) must resolve after growth"
             );
         }
+    }
+
+    #[test]
+    fn set_replay_page_count_btreeaware_shrink_trims_group_pages_and_index() {
+        use crate::tiered::config::GroupingStrategy;
+        use crate::tiered::manifest::Manifest;
+
+        let mut manifest = Manifest::empty();
+        manifest.strategy = GroupingStrategy::BTreeAware;
+        manifest.page_count = 8;
+        manifest.page_size = 4096;
+        manifest.pages_per_group = 4;
+        manifest.group_pages = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+        manifest.build_page_index();
+
+        set_replay_page_count(&mut manifest, 8, 5);
+
+        assert_eq!(manifest.page_count, 5);
+        assert_eq!(manifest.group_pages, vec![vec![0, 1, 2, 3], vec![4]]);
+        assert!(manifest.page_location(4).is_some());
+        assert!(manifest.page_location(5).is_none());
     }
 
     /// Atomicity contract for overwrites of already-present pages.
@@ -1582,7 +1848,10 @@ mod tests {
                 ..Default::default()
             };
             let vfs = TurboliteVfs::new_local(config).unwrap();
-            let manifest = vfs.import_sqlite_file(&seed_path).unwrap();
+            let mut manifest = vfs.import_sqlite_file(&seed_path).unwrap();
+            manifest.version += 1;
+            manifest.change_counter = 0;
+            vfs.set_manifest(manifest.clone());
             let page_size = manifest.page_size;
             let cache = vfs_cache(&vfs);
 
@@ -2297,21 +2566,16 @@ mod tests {
         assert_eq!(buf, bytes, "install closure's bytes must land on disk");
     }
 
-    /// `publish_replayed_base` returns hybrid manifest bytes that
-    /// round-trip through `decode_manifest_bytes` and carry the
-    /// supplied walrust cursor and prefix.
+    /// `publish_replayed_base` returns pure page/base manifest bytes.
     #[test]
-    fn publish_replayed_base_round_trips_walrust_delta_when_no_pending_state() {
+    fn publish_replayed_base_round_trips_pure_manifest_when_no_pending_state() {
         let tmp = TempDir::new().unwrap();
         let (vfs, _page_size) = fresh_vfs_with_pages(&tmp, 4);
 
         let bytes = vfs
-            .publish_replayed_base(42, "test-prefix/")
+            .publish_replayed_base()
             .expect("publish_replayed_base on empty pending state");
-        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode round-trip");
-        let (seq, prefix) = walrust.expect("walrust delta extension must be present");
-        assert_eq!(seq, 42);
-        assert_eq!(prefix, "test-prefix/");
+        let m = TurboliteVfs::decode_manifest_bytes(&bytes).expect("decode round-trip");
         assert!(
             m.page_count > 0,
             "manifest must carry a real page count from the import-seeded fixture"
@@ -2324,8 +2588,7 @@ mod tests {
     /// for every replayed group is encoded by the flush primitive,
     /// not by this test directly; here we assert the simpler shape
     /// invariant: the published manifest version >= the post-finalize
-    /// manifest version, page_count covers the replayed pages, and
-    /// the returned bytes carry the supplied walrust cursor.
+    /// manifest version, and page_count covers the replayed pages.
     #[test]
     fn publish_replayed_base_after_replay_carries_post_replay_state() {
         let tmp = TempDir::new().unwrap();
@@ -2335,7 +2598,7 @@ mod tests {
         cache.write_page(0, &pre_replay).unwrap();
 
         let new_bytes = vec![0xBBu8; page_size as usize];
-        let mut handle = vfs.begin_replay().unwrap();
+        let mut handle = vfs.begin_replay_after(6).unwrap();
         handle.apply_page(1, &new_bytes).unwrap();
         handle.commit_changeset(7).unwrap();
         handle.finalize().unwrap();
@@ -2346,12 +2609,9 @@ mod tests {
         // no-op upload-wise but still bumps the manifest. Tests for
         // remote-mode flush behaviour live in flush.rs's own suite.
         let bytes = vfs
-            .publish_replayed_base(13, "p/")
+            .publish_replayed_base()
             .expect("publish_replayed_base after replay");
-        let (m, walrust) = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
-        let (seq, prefix) = walrust.expect("walrust extension");
-        assert_eq!(seq, 13);
-        assert_eq!(prefix, "p/");
+        let m = TurboliteVfs::decode_manifest_bytes(&bytes).unwrap();
         assert!(
             m.version >= post_finalize_version,
             "published manifest version must be >= post-finalize version (post={post_finalize_version}, published={})",

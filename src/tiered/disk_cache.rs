@@ -23,10 +23,12 @@ pub(crate) struct CacheIndex {
     /// Next append offset in the compressed cache file.
     pub(crate) next_offset: u64,
     /// Path for persistence.
+    #[allow(dead_code)] // direct CacheIndex unit tests exercise file-level persistence
     pub(crate) path: PathBuf,
 }
 
 impl CacheIndex {
+    #[cfg(test)]
     pub(crate) fn new(path: PathBuf) -> Self {
         match Self::load_from_disk(&path) {
             Some(idx) => idx,
@@ -35,6 +37,24 @@ impl CacheIndex {
                 next_offset: 0,
                 path,
             },
+        }
+    }
+
+    pub(crate) fn new_with_state(
+        path: PathBuf,
+        state: Option<local_state::CacheIndexState>,
+    ) -> Self {
+        if let Some(state) = state {
+            return Self {
+                entries: state.entries,
+                next_offset: state.next_offset,
+                path,
+            };
+        }
+        Self {
+            entries: HashMap::new(),
+            next_offset: 0,
+            path,
         }
     }
 
@@ -90,6 +110,7 @@ impl CacheIndex {
     }
 
     /// Persist index to disk (atomic tmp+rename).
+    #[cfg(test)]
     pub(crate) fn persist(&self) -> io::Result<()> {
         let data = serde_json::to_vec(&PersistableCacheIndex {
             entries: &self.entries,
@@ -107,7 +128,15 @@ impl CacheIndex {
         Ok(())
     }
 
+    pub(crate) fn to_state(&self) -> local_state::CacheIndexState {
+        local_state::CacheIndexState {
+            entries: self.entries.clone(),
+            next_offset: self.next_offset,
+        }
+    }
+
     /// Load index from disk. Returns None if missing or corrupt.
+    #[cfg(test)]
     fn load_from_disk(path: &Path) -> Option<Self> {
         let data = fs::read(path).ok()?;
         let parsed: LoadableCacheIndex = serde_json::from_slice(&data).ok()?;
@@ -119,12 +148,14 @@ impl CacheIndex {
     }
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct PersistableCacheIndex<'a> {
     entries: &'a HashMap<u64, CacheIndexEntry>,
     next_offset: u64,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct LoadableCacheIndex {
     entries: HashMap<u64, CacheIndexEntry>,
@@ -143,6 +174,8 @@ struct LoadableCacheIndex {
 pub(crate) struct DiskCache {
     #[allow(dead_code)] // retained for debugging
     pub(crate) cache_dir: PathBuf,
+    /// Path to the local main database image.
+    pub(crate) cache_file_path: PathBuf,
     /// Local cache file — uncompressed pages at offset page_num * page_size.
     /// pread/pwrite are thread-safe on Unix, no lock needed for I/O.
     /// Only set_len (extending) is serialized via cache_file_extend.
@@ -299,14 +332,50 @@ impl DiskCache {
         #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
         mem_cache_budget: u64,
     ) -> io::Result<Self> {
-        fs::create_dir_all(cache_dir)?;
+        Self::new_with_compression_at(
+            cache_dir,
+            &cache_dir.join("data.cache"),
+            ttl_secs,
+            pages_per_group,
+            sub_pages_per_frame,
+            page_size,
+            page_count,
+            encryption_key,
+            group_pages,
+            cache_compression,
+            cache_compression_level,
+            #[cfg(feature = "zstd")]
+            dictionary,
+            mem_cache_budget,
+        )
+    }
 
-        let cache_file_path = cache_dir.join("data.cache");
+    pub(crate) fn new_with_compression_at(
+        cache_dir: &Path,
+        cache_file_path: &Path,
+        ttl_secs: u64,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        page_size: u32,
+        page_count: u64,
+        encryption_key: Option<[u8; 32]>,
+        group_pages: Vec<Vec<u64>>,
+        cache_compression: bool,
+        cache_compression_level: i32,
+        #[cfg(feature = "zstd")] dictionary: Option<Vec<u8>>,
+        mem_cache_budget: u64,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(cache_dir)?;
+        if let Some(parent) = cache_file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
         let cache_file = FsOpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(&cache_file_path)?;
+            .open(cache_file_path)?;
+        let cache_file_was_empty = cache_file.metadata()?.len() == 0;
 
         // For uncompressed mode: extend to full size (sparse file).
         // For compressed mode: the file grows via append, no pre-allocation needed.
@@ -318,9 +387,16 @@ impl DiskCache {
             }
         }
 
+        let local_state = local_state::load(cache_dir)?;
+
         // Load or create compressed cache index
         let index_path = cache_dir.join("cache_index.json");
-        let mut cache_index = CacheIndex::new(index_path);
+        let mut cache_index = CacheIndex::new_with_state(
+            index_path,
+            local_state
+                .as_ref()
+                .and_then(|state| state.cache_index.clone()),
+        );
 
         // If compression mode changed (index exists but compression off, or vice versa),
         // or if index is present but cache file is empty/missing, reset both.
@@ -344,25 +420,42 @@ impl DiskCache {
             pages_per_group
         };
         let tracker_path = cache_dir.join("sub_chunk_tracker");
+        let tracker_state = local_state
+            .as_ref()
+            .and_then(|state| state.sub_chunk_tracker.clone());
         #[cfg(feature = "encryption")]
         let mut tracker = if encryption_key.is_some() {
             SubChunkTracker::new_encrypted(tracker_path, pages_per_group, spf, encryption_key)
         } else {
-            SubChunkTracker::new(tracker_path, pages_per_group, spf)
+            SubChunkTracker::new_with_state(tracker_path, pages_per_group, spf, tracker_state)
         };
         #[cfg(not(feature = "encryption"))]
-        let mut tracker = SubChunkTracker::new(tracker_path, pages_per_group, spf);
+        let mut tracker =
+            SubChunkTracker::new_with_state(tracker_path, pages_per_group, spf, tracker_state);
 
         // Set sub-chunk byte size if page_size is known at construction
         if page_size > 0 && spf > 0 {
             tracker.set_sub_chunk_byte_size(spf as u64 * page_size as u64);
         }
 
-        // Legacy bitmap (kept for backward compat during migration)
+        // Bitmap/tracker/index state comes only from local_state in the
+        // DiskCache product path. The path-bearing helper structs keep their
+        // old unit-level persistence helpers, but DiskCache no longer treats
+        // those split files as migration inputs.
         let bitmap_path = cache_dir.join("page_bitmap");
-        let mut bitmap = PageBitmap::new(bitmap_path);
+        let mut bitmap = PageBitmap::new_with_state(
+            bitmap_path,
+            local_state
+                .as_ref()
+                .and_then(|state| state.page_bitmap.clone()),
+        );
         if page_count > 0 {
             bitmap.resize(page_count);
+        }
+        if cache_file_was_empty {
+            bitmap.clear_all();
+            tracker.clear_all();
+            cache_index.clear();
         }
 
         let total_groups = if pages_per_group > 0 && page_count > 0 {
@@ -402,6 +495,7 @@ impl DiskCache {
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
+            cache_file_path: cache_file_path.to_path_buf(),
             cache_file_len: std::sync::atomic::AtomicU64::new(
                 cache_file.metadata().map(|m| m.len()).unwrap_or(0),
             ),
@@ -1564,6 +1658,67 @@ impl DiskCache {
         }
     }
 
+    /// Truncate the local page image to a logical page count and clear cache
+    /// metadata for pages at or beyond the new end.
+    pub(crate) fn truncate_to_page_count(&self, page_count: u64, page_size: u32) -> io::Result<()> {
+        let new_len = page_count * page_size as u64;
+        {
+            let _guard = self.cache_file_extend.lock();
+            self.cache_file.set_len(new_len)?;
+            self.cache_file_len.store(new_len, Ordering::Relaxed);
+        }
+
+        {
+            let bitmap = self.bitmap.read();
+            let old_capacity = (bitmap.bits.len() * 8) as u64;
+            if old_capacity > page_count {
+                bitmap.clear_range(page_count, old_capacity - page_count);
+            }
+        }
+
+        let stale_sub_chunks: Vec<SubChunkId> = {
+            let ids: Vec<SubChunkId> = self.tracker.lock().present.iter().copied().collect();
+            ids.into_iter()
+                .filter(|id| {
+                    let pages = self.sub_chunk_page_nums(*id);
+                    pages.is_empty() || pages.iter().all(|page| *page >= page_count)
+                })
+                .collect()
+        };
+        if !stale_sub_chunks.is_empty() {
+            let mut tracker = self.tracker.lock();
+            for id in stale_sub_chunks {
+                tracker.remove(id);
+            }
+        }
+
+        if self.cache_compression {
+            let mut index = self.cache_index.lock();
+            let stale_pages: Vec<u64> = index
+                .entries
+                .keys()
+                .copied()
+                .filter(|page| *page >= page_count)
+                .collect();
+            for page in stale_pages {
+                index.remove(page);
+            }
+        }
+
+        let ppg = self.pages_per_group as u64;
+        if ppg > 0 {
+            let group_count = page_count.div_ceil(ppg);
+            let states = self.group_states.lock();
+            for (gid, state) in states.iter().enumerate() {
+                if gid as u64 >= group_count {
+                    state.store(GroupState::None as u8, Ordering::Release);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Evict a single page group from the local cache.
     pub(crate) fn evict_group(&self, gid: u64) {
         let page_nums = self.group_page_nums(gid);
@@ -1681,7 +1836,7 @@ impl DiskCache {
     }
 
     /// Prune the compressed cache index: remove all entries NOT in `keep_pages`.
-    /// No-op if cache_compression is false. Persists the index afterward.
+    /// No-op if cache_compression is false. Persists unified local state afterward.
     pub(crate) fn prune_cache_index(&self, keep_pages: &HashSet<u64>) {
         if !self.cache_compression {
             return;
@@ -1696,7 +1851,8 @@ impl DiskCache {
         for p in to_remove {
             index.remove(p);
         }
-        let _ = index.persist();
+        drop(index);
+        let _ = self.persist_bitmap();
     }
 
     /// Clear the compressed cache index entirely (for full cache reset).
@@ -1707,7 +1863,8 @@ impl DiskCache {
         }
         let mut index = self.cache_index.lock();
         index.clear();
-        let _ = index.persist();
+        drop(index);
+        let _ = self.persist_bitmap();
     }
 
     /// Mark all pages as present in the bitmap and all groups as Present.
@@ -1763,12 +1920,21 @@ impl DiskCache {
 
     /// Persist the page bitmap, sub-chunk tracker, and cache index to disk.
     pub(crate) fn persist_bitmap(&self) -> io::Result<()> {
-        self.bitmap.read().persist()?;
-        self.tracker.lock().persist()?;
-        if self.cache_compression {
-            self.cache_index.lock().persist()?;
-        }
-        Ok(())
+        let bitmap = self.bitmap.read().to_bytes();
+        let tracker = {
+            let tracker = self.tracker.lock();
+            local_state::tracker_entries(&tracker.present, &tracker.tiers, &tracker.access_counts)
+        };
+        let cache_index = if self.cache_compression {
+            Some(self.cache_index.lock().to_state())
+        } else {
+            None
+        };
+        local_state::update(&self.cache_dir, |state| {
+            state.page_bitmap = Some(bitmap);
+            state.sub_chunk_tracker = Some(tracker);
+            state.cache_index = cache_index;
+        })
     }
 }
 

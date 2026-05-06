@@ -1,4 +1,3 @@
-use super::*;
 use crate::tiered::*;
 use std::collections::HashMap;
 use tempfile::TempDir;

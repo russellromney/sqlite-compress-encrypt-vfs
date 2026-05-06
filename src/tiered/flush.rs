@@ -1,7 +1,6 @@
 //! Non-blocking backend flush for the two-phase checkpoint path.
 //!
-//! After a local-only checkpoint (runtime `LOCAL_CHECKPOINT_ONLY` flag, or
-//! recovery of staging logs written by an older turbolite), dirty pages are
+//! After a `CheckpointMode::LocalThenFlush` checkpoint, dirty pages are
 //! captured in staging log files on disk. This module reads from those logs
 //! (not the live disk cache), encodes page groups, and uploads to the backend
 //! without holding any SQLite lock. The flush is backend-agnostic: an
@@ -20,7 +19,7 @@ use super::storage as storage_helpers;
 use super::{
     bundle_chunk_range, compact, decode_page_group, decode_page_group_seekable_full,
     encode_interior_bundle, encode_override_frame, encode_page_group, encode_page_group_seekable,
-    keys, manifest, read_change_counter_from_cache, staging, DiskCache, FrameEntry, Manifest,
+    keys, manifest, resolve_manifest_replay_cursor, staging, DiskCache, FrameEntry, Manifest,
     SubChunkId, SubChunkTier,
 };
 
@@ -174,7 +173,7 @@ fn flush_inner(
     turbolite_debug!("[flush] uploading {} dirty groups...", dirty_groups.len(),);
 
     let next_version = manifest_snap.version + 1;
-    let change_counter = read_change_counter_from_cache(cache, manifest_snap.page_size);
+    let change_counter = resolve_manifest_replay_cursor(cache, &manifest_snap)?;
     let mut uploads: Vec<(String, Vec<u8>)> = Vec::new();
     let mut new_keys = manifest_snap.page_group_keys.clone();
     let mut replaced_keys: Vec<String> = Vec::new();

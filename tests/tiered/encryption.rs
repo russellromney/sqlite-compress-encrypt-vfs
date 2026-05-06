@@ -132,7 +132,7 @@ fn test_encrypted_write_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -224,7 +224,7 @@ fn test_encrypted_wrong_key_cold_read_fails() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -348,7 +348,7 @@ fn test_encrypted_arctic_start_all_page_types() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -357,8 +357,6 @@ fn test_encrypted_arctic_start_all_page_types() {
 /// Write encrypted data with key A, rotate to key B, cold read with key B succeeds.
 #[test]
 fn test_rotate_key_cold_read_succeeds() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_basic", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -420,7 +418,7 @@ fn test_rotate_key_cold_read_succeeds() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b)).expect("key rotation failed");
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).expect("key rotation failed");
     }
 
     // Cold read with key B (fresh cache)
@@ -490,15 +488,13 @@ fn test_rotate_key_cold_read_succeeds() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
 /// After rotation, reading with the OLD key must fail.
 #[test]
 fn test_rotate_key_old_key_fails() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_old_key", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -545,7 +541,7 @@ fn test_rotate_key_old_key_fails() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // Cold read with OLD key A must fail (at open, pragma, or query level)
@@ -599,15 +595,13 @@ fn test_rotate_key_old_key_fails() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
 /// After rotation, old S3 objects should be cleaned up by GC.
 #[test]
 fn test_rotate_key_gc_cleans_old_objects() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_gc", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -658,7 +652,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let aws_config = aws_config::from_env()
-                .region(aws_sdk_s3::config::Region::new("auto"))
+                .region(aws_sdk_s3::config::Region::new(aws_region()))
                 .load()
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -694,7 +688,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // List S3 objects after rotation
@@ -702,7 +696,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let aws_config = aws_config::from_env()
-                .region(aws_sdk_s3::config::Region::new("auto"))
+                .region(aws_sdk_s3::config::Region::new(aws_region()))
                 .load()
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -769,7 +763,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
@@ -777,7 +771,6 @@ fn test_rotate_key_gc_cleans_old_objects() {
 #[test]
 fn test_rotate_key_data_integrity() {
     use std::collections::HashMap;
-    use turbolite::tiered::rotate_encryption_key;
 
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_integrity", writer_cache.path());
@@ -842,7 +835,7 @@ fn test_rotate_key_data_integrity() {
             runtime_handle: Some(super::helpers::shared_runtime_handle()),
             ..Default::default()
         };
-        rotate_encryption_key(&rotate_config, Some(key_b)).unwrap();
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).unwrap();
     }
 
     // Verify every row matches
@@ -907,15 +900,13 @@ fn test_rotate_key_data_integrity() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
 /// Write encrypted data, remove encryption (rotate to None), cold read without key.
 #[test]
 fn test_remove_encryption_cold_read() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("remove_enc", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -975,7 +966,7 @@ fn test_remove_encryption_cold_read() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, None).expect("remove encryption failed");
+        rotate_encryption_key_compat(&rotate_config, None).expect("remove encryption failed");
     }
 
     // Cold read WITHOUT encryption key
@@ -1029,15 +1020,13 @@ fn test_remove_encryption_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }
 
 /// Write unencrypted data, add encryption (rotate from None to Some), cold read with key.
 #[test]
 fn test_add_encryption_cold_read() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config("add_enc", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -1097,7 +1086,7 @@ fn test_add_encryption_cold_read() {
             ..Default::default()
         };
 
-        rotate_encryption_key(&rotate_config, Some(key_b)).expect("add encryption failed");
+        rotate_encryption_key_compat(&rotate_config, Some(key_b)).expect("add encryption failed");
     }
 
     // Cold read WITH encryption key
@@ -1185,6 +1174,6 @@ fn test_add_encryption_cold_read() {
             ..Default::default()
         };
         let cleanup_vfs = TurboliteVfs::new_local(cleanup_config).unwrap();
-        cleanup_vfs.destroy_s3().unwrap();
+        cleanup_vfs.destroy_remote().unwrap();
     }
 }

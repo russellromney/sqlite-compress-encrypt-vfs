@@ -1,0 +1,29 @@
+{
+  "kind": "delta",
+  "format_version": 1,
+  "tenant_scope": "tenant-a/scope-a",
+  "database_id": "db-alpha",
+  "database_incarnation_id": "incarnation-0001",
+  "object_prefix": "tenant-a/scope-a/db-alpha",
+  "writer_id": "writer-a",
+  "lease_epoch": 7,
+  "base_database_version": 1,
+  "end_database_version": 2,
+  "sequence": 1,
+  "page_size": 4,
+  "base_database_page_count": 2,
+  "end_database_page_count": 3,
+  "committed_boundary": "after_wal_flush",
+  "changed_pages": [
+    {
+      "page_number": 0,
+      "bytes": [1, 2, 3, 4]
+    },
+    {
+      "page_number": 2,
+      "bytes": [9, 9, 9, 9]
+    }
+  ],
+  "checksum": 7881,
+  "replay_idempotency_key": "db-alpha:7:1"
+}

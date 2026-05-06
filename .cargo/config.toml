@@ -1,8 +1,7 @@
-# See cinch-cloud/.cargo/config.toml for rationale. Shared target-dir and
-# sccache so turbolite's builds dedupe with cinch-cloud and the rest of
-# the sibling repos. Keep in sync.
+# Shared target-dir so turbolite's builds dedupe with cinch-cloud and the
+# rest of the sibling repos. Use RUSTC_WRAPPER locally if you want sccache;
+# committed config must stay portable for Linux CI and non-Homebrew systems.
 
 [build]
 target-dir = "../cinch-target"
-rustc-wrapper = "/opt/homebrew/opt/sccache/bin/sccache"
 incremental = true

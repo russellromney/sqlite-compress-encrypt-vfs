@@ -1,5 +1,5 @@
 use super::*;
-use crate::tiered::*;
+#[cfg(feature = "encryption")]
 use tempfile::TempDir;
 
 // =========================================================================

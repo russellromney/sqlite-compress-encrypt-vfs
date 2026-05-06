@@ -81,7 +81,7 @@ fn test_compact_reclaims_dead_space() {
             bucket: bucket.clone(),
             prefix: prefix.clone(),
             endpoint_url: endpoint.clone(),
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: reader_cache.path().to_path_buf(),
             read_only: true,
             runtime_handle: Some(super::helpers::shared_runtime_handle()),

@@ -40,9 +40,6 @@ fn main() {
             );
             println!("cargo:rustc-cdylib-link-arg=-undefined");
             println!("cargo:rustc-cdylib-link-arg=dynamic_lookup");
-        } else {
-            // Linux: --export-dynamic exports all symbols.
-            println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic");
         }
 
         println!("cargo:rerun-if-changed=src/ext_entry.c");
