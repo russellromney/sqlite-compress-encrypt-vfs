@@ -3,10 +3,10 @@
 Comprehensive tests for the turbolite SQLite loadable extension.
 
 Requires:
-- Homebrew Python (system macOS Python lacks load_extension support)
+- Python with sqlite3 load_extension support
 - The loadable extension built: `make ext`
 
-Run: /opt/homebrew/bin/python3 tests/test_loadable_ext.py
+Run: python3 tests/test_loadable_ext.py
 """
 
 import os

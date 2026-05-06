@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --features zstd,bundled-sqlite
+      - run: cargo test -p turbolite --features zstd,bundled-sqlite
 
   build-ext:
     runs-on: ubuntu-latest
@@ -22,7 +22,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build loadable extension
-        run: cargo build --release --lib --no-default-features --features loadable-extension,zstd,cloud
+        run: make -C turbolite-ffi ext
+
+      - name: Test loadable extension
+        run: make -C turbolite-ffi test-ext
 
   test-node:
     runs-on: ubuntu-latest
@@ -34,18 +37,8 @@ jobs:
         with:
           node-version: 20
 
-      - name: Build loadable extension
-        run: |
-          cargo build --release --lib --no-default-features --features loadable-extension,zstd,cloud
-          cp target/release/libturbolite.so packages/node/turbolite.so
-
-      - name: Install dependencies and build TypeScript
-        working-directory: packages/node
-        run: npm install && npx tsc
-
-      - name: Run tests
-        working-directory: packages/node
-        run: node test.mjs
+      - name: Run Node FFI tests
+        run: make -C turbolite-ffi test-ffi-node
 
   test-go:
     runs-on: ubuntu-latest
@@ -57,13 +50,5 @@ jobs:
         with:
           go-version: "1.21"
 
-      - name: Build loadable extension
-        run: |
-          cargo build --release --lib --no-default-features --features loadable-extension,zstd,cloud
-          cp target/release/libturbolite.so packages/go/turbolite.so
-
-      - name: Run tests
-        working-directory: packages/go
-        env:
-          TURBOLITE_EXT_PATH: ./turbolite.so
-        run: go test -v -count=1 ./...
+      - name: Run Go FFI tests
+        run: make -C turbolite-ffi test-ffi-go
