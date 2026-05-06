@@ -76,6 +76,7 @@ fn handle_with_manifest(
         0,
         0,
         false,
+        false,
         Arc::new(parking_lot::RwLock::new(())),
         Arc::new(AtomicU64::new(0)),
     )

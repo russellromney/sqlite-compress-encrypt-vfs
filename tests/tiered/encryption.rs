@@ -357,8 +357,6 @@ fn test_encrypted_arctic_start_all_page_types() {
 /// Write encrypted data with key A, rotate to key B, cold read with key B succeeds.
 #[test]
 fn test_rotate_key_cold_read_succeeds() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_basic", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -497,8 +495,6 @@ fn test_rotate_key_cold_read_succeeds() {
 /// After rotation, reading with the OLD key must fail.
 #[test]
 fn test_rotate_key_old_key_fails() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_old_key", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -606,8 +602,6 @@ fn test_rotate_key_old_key_fails() {
 /// After rotation, old S3 objects should be cleaned up by GC.
 #[test]
 fn test_rotate_key_gc_cleans_old_objects() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_gc", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -658,7 +652,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let aws_config = aws_config::from_env()
-                .region(aws_sdk_s3::config::Region::new("auto"))
+                .region(aws_sdk_s3::config::Region::new(aws_region()))
                 .load()
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -702,7 +696,7 @@ fn test_rotate_key_gc_cleans_old_objects() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let aws_config = aws_config::from_env()
-                .region(aws_sdk_s3::config::Region::new("auto"))
+                .region(aws_sdk_s3::config::Region::new(aws_region()))
                 .load()
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -777,7 +771,6 @@ fn test_rotate_key_gc_cleans_old_objects() {
 #[test]
 fn test_rotate_key_data_integrity() {
     use std::collections::HashMap;
-    use turbolite::tiered::rotate_encryption_key;
 
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("rotate_integrity", writer_cache.path());
@@ -914,8 +907,6 @@ fn test_rotate_key_data_integrity() {
 /// Write encrypted data, remove encryption (rotate to None), cold read without key.
 #[test]
 fn test_remove_encryption_cold_read() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config_encrypted("remove_enc", writer_cache.path());
     let bucket = config.bucket.clone();
@@ -1036,8 +1027,6 @@ fn test_remove_encryption_cold_read() {
 /// Write unencrypted data, add encryption (rotate from None to Some), cold read with key.
 #[test]
 fn test_add_encryption_cold_read() {
-    use turbolite::tiered::rotate_encryption_key;
-
     let writer_cache = TempDir::new().unwrap();
     let config = test_config("add_enc", writer_cache.path());
     let bucket = config.bucket.clone();

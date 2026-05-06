@@ -20,8 +20,20 @@ unsafe impl Send for PageBitmap {}
 unsafe impl Sync for PageBitmap {}
 
 impl PageBitmap {
+    #[allow(dead_code)] // direct PageBitmap unit tests exercise file-level persistence
     pub(crate) fn new(path: PathBuf) -> Self {
         let raw = fs::read(&path).unwrap_or_default();
+        Self::new_with_bytes(path, raw)
+    }
+
+    pub(crate) fn new_with_state(path: PathBuf, raw: Option<Vec<u8>>) -> Self {
+        match raw {
+            Some(raw) => Self::new_with_bytes(path, raw),
+            None => Self::new_with_bytes(path, Vec::new()),
+        }
+    }
+
+    fn new_with_bytes(path: PathBuf, raw: Vec<u8>) -> Self {
         let bits = raw.into_iter().map(AtomicU8::new).collect();
         Self { bits, path }
     }
@@ -69,6 +81,12 @@ impl PageBitmap {
         }
     }
 
+    pub(crate) fn clear_all(&self) {
+        for byte in &self.bits {
+            byte.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Grow the bitmap if needed. NOT thread-safe for concurrent resize,
     /// but safe to call while readers use `is_present()` on existing pages
     /// (they only access indices < current len).
@@ -81,14 +99,17 @@ impl PageBitmap {
 
     pub(crate) fn persist(&self) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
-        let raw: Vec<u8> = self
-            .bits
-            .iter()
-            .map(|a| a.load(Ordering::Relaxed))
-            .collect();
+        let raw = self.to_bytes();
         fs::write(&tmp, &raw)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        self.bits
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect()
     }
 
     /// Grow if needed. Same caveats as `resize()`.
@@ -156,6 +177,9 @@ pub(crate) struct SubChunkTracker {
     /// Config: pages per sub-chunk frame.
     pub(crate) sub_pages_per_frame: u32,
     /// Path for persistence.
+    #[allow(dead_code)]
+    // Direct tracker unit tests still exercise this file-level helper; the
+    // DiskCache product path persists tracker state through local_state.
     pub(crate) path: PathBuf,
     /// Optional encryption key for CTR-encrypting the persistence file.
     #[cfg(feature = "encryption")]
@@ -163,8 +187,46 @@ pub(crate) struct SubChunkTracker {
 }
 
 impl SubChunkTracker {
+    #[allow(dead_code)] // direct tracker tests use this constructor
     pub(crate) fn new(path: PathBuf, pages_per_group: u32, sub_pages_per_frame: u32) -> Self {
         let (present, tiers, access_counts) = Self::load_from_disk(&path, None);
+        Self::from_parts(
+            path,
+            pages_per_group,
+            sub_pages_per_frame,
+            present,
+            tiers,
+            access_counts,
+        )
+    }
+
+    pub(crate) fn new_with_state(
+        path: PathBuf,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        entries: Option<Vec<local_state::TrackerEntry>>,
+    ) -> Self {
+        let (present, tiers, access_counts) = entries
+            .map(local_state::tracker_maps)
+            .unwrap_or_else(|| (HashSet::new(), HashMap::new(), HashMap::new()));
+        Self::from_parts(
+            path,
+            pages_per_group,
+            sub_pages_per_frame,
+            present,
+            tiers,
+            access_counts,
+        )
+    }
+
+    fn from_parts(
+        path: PathBuf,
+        pages_per_group: u32,
+        sub_pages_per_frame: u32,
+        present: HashSet<SubChunkId>,
+        tiers: HashMap<SubChunkId, SubChunkTier>,
+        access_counts: HashMap<SubChunkId, u32>,
+    ) -> Self {
         let now = Instant::now();
         let access_times: HashMap<SubChunkId, Instant> =
             present.iter().map(|id| (*id, now)).collect();
@@ -557,8 +619,9 @@ impl SubChunkTracker {
 
     /// Persist tracker state to disk for crash recovery.
     /// Format v2: JSON vec of (SubChunkId, tier_u8, access_count_u32).
-    /// Backward-compatible: load_from_disk also reads v1 format (SubChunkId, tier_u8).
+    /// Direct helper also reads v1-format test fixtures (SubChunkId, tier_u8).
     /// CTR-encrypted with random nonce if key present.
+    #[allow(dead_code)] // DiskCache now persists this through unified local_state
     pub(crate) fn persist(&self) -> io::Result<()> {
         let entries: Vec<(SubChunkId, u8, u32)> = self
             .present

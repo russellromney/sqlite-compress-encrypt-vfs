@@ -1,10 +1,8 @@
-//! Phase Anvil g review tests: manifest + dirty_groups persistence split.
+//! Crash recovery tests for unified local sidecar metadata.
 //!
-//! Before Phase Anvil g, local recovery state was one atomic file
-//! (`LocalManifest { manifest, dirty_groups }`). After, it's two
-//! independent files (`manifest.msgpack` + `dirty_groups.msgpack`). These
-//! tests pin the crash-recovery semantics so we notice if either file's
-//! atomic-write invariant breaks or if the loader regresses.
+//! Turbolite stores local recovery metadata in `local_state.msgpack`.
+//! These tests pin the crash-recovery semantics so we notice if pending
+//! flush recovery regresses.
 
 use std::sync::Arc;
 
@@ -50,6 +48,7 @@ fn build_remote_vfs(
         },
         cache: CacheConfig {
             pages_per_group: 4,
+            checkpoint_mode: turbolite::tiered::CheckpointMode::LocalThenFlush,
             ..Default::default()
         },
         ..Default::default()
@@ -75,9 +74,9 @@ fn write_one_row(vfs_name: &str) {
         .expect("ckpt");
 }
 
-/// After checkpoint in LocalThenFlush mode, `manifest.msgpack` and
-/// `dirty_groups.msgpack` (or staging logs + trailers) are on disk and a
-/// fresh VFS reopening the same `cache_dir` recovers pending flush state.
+/// After checkpoint in LocalThenFlush mode, `local_state.msgpack` and staging
+/// logs are on disk and a fresh VFS reopening the same `cache_dir` recovers
+/// pending flush state.
 /// Critical: the recovered VFS knows there's work to do and
 /// `flush_to_storage()` completes it.
 #[test]
@@ -113,9 +112,14 @@ fn reopen_after_checkpoint_recovers_pending_flush() {
             .expect("reopen");
     }
 
+    assert!(
+        dir.path().join("local_state.msgpack").exists(),
+        "pending recovery state should use unified local_state"
+    );
+
     // The recovered VFS must know there are pending page groups to flush.
-    // If this assertion fires, the manifest/dirty_groups split lost its
-    // round-trip correctness OR the staging-log recovery path regressed.
+    // If this assertion fires, unified local_state OR staging-log recovery
+    // lost its round-trip correctness.
     assert!(
         shared2.has_pending_flush(),
         "reopened VFS must recover pending flush state; \
@@ -143,11 +147,9 @@ fn reopen_after_checkpoint_recovers_pending_flush() {
     );
 }
 
-/// Partial-crash scenario: `manifest.msgpack` persisted but
-/// `dirty_groups.msgpack` did not (crash between the two atomic renames).
-/// The reopened VFS must still start cleanly; losing the dirty_groups file
-/// is acceptable (staging logs are the authoritative recovery mechanism
-/// in the new scheme) but the manifest-level state must survive.
+/// Partial-crash scenario: stale split metadata from an older layout is
+/// absent/ignored. The reopened VFS must still start cleanly because the
+/// current recovery state lives in `local_state.msgpack` and staging logs.
 #[test]
 fn reopen_with_missing_dirty_groups_file_does_not_panic() {
     let dir = TempDir::new().expect("tmpdir");
@@ -160,10 +162,13 @@ fn reopen_with_missing_dirty_groups_file_does_not_panic() {
         shared.flush_to_storage().expect("drain");
     }
 
-    // Simulate the partial-crash: dirty_groups.msgpack got removed between
-    // manifest persist and dirty_groups persist. (In our case it's already
-    // been removed by the drain; persist_dirty_groups(&[]) deletes the
-    // file. Write some garbage state to confirm reopen survives absence.)
+    assert!(
+        dir.path().join("local_state.msgpack").exists(),
+        "current local state should survive flush"
+    );
+
+    // Stale split files are no longer part of the product path. Confirm their
+    // absence does not matter.
     let dirty_path = dir.path().join("dirty_groups.msgpack");
     if dirty_path.exists() {
         std::fs::remove_file(&dirty_path).expect("remove dirty_groups");

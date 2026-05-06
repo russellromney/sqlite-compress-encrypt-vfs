@@ -56,7 +56,7 @@ fn cold_reader(
         prefix: prefix.to_string(),
         cache_dir: cold_dir.keep(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
@@ -182,7 +182,7 @@ fn borodino_encryption_staging_roundtrip() {
         prefix: prefix.clone(),
         cache_dir: cold_dir.keep(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         encryption_key: Some([0xAB; 32]),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -238,7 +238,7 @@ fn borodino_encryption_staging_wrong_key_fails() {
         prefix,
         cache_dir: cold_dir.keep(),
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         encryption_key: Some([0xCD; 32]), // wrong key
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -468,7 +468,7 @@ fn get_manifest_version(
     let endpoint = endpoint.clone();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);

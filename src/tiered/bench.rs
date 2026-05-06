@@ -13,7 +13,7 @@ use super::storage as storage_helpers;
 use super::{
     cache_tracking, compact, decode_page_group, decode_page_group_seekable_full,
     decode_seekable_subchunk, encode_page_group, encode_page_group_seekable, flush, keys,
-    query_plan, read_change_counter_from_cache, staging, DiskCache, FrameEntry, GroupState,
+    query_plan, resolve_manifest_replay_cursor, staging, DiskCache, FrameEntry, GroupState,
     Manifest, PrefetchPool, SubChunkId,
 };
 
@@ -547,7 +547,8 @@ impl TurboliteSharedState {
         let mut total_freed = 0usize;
         let mut replaced_keys: Vec<String> = Vec::new();
         let mut manifest = (**self.shared_manifest.load()).clone();
-        let next_version = read_change_counter_from_cache(&self.cache, page_size);
+        let next_version = manifest.version + 1;
+        let change_counter = resolve_manifest_replay_cursor(&self.cache, &manifest)?;
 
         for btree_info in &report.btrees {
             if !report.candidates.contains(&btree_info.name) {
@@ -688,6 +689,7 @@ impl TurboliteSharedState {
         }
 
         manifest.version = next_version;
+        manifest.change_counter = change_counter;
         manifest.build_page_index();
 
         storage_helpers::put_manifest(self.storage.as_ref(), &self.runtime, &manifest)?;

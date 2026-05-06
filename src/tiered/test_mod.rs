@@ -1,5 +1,46 @@
 use super::*;
 
+fn page0_with_change_counter(counter: u32, fill: u8) -> Vec<u8> {
+    let mut page = vec![fill; 4096];
+    page[24..28].copy_from_slice(&counter.to_be_bytes());
+    page
+}
+
+#[test]
+fn replay_cursor_accepts_manifest_ahead_when_page0_matches() {
+    let page0 = page0_with_change_counter(3, 0x11);
+
+    validate_replay_cursor_page0(3, 7, &page0, Some(&page0))
+        .expect("matching page0 lets direct replay cursor stay ahead of SQLite header counter");
+}
+
+#[test]
+fn replay_cursor_accepts_zero_cache_counter_when_manifest_cursor_is_ahead() {
+    let page0 = page0_with_change_counter(0, 0x11);
+
+    validate_replay_cursor_page0(0, 7, &page0, Some(&page0))
+        .expect("direct replay cursor may be valid before SQLite header counter advances");
+}
+
+#[test]
+fn replay_cursor_rejects_lagging_counter_with_different_page0() {
+    let cache_page0 = page0_with_change_counter(3, 0x11);
+    let manifest_page0 = page0_with_change_counter(3, 0x22);
+
+    let err = validate_replay_cursor_page0(3, 7, &cache_page0, Some(&manifest_page0))
+        .expect_err("different page0 with lagging header counter is reset/copy drift");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn replay_cursor_accepts_cache_counter_at_or_above_manifest() {
+    let cache_page0 = page0_with_change_counter(9, 0x11);
+    let manifest_page0 = page0_with_change_counter(3, 0x22);
+
+    validate_replay_cursor_page0(9, 7, &cache_page0, Some(&manifest_page0))
+        .expect("normal local progress can have a newer cache header");
+}
+
 // =========================================================================
 // Coordinate Math (tests for group_id, local_idx_in_group, group_start_page
 // defined in this file)

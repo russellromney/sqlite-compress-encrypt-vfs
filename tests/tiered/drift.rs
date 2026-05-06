@@ -91,7 +91,7 @@ fn list_s3_keys(bucket: &str, prefix: &str, endpoint: &Option<String>) -> Vec<St
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -421,7 +421,7 @@ fn drift_two_writer_cache_validation() {
         prefix: prefix.clone(),
         cache_dir: cache2.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         sub_pages_per_frame: 8,
         override_threshold: 100,
         compaction_threshold: 8,
@@ -460,7 +460,7 @@ fn drift_two_writer_cache_validation() {
         prefix: prefix.clone(),
         cache_dir: cache1_reopen.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         sub_pages_per_frame: 8,
         override_threshold: 100,
         compaction_threshold: 8,
@@ -549,7 +549,7 @@ fn drift_override_with_encryption() {
         prefix: prefix.clone(),
         cache_dir: cold_dir.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         encryption_key: Some([0xDE; 32]),
         runtime_handle: Some(shared_runtime_handle()),
@@ -593,7 +593,7 @@ fn drift_override_with_encryption() {
         prefix,
         cache_dir: bad_dir.path().to_path_buf(),
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         encryption_key: Some([0xFF; 32]), // wrong key
         runtime_handle: Some(shared_runtime_handle()),

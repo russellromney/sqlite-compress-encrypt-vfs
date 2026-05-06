@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "encryption")]
+use tempfile::TempDir;
 
 // =========================================================================
 // Page Group Encoding

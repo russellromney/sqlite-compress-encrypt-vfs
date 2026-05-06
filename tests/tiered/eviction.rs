@@ -72,7 +72,7 @@ fn cold_reader(
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         read_only: true,
@@ -102,7 +102,7 @@ fn cleanup(bucket: &str, prefix: &str, endpoint: &Option<String>) {
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()

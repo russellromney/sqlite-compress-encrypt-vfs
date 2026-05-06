@@ -54,7 +54,7 @@ fn test_index_bundles_checkpoint_and_cold_read() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -441,8 +441,8 @@ fn test_small_ppg_index_integrity() {
             .as_nanos()
     );
     let bucket = test_bucket();
-    let endpoint = Some(endpoint_url());
-    let region = Some("auto".to_string());
+    let endpoint = endpoint_url();
+    let region = Some(aws_region());
 
     // Use ppg=8 to force many small page groups
     let config = TurboliteConfig {

@@ -2,7 +2,7 @@ use super::*;
 
 // ===== StorageClient: unified local + S3 storage abstraction =====
 
-/// Unified storage client for page groups and manifests.
+/// Unified storage client for backend page groups and manifests.
 /// Local: reads/writes files under `{base_dir}/p/{d,it,ix}/` and `{base_dir}/manifest.msgpack`.
 /// S3: delegates to the existing S3Client.
 pub(crate) enum StorageClient {
@@ -136,9 +136,9 @@ impl StorageClient {
         Ok(manifest)
     }
 
-    /// Fetch the manifest and any dirty groups that haven't been flushed.
-    /// For local mode, dirty groups come from the LocalManifest (crash recovery).
-    /// For S3 mode, dirty groups are always empty (S3 manifest is clean).
+    /// Fetch the backend manifest and any backend-carried dirty groups.
+    /// Current product paths keep dirty groups in local sidecar state instead.
+    /// S3 manifests are always clean.
     pub(crate) fn get_manifest_with_dirty_groups(&self) -> io::Result<(Option<Manifest>, Vec<u64>)> {
         match self {
             StorageClient::Local { base_dir } => {

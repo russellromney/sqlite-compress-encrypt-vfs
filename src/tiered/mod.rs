@@ -72,6 +72,7 @@ mod handle;
 mod import;
 mod instrumented_storage;
 mod keys;
+mod local_state;
 mod manifest;
 mod prediction;
 mod prefetch;
@@ -181,20 +182,23 @@ fn bundle_chunk_range(page_size: impl Into<u64>) -> u64 {
     TARGET_BYTES / page_size.into()
 }
 
-/// When true, `sync()` skips S3 upload and just records which page groups are dirty.
-/// Pages are already in disk cache from `write_all_at()`. This keeps WAL small during
-/// bulk loading without S3 round-trip overhead. Call `set_local_checkpoint_only(false)`
-/// before the final checkpoint to upload everything to S3.
+/// Legacy process-global checkpoint shim retained for older tests and callers.
+///
+/// New VFS instances derive local-checkpoint-only behavior from
+/// `TurboliteConfig.cache.checkpoint_mode`, and handles no longer read this
+/// process-global flag. Keeping the shim avoids a public API break while
+/// making parallel tests and mixed VFS modes deterministic.
 static LOCAL_CHECKPOINT_ONLY: AtomicBool = AtomicBool::new(false);
 
-/// Set the local-checkpoint-only flag. When true, WAL checkpoints compact the WAL
-/// and free in-memory dirty pages, but skip S3 upload. When false (default), checkpoints
-/// upload dirty pages to S3 as normal.
+/// Set the legacy local-checkpoint-only flag.
+///
+/// Deprecated behavior shim: configure `CheckpointMode::LocalThenFlush` on
+/// `TurboliteConfig.cache.checkpoint_mode` before opening the VFS instead.
 pub fn set_local_checkpoint_only(val: bool) {
     LOCAL_CHECKPOINT_ONLY.store(val, Ordering::Release);
 }
 
-/// Returns the current value of the local-checkpoint-only flag.
+/// Returns the current value of the legacy local-checkpoint-only flag.
 pub fn is_local_checkpoint_only() -> bool {
     LOCAL_CHECKPOINT_ONLY.load(Ordering::Acquire)
 }
@@ -218,14 +222,17 @@ pub fn get_manifest(
     }
 }
 
-// ===== SQLite file change counter =====
+const SQLITE_DB_HEADER_LEN: usize = 100;
+
+// ===== Replay cursor / SQLite file change counter =====
 
 /// Read SQLite's file change counter from page 0 data.
 /// Offset 24 in the database header, 4 bytes big-endian.
 /// Returns 0 if page data is too short.
 ///
-/// This counter increments on every transaction commit. Used as the unified
-/// version number for both turbolite manifests and walrust WAL txids.
+/// The value is one input to Turbolite's persisted replay cursor. In the direct
+/// page replay path, `Manifest::change_counter` may advance beyond this header
+/// value because it records the latest committed changeset sequence.
 pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
     if page0.len() < 28 {
         return 0;
@@ -233,27 +240,59 @@ pub(crate) fn read_file_change_counter(page0: &[u8]) -> u64 {
     u32::from_be_bytes([page0[24], page0[25], page0[26], page0[27]]) as u64
 }
 
-/// Read the file change counter from page 0 in the disk cache.
-/// Panics if page 0 is not cached or counter is 0. A wrong version
-/// number would corrupt data on recovery (walrust would replay WAL
-/// segments over the wrong page state).
-pub(crate) fn read_change_counter_from_cache(cache: &DiskCache, page_size: u32) -> u64 {
-    let counter = try_read_change_counter_from_cache(cache, page_size)
-        .expect("page 0 must be in cache at checkpoint time");
-    assert!(
-        counter > 0,
-        "file change counter must be > 0 at checkpoint time"
-    );
-    counter
+pub(crate) fn resolve_manifest_replay_cursor(
+    cache: &DiskCache,
+    manifest: &Manifest,
+) -> std::io::Result<u64> {
+    let mut page0 = vec![0u8; manifest.page_size as usize];
+    cache.read_page(0, &mut page0)?;
+    let cache_change_counter = read_file_change_counter(&page0);
+    validate_replay_cursor_page0(
+        cache_change_counter,
+        manifest.change_counter,
+        &page0,
+        manifest.db_header.as_deref(),
+    )?;
+    Ok(cache_change_counter.max(manifest.change_counter))
 }
 
-pub(crate) fn try_read_change_counter_from_cache(
-    cache: &DiskCache,
-    page_size: u32,
-) -> std::io::Result<u64> {
-    let mut page0 = vec![0u8; page_size as usize];
-    cache.read_page(0, &mut page0)?;
-    Ok(read_file_change_counter(&page0))
+fn validate_replay_cursor_page0(
+    cache_change_counter: u64,
+    manifest_change_counter: u64,
+    cache_page0: &[u8],
+    manifest_page0: Option<&[u8]>,
+) -> std::io::Result<()> {
+    if cache_change_counter == 0 && manifest_change_counter == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file change counter must be > 0 at checkpoint/flush time",
+        ));
+    }
+
+    if cache_change_counter >= manifest_change_counter {
+        return Ok(());
+    }
+
+    let Some(manifest_page0) = manifest_page0 else {
+        return Ok(());
+    };
+    let compare_len = SQLITE_DB_HEADER_LEN
+        .min(cache_page0.len())
+        .min(manifest_page0.len());
+    if compare_len < SQLITE_DB_HEADER_LEN {
+        return Ok(());
+    }
+    if cache_page0[..compare_len] != manifest_page0[..compare_len] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "local cache page 0 does not match manifest replay base while file change counter lags replay cursor (cache={}, manifest={})",
+                cache_change_counter, manifest_change_counter
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 // ===== Page group coordinate math =====

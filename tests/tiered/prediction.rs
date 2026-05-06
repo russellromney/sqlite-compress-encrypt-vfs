@@ -71,7 +71,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     // Read manifest from S3
     let manifest = get_manifest_compat(&TurboliteConfig {
         bucket: bucket.clone(), prefix: prefix.clone(),
-        endpoint_url: endpoint.clone(), region: Some("auto".to_string()),
+        endpoint_url: endpoint.clone(), region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
     }).unwrap().unwrap();
 
@@ -84,7 +84,7 @@ fn test_prediction_patterns_survive_checkpoint_roundtrip() {
     let reader_cache = tempfile::tempdir().unwrap();
     let reader_manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: reader_cache.path().to_path_buf(),
         ..Default::default()
     }).unwrap().unwrap();
@@ -131,7 +131,7 @@ fn test_checkpoint_no_patterns_when_disabled() {
 
     let manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
     }).unwrap().unwrap();
 
@@ -190,7 +190,7 @@ fn test_single_table_no_predictions() {
 
     let manifest = get_manifest_compat(&TurboliteConfig {
         bucket, prefix, endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(), ..Default::default()
     }).unwrap().unwrap();
 
@@ -269,7 +269,7 @@ fn test_vacuum_predictions_no_corruption() {
         let reader_cache = tempfile::tempdir().unwrap();
         let reader_config = TurboliteConfig {
             bucket, prefix, endpoint_url: endpoint,
-            region: Some("auto".to_string()),
+            region: Some(aws_region()),
             cache_dir: reader_cache.path().to_path_buf(),
             prediction_enabled: true, read_only: true,
             ..Default::default()

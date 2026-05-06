@@ -8,9 +8,13 @@ pub struct Manifest {
     /// Monotonically increasing version (bumped +1 on each checkpoint).
     /// Used for S3 key uniqueness: `pg/{gid}_v{version}`.
     pub version: u64,
-    /// SQLite file change counter (page 0, offset 24) at checkpoint time.
-    /// Used by walrust for WAL segment replay: replay segments with txid > change_counter.
-    /// Default 0 for backward compat (walrust replays everything).
+    /// Durable replay cursor/floor for physical delta replay.
+    ///
+    /// Checkpoint/import paths initialize this from SQLite's file change counter
+    /// (page 0, offset 24). Direct page replay may advance it to the latest
+    /// committed changeset sequence even when the SQLite header counter is lower.
+    /// Followers replay delta objects with seq > `change_counter`.
+    /// Default 0 for backward compat (delta replay starts from the beginning).
     #[serde(default)]
     pub change_counter: u64,
     /// Number of pages in the database
@@ -140,31 +144,15 @@ pub(crate) fn default_pages_per_group() -> u32 {
     DEFAULT_PAGES_PER_GROUP
 }
 
-// Local manifest cache + dirty-group recovery state
-//
-// Two files, two concerns.
-//
-//   {cache_dir}/manifest.msgpack        msgpack(Manifest)     -- warm cache of the
-//                                                                remote manifest
-//   {cache_dir}/dirty_groups.msgpack    msgpack(Vec<u64>)     -- groups staged for
-//                                                                upload, survives
-//                                                                process crash
-//
-// Splitting them means the backend's own `manifest.msgpack` object is a raw
-// Manifest (not a turbolite-specific wrapper), and dirty_groups stops leaking
-// into what the backend sees.
+// Local sidecar metadata lives in {cache_dir}/local_state.msgpack.
 
 /// Persist a `Manifest` to the local cache directory as a warm cache for cold
 /// reopens. Atomic write (tmp + rename). Used by local mode as the
 /// authoritative source and by remote mode as a hint for warm reconnect.
 pub(crate) fn persist_manifest_local(cache_dir: &Path, manifest: &Manifest) -> io::Result<()> {
-    let path = cache_dir.join("manifest.msgpack");
-    let tmp = cache_dir.join("manifest.msgpack.tmp");
-    let data = rmp_serde::to_vec(manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize manifest: {e}")))?;
-    fs::write(&tmp, &data)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    local_state::update(cache_dir, |state| {
+        state.manifest = Some(manifest.clone());
+    })
 }
 
 /// Pre-Anvil-g wrapper: the old on-disk / on-S3 layout bundled the manifest
@@ -211,51 +199,31 @@ pub(crate) fn decode_manifest_bytes(data: &[u8]) -> io::Result<Manifest> {
 /// Load a locally-cached `Manifest`. `Ok(None)` if absent. Callers that need
 /// crash-recovery dirty groups read them from [`load_dirty_groups`] separately.
 pub(crate) fn load_manifest_local(cache_dir: &Path) -> io::Result<Option<Manifest>> {
-    let path = cache_dir.join("manifest.msgpack");
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    Ok(Some(decode_manifest_bytes(&data)?))
+    if let Some(state) = local_state::load(cache_dir)? {
+        if state.manifest.is_some() {
+            return Ok(state.manifest);
+        }
+    }
+    Ok(None)
 }
 
 /// Persist the set of page-group ids that have been checkpointed locally but
 /// not yet flushed to the remote backend. Empty list means "no pending work";
 /// file is removed in that case to keep the cache dir tidy.
 pub(crate) fn persist_dirty_groups(cache_dir: &Path, dirty: &[u64]) -> io::Result<()> {
-    let path = cache_dir.join("dirty_groups.msgpack");
-    if dirty.is_empty() {
-        match fs::remove_file(&path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        }
-    }
-    let tmp = cache_dir.join("dirty_groups.msgpack.tmp");
-    let data = rmp_serde::to_vec(&dirty.to_vec()).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("serialize dirty_groups: {e}"))
-    })?;
-    fs::write(&tmp, &data)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    local_state::update(cache_dir, |state| {
+        state.dirty_groups = Some(dirty.to_vec());
+    })
 }
 
 /// Load dirty-group recovery state. `Ok(Vec::new())` if no file exists.
 pub(crate) fn load_dirty_groups(cache_dir: &Path) -> io::Result<Vec<u64>> {
-    let path = cache_dir.join("dirty_groups.msgpack");
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let dirty: Vec<u64> = rmp_serde::from_slice(&data).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("deserialize dirty_groups: {e}"),
-        )
-    })?;
-    Ok(dirty)
+    if let Some(state) = local_state::load(cache_dir)? {
+        if let Some(dirty_groups) = state.dirty_groups {
+            return Ok(dirty_groups);
+        }
+    }
+    Ok(Vec::new())
 }
 
 impl Manifest {
@@ -419,6 +387,37 @@ impl Manifest {
         }
         self.normalize_overrides();
         self.build_page_index();
+    }
+}
+
+#[cfg(test)]
+mod local_state_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_and_dirty_groups_persist_to_unified_local_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = Manifest::empty();
+        manifest.version = 7;
+
+        persist_manifest_local(dir.path(), &manifest).expect("persist manifest");
+        persist_dirty_groups(dir.path(), &[1, 3, 5]).expect("persist dirty groups");
+
+        assert!(dir.path().join("local_state.msgpack").exists());
+        assert!(!dir.path().join("manifest.msgpack").exists());
+        assert!(!dir.path().join("dirty_groups.msgpack").exists());
+
+        assert_eq!(
+            load_manifest_local(dir.path())
+                .expect("load manifest")
+                .expect("manifest")
+                .version,
+            7
+        );
+        assert_eq!(
+            load_dirty_groups(dir.path()).expect("load dirty groups"),
+            vec![1, 3, 5]
+        );
     }
 }
 

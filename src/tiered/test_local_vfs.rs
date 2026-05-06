@@ -74,6 +74,116 @@ fn test_local_vfs_sqlite_roundtrip() {
     assert_eq!(val, "hello");
 }
 
+#[test]
+fn file_first_vfs_rejects_mismatched_main_db_name() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("app.db");
+    let config = TurboliteConfig::for_database_path(&db_path);
+    let vfs_name = format!(
+        "file_first_reject_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let vfs = TurboliteVfs::new_local(config).expect("local VFS");
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn = rusqlite::Connection::open_with_flags_and_vfs(
+        db_path.to_str().expect("utf8 db path"),
+        flags,
+        &vfs_name,
+    )
+    .expect("configured file-first path opens");
+    drop(conn);
+
+    let other_path = dir.path().join("other.db");
+    let err = rusqlite::Connection::open_with_flags_and_vfs(
+        other_path.to_str().expect("utf8 other path"),
+        flags,
+        &vfs_name,
+    )
+    .expect_err("same file-first VFS must not alias another db name");
+    assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+
+    let same_name_other_dir = dir.path().join("nested").join("app.db");
+    std::fs::create_dir_all(same_name_other_dir.parent().unwrap()).unwrap();
+    let err = rusqlite::Connection::open_with_flags_and_vfs(
+        same_name_other_dir.to_str().expect("utf8 nested path"),
+        flags,
+        &vfs_name,
+    )
+    .expect_err("same file-first VFS must not alias the same filename in another directory");
+    assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+}
+
+#[test]
+fn file_first_with_backend_keeps_sidecar_to_local_state() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("app.db");
+    let remote_dir = dir.path().join("backend");
+    let config = TurboliteConfig::for_database_path(&db_path);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let storage: std::sync::Arc<dyn hadb_storage::StorageBackend> =
+        std::sync::Arc::new(hadb_storage_local::LocalStorage::new(&remote_dir));
+    let vfs = TurboliteVfs::with_backend(config.clone(), storage, runtime.handle().clone())
+        .expect("file-first backend VFS");
+    let vfs_name = format!(
+        "file_first_backend_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    crate::tiered::register(&vfs_name, vfs).expect("register");
+
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn = rusqlite::Connection::open_with_flags_and_vfs(
+        db_path.to_str().expect("utf8 db path"),
+        flags,
+        &vfs_name,
+    )
+    .expect("open file-first db");
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+         INSERT INTO t VALUES (1, 'sidecar');",
+    )
+    .unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(conn);
+
+    assert!(db_path.exists(), "primary app.db artifact should exist");
+    assert!(
+        config.cache_dir.join("local_state.msgpack").exists(),
+        "sidecar should carry unified local state"
+    );
+    assert!(
+        !config.cache_dir.join("data.cache").exists(),
+        "file-first mode must not create data.cache"
+    );
+    assert!(
+        !config.cache_dir.join("manifest.msgpack").exists(),
+        "caller-supplied backend keeps backend manifest out of the sidecar"
+    );
+    assert!(
+        !config.cache_dir.join("p").exists(),
+        "caller-supplied backend keeps page objects out of the sidecar"
+    );
+    assert!(
+        remote_dir.join("manifest.msgpack").exists(),
+        "backend owns the manifest object"
+    );
+    assert!(remote_dir.join("p").exists(), "backend owns page objects");
+}
+
 /// Local VFS with compression enabled: write + checkpoint + reopen.
 #[test]
 #[cfg(feature = "zstd")]

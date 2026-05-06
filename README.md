@@ -355,7 +355,7 @@ let config = TurboliteConfig {
 };
 ```
 
-turbolite and walrust stay synchronized via SQLite's file change counter, stored as `manifest.change_counter`. On cold start, turbolite materializes the database from page groups, then walrust replays WAL segments with txid > `change_counter` to recover writes that occurred after the last checkpoint.
+turbolite and walrust stay synchronized via the replay cursor stored as `manifest.change_counter`. Import/checkpoint paths seed that cursor from SQLite's file change counter; direct page replay can advance it to the latest committed changeset sequence. On cold start, turbolite materializes the database from page groups, then walrust replays WAL segments with txid > `change_counter` to recover writes that occurred after the last checkpoint.
 
 **Durability model with WAL shipping**: every committed transaction is shipped to S3 as a WAL segment within the sync interval (default 100ms). If the machine dies, at most one sync interval of writes is lost. After checkpoint, WAL segments with txid <= `change_counter` are garbage collected automatically.
 

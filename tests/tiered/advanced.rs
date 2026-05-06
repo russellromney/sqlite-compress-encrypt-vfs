@@ -324,7 +324,7 @@ fn test_custom_pages_per_group() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -578,7 +578,7 @@ fn test_evict_tree_by_name() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -698,7 +698,7 @@ fn test_cache_info_returns_valid_json() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -762,6 +762,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
     );
 
     // Step 3: Open via tiered VFS, write new data, local-checkpoint to create pending groups
+    config.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
     let vfs_name = unique_vfs_name("tiered_evict_pending");
     let vfs = TurboliteVfs::new_local(config).expect("TurboliteVfs");
     let bench = vfs.shared_state();
@@ -795,7 +796,6 @@ fn test_evict_tree_skips_pending_flush_groups() {
         .unwrap();
 
     // Write new data and local-checkpoint to create pending groups
-    turbolite::tiered::set_local_checkpoint_only(true);
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 2000..2500 {
@@ -824,7 +824,6 @@ fn test_evict_tree_skips_pending_flush_groups() {
     );
 
     // Flush, then evict should work fully again
-    turbolite::tiered::set_local_checkpoint_only(false);
     bench.flush_to_storage().unwrap();
     assert!(!bench.has_pending_flush());
 
@@ -839,7 +838,7 @@ fn test_evict_tree_skips_pending_flush_groups() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 8,
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
@@ -954,7 +953,7 @@ fn test_autovacuum_with_gc() {
         prefix: prefix.clone(),
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
@@ -1095,7 +1094,7 @@ fn test_cache_truncation_after_vacuum() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()

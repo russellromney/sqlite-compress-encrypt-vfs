@@ -38,9 +38,11 @@ pub struct TurboliteVfs {
     /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
     /// read by flush_to_storage() for non-blocking storage upload.
     shared_manifest: Arc<ArcSwap<Manifest>>,
+    /// True when this VFS checkpoints into local staging and requires an
+    /// explicit `flush_to_storage()` to publish to the backend.
+    pub(crate) local_checkpoint_only: bool,
     /// Shared pending dirty groups. Accumulated by TurboliteHandle during
-    /// local-only checkpoints, drained by flush_to_storage(). Used for the
-    /// global LOCAL_CHECKPOINT_ONLY runtime flag path.
+    /// local-only checkpoints, drained by flush_to_storage().
     shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     /// Pending staging log flushes. Drained by flush_to_storage() for any
     /// staging logs recovered on open from older turbolite versions.
@@ -96,15 +98,10 @@ impl TurboliteVfs {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("build tokio rt: {e}")))?;
         let runtime = owned.handle().clone();
         config.apply_legacy_flat_fields();
-        super::set_local_checkpoint_only(matches!(
-            config.cache.checkpoint_mode,
-            super::CheckpointMode::LocalThenFlush
-        ));
 
-        // Ensure the cache dir exists before LocalStorage tries to write
-        // under it; LocalStorage creates parents lazily on put but we
-        // also store manifest.msgpack / dirty_groups.msgpack directly
-        // through synchronous helpers that assume the directory is there.
+        // Ensure the state dir exists before local_state/staging helpers
+        // write under it. LocalStorage creates parents lazily for backend
+        // objects, but local sidecar metadata is synchronous.
         fs::create_dir_all(&config.cache_dir)?;
 
         #[cfg(feature = "cli-s3")]
@@ -145,10 +142,6 @@ impl TurboliteVfs {
         runtime: tokio::runtime::Handle,
     ) -> io::Result<Self> {
         config.apply_legacy_flat_fields();
-        super::set_local_checkpoint_only(matches!(
-            config.cache.checkpoint_mode,
-            super::CheckpointMode::LocalThenFlush
-        ));
         fs::create_dir_all(&config.cache_dir)?;
         #[cfg(feature = "bundled-sqlite")]
         crate::install_hook::ensure_registered();
@@ -166,9 +159,12 @@ impl TurboliteVfs {
         is_local: bool,
     ) -> io::Result<Self> {
         // 1. Decide which manifest to start from.
-        //    Warm cache file wins unless it's missing, in which case we
-        //    go to the backend. Dirty groups survive independently in
-        //    `dirty_groups.msgpack`.
+        //    Warm local_state wins unless missing, in which case we go to
+        //    the backend. Dirty groups also live in local_state.
+        let local_checkpoint_only = matches!(
+            config.cache.checkpoint_mode,
+            super::CheckpointMode::LocalThenFlush
+        );
         let local_manifest = manifest::load_manifest_local(&config.cache_dir)?;
         let recovered_dirty_groups = manifest::load_dirty_groups(&config.cache_dir)?;
 
@@ -214,8 +210,13 @@ impl TurboliteVfs {
             config.cache.pages_per_group
         };
 
-        let cache = DiskCache::new_with_compression(
+        let cache_file_path = config
+            .local_data_path
+            .clone()
+            .unwrap_or_else(|| config.cache_dir.join("data.cache"));
+        let cache = DiskCache::new_with_compression_at(
             &config.cache_dir,
+            &cache_file_path,
             config.cache.ttl_secs,
             ppg,
             config.cache.sub_pages_per_frame,
@@ -368,6 +369,7 @@ impl TurboliteVfs {
             page_count,
             config,
             shared_manifest,
+            local_checkpoint_only,
             shared_dirty_groups,
             pending_flushes,
             staging_seq,
@@ -1066,9 +1068,51 @@ impl TurboliteVfs {
         }
     }
 
-    /// Get the path to the raw cache file (data.cache).
+    /// Get the path to the raw local database image.
     pub fn cache_file_path(&self) -> PathBuf {
-        self.config.cache_dir.join("data.cache")
+        self.cache.cache_file_path.clone()
+    }
+
+    fn local_main_db_path(&self, db: &str) -> io::Result<PathBuf> {
+        if let Some(data_path) = self.config.local_data_path.as_ref() {
+            let requested = Path::new(db);
+            let requested_has_parent = requested
+                .parent()
+                .is_some_and(|parent| parent != Path::new(""));
+            let requested_matches = if requested_has_parent || requested.is_absolute() {
+                requested == data_path
+            } else {
+                requested.file_name() == data_path.file_name()
+            };
+            if !requested_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "file-first Turbolite VFS is bound to {}; refusing open of {}",
+                        data_path.display(),
+                        db
+                    ),
+                ));
+            }
+            Ok(data_path.clone())
+        } else {
+            Ok(self.config.cache_dir.join(db))
+        }
+    }
+
+    fn local_sqlite_companion_path(&self, db: &str) -> PathBuf {
+        if let Some(data_path) = self.config.local_data_path.as_ref() {
+            let name = Path::new(db)
+                .file_name()
+                .map(|name| name.to_owned())
+                .unwrap_or_else(|| db.into());
+            data_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name)
+        } else {
+            self.config.cache_dir.join(db)
+        }
     }
 
     /// Replace the local cache contents from a materialized SQLite file.
@@ -1216,7 +1260,11 @@ impl Vfs for TurboliteVfs {
     type Handle = TurboliteHandle;
 
     fn open(&self, db: &str, opts: OpenOptions) -> Result<Self::Handle, io::Error> {
-        let path = self.config.cache_dir.join(db);
+        let path = if matches!(opts.kind, OpenKind::MainDb) {
+            self.local_main_db_path(db)?
+        } else {
+            self.local_sqlite_companion_path(db)
+        };
 
         if matches!(opts.kind, OpenKind::MainDb) {
             let (mut manifest, recovered_dirty_groups, warm_reconnect) = self.load_manifest()?;
@@ -1302,16 +1350,42 @@ impl Vfs for TurboliteVfs {
                 );
             }
 
-            let lock_dir = self.config.cache_dir.join("locks");
-            fs::create_dir_all(&lock_dir)?;
-            let lock_path = lock_dir.join(db);
+            let lock_path = if let Some(data_path) = self.config.local_data_path.as_ref() {
+                data_path.with_file_name(format!(
+                    "{}-lock",
+                    data_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| db.into())
+                ))
+            } else {
+                let lock_dir = self.config.cache_dir.join("locks");
+                fs::create_dir_all(&lock_dir)?;
+                lock_dir.join(db)
+            };
+            if let Some(parent) = lock_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             FsOpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(&lock_path)?;
 
             if !self.config.read_only {
-                let wal_path = self.config.cache_dir.join(format!("{}-wal", db));
+                let wal_path = if let Some(data_path) = self.config.local_data_path.as_ref() {
+                    data_path.with_file_name(format!(
+                        "{}-wal",
+                        data_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| db.into())
+                    ))
+                } else {
+                    self.config.cache_dir.join(format!("{}-wal", db))
+                };
+                if let Some(parent) = wal_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let _ = FsOpenOptions::new()
                     .create(true)
                     .write(true)
@@ -1362,6 +1436,7 @@ impl Vfs for TurboliteVfs {
                 self.config.cache.override_threshold,
                 self.config.cache.compaction_threshold,
                 self.is_local,
+                self.local_checkpoint_only,
                 Arc::clone(&self.replay_gate),
                 Arc::clone(&self.replay_epoch),
             )
@@ -1383,7 +1458,7 @@ impl Vfs for TurboliteVfs {
     }
 
     fn delete(&self, db: &str) -> Result<(), io::Error> {
-        let path = self.config.cache_dir.join(db);
+        let path = self.local_sqlite_companion_path(db);
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1393,7 +1468,7 @@ impl Vfs for TurboliteVfs {
     }
 
     fn exists(&self, db: &str) -> Result<bool, io::Error> {
-        let path = self.config.cache_dir.join(db);
+        let path = self.local_sqlite_companion_path(db);
         if path.exists() {
             return Ok(true);
         }

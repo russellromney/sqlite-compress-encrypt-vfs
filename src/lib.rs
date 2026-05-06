@@ -1,9 +1,9 @@
 //! turbolite: high-performance SQLite VFS with compressed page groups.
 //!
-//! Two storage modes, same on-disk format (manifest + page groups):
+//! Two storage modes, same object format (manifest + page groups):
 //!
-//! - **Local** (default): page groups stored at `{cache_dir}/pg/`, manifest at
-//!   `{cache_dir}/manifest.msgpack`. No S3, no tokio, no async deps.
+//! - **Local** (default): page groups and manifest stored under the configured
+//!   local backend directory. No S3, no tokio, no async deps.
 //!
 //! - **Cloud** (S3-backed, requires `cloud` feature): S3 is the source of truth,
 //!   local NVMe disk is a page-level cache.

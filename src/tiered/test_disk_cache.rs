@@ -598,6 +598,44 @@ fn test_disk_cache_bitmap_persistence() {
 }
 
 #[test]
+fn test_disk_cache_persists_unified_local_state() {
+    let dir = TempDir::new().unwrap();
+    {
+        let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+        cache.write_page(3, &vec![1u8; 64]).unwrap();
+        cache.persist_bitmap().unwrap();
+    }
+
+    assert!(dir.path().join("local_state.msgpack").exists());
+    assert!(!dir.path().join("page_bitmap").exists());
+    assert!(!dir.path().join("sub_chunk_tracker").exists());
+    assert!(!dir.path().join("cache_index.json").exists());
+
+    let state = local_state::load(dir.path()).unwrap().unwrap();
+    assert!(state.page_bitmap.is_some());
+    assert!(state.sub_chunk_tracker.is_some());
+}
+
+#[test]
+fn test_disk_cache_ignores_old_split_tracking_files() {
+    let dir = TempDir::new().unwrap();
+    let bitmap_path = dir.path().join("page_bitmap");
+    {
+        let mut bitmap = PageBitmap::new(bitmap_path);
+        bitmap.ensure_capacity(5);
+        bitmap.mark_present(5);
+        bitmap.persist().unwrap();
+    }
+    std::fs::write(dir.path().join("data.cache"), vec![0u8; 64 * 8]).unwrap();
+
+    let cache = DiskCache::new(dir.path(), 3600, 4, 2, 64, 8, None, Vec::new()).unwrap();
+    assert!(
+        !cache.is_present(5),
+        "DiskCache must not resurrect state from old split tracking files"
+    );
+}
+
+#[test]
 fn test_disk_cache_reopen_initializes_group_states_from_bitmap() {
     let dir = TempDir::new().unwrap();
     let gp = positional_group_pages(4, 16);
@@ -1693,11 +1731,12 @@ fn test_compressed_corrupt_index_resets() {
         cache.persist_bitmap().unwrap();
     }
 
-    // Corrupt the index file
+    // Old split index files are ignored by the DiskCache open path.
+    std::fs::remove_file(dir.path().join("local_state.msgpack")).unwrap();
     let index_path = dir.path().join("cache_index.json");
     std::fs::write(&index_path, b"this is not valid json").unwrap();
 
-    // Re-open: should start with empty index (graceful rebuild)
+    // Re-open: should start with empty unified state.
     let cache = compressed_cache(dir.path(), 64, 16);
     // Page 0 is in bitmap but NOT in cache index, so is_present returns false
     assert!(

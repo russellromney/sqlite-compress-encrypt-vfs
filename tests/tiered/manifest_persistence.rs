@@ -1,4 +1,4 @@
-//! Phase Gallipoli: local manifest persistence integration tests.
+//! Local manifest persistence integration tests.
 //! Tests that manifest is persisted locally, survives reconnection,
 //! and dirty groups are recovered after simulated crash.
 
@@ -6,7 +6,7 @@ use super::helpers::*;
 use tempfile::TempDir;
 use turbolite::tiered::{TurboliteConfig, TurboliteVfs};
 
-/// After checkpoint, a local manifest.msgpack should exist in cache_dir.
+/// After checkpoint, local_state.msgpack should exist in cache_dir.
 #[test]
 fn test_local_manifest_persisted_on_checkpoint() {
     let cache_dir = TempDir::new().unwrap();
@@ -36,23 +36,23 @@ fn test_local_manifest_persisted_on_checkpoint() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    // Verify local manifest exists
-    let manifest_path = cache_dir.path().join("manifest.msgpack");
+    // Verify local state exists
+    let manifest_path = cache_dir.path().join("local_state.msgpack");
     assert!(
         manifest_path.exists(),
-        "local manifest should exist after checkpoint"
+        "local_state should exist after checkpoint"
     );
 
     // Verify it's valid msgpack
     let bytes = std::fs::read(&manifest_path).unwrap();
-    assert!(!bytes.is_empty(), "manifest file should not be empty");
+    assert!(!bytes.is_empty(), "local_state file should not be empty");
 
     drop(conn);
     let cleanup_config = TurboliteConfig {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
@@ -113,7 +113,7 @@ fn test_warm_reconnect_uses_local_manifest_state() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
@@ -138,6 +138,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
     {
         let mut cfg1 = test_config("dirty_recovery_placeholder", cache_dir.path());
         cfg1.prefix = prefix.clone();
+        cfg1.cache.checkpoint_mode = turbolite::tiered::CheckpointMode::LocalThenFlush;
         let vfs = TurboliteVfs::new_local(cfg1).expect("TurboliteVfs");
         let state = vfs.shared_state();
         turbolite::tiered::register(&vfs_name, vfs).unwrap();
@@ -149,7 +150,6 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         )
         .unwrap();
 
-        turbolite::tiered::set_local_checkpoint_only(true);
         conn.execute_batch(
             "PRAGMA page_size=4096;
              PRAGMA journal_mode=WAL;
@@ -169,16 +169,15 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         }
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
-        turbolite::tiered::set_local_checkpoint_only(false);
 
         assert!(
             state.has_pending_flush(),
             "should have pending dirty groups"
         );
 
-        // Verify local manifest has dirty_groups
-        let manifest_path = cache_dir.path().join("manifest.msgpack");
-        assert!(manifest_path.exists(), "local manifest should exist");
+        // Verify local_state exists to carry manifest + dirty group recovery.
+        let manifest_path = cache_dir.path().join("local_state.msgpack");
+        assert!(manifest_path.exists(), "local_state should exist");
 
         // DON'T flush - simulate crash by dropping everything
         drop(conn);
@@ -229,7 +228,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         bucket,
         prefix,
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
@@ -240,7 +239,7 @@ fn test_dirty_groups_recovered_from_local_manifest() {
         .unwrap();
 }
 
-/// Durable mode local manifest has no dirty groups.
+/// Durable mode persists local_state without pending dirty groups.
 #[test]
 fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     let cache_dir = TempDir::new().unwrap();
@@ -270,12 +269,12 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .unwrap();
 
-    // Verify local manifest exists and is valid msgpack
-    let manifest_path = cache_dir.path().join("manifest.msgpack");
+    // Verify local_state exists and is valid msgpack
+    let manifest_path = cache_dir.path().join("local_state.msgpack");
     let bytes = std::fs::read(&manifest_path).unwrap();
     assert!(
         !bytes.is_empty(),
-        "local manifest should be non-empty after Durable checkpoint"
+        "local_state should be non-empty after Durable checkpoint"
     );
 
     drop(conn);
@@ -283,7 +282,7 @@ fn test_durable_mode_no_dirty_groups_in_local_manifest() {
         bucket,
         prefix,
         endpoint_url: endpoint,
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()

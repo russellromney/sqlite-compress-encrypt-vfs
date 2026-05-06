@@ -206,7 +206,7 @@ fn test_gc_full_scan() {
         prefix: prefix.clone(),
         cache_dir: gc_cache.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
@@ -278,8 +278,8 @@ fn test_gc_no_orphans() {
         bucket: test_bucket(),
         prefix: "test/gc_noop/will_not_exist".to_string(),
         cache_dir: gc_cache.path().to_path_buf(),
-        endpoint_url: Some(endpoint_url()),
-        region: Some("auto".to_string()),
+        endpoint_url: endpoint_url(),
+        region: Some(aws_region()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };

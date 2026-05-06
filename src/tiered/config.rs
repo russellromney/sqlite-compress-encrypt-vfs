@@ -363,6 +363,14 @@ pub struct TurboliteConfig {
     /// this is where the sub-chunk cache, staging logs, and dirty-group
     /// recovery state live.
     pub cache_dir: PathBuf,
+    /// Optional local main database image path.
+    ///
+    /// When unset, Turbolite stores the main image at
+    /// `{cache_dir}/data.cache`. Product embedders that want a
+    /// SQLite-shaped user artifact can set this to the caller-supplied
+    /// database path while keeping metadata/staging under `cache_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_data_path: Option<PathBuf>,
     /// Open in read-only mode (no writes, no WAL)
     pub read_only: bool,
 
@@ -436,6 +444,7 @@ impl Default for TurboliteConfig {
     fn default() -> Self {
         Self {
             cache_dir: PathBuf::from("/tmp/turbolite-cache"),
+            local_data_path: None,
             read_only: false,
             cache: CacheConfig::default(),
             compression: CompressionConfig::default(),
@@ -474,6 +483,43 @@ impl Default for TurboliteConfig {
 }
 
 impl TurboliteConfig {
+    /// Return a path-derived hidden state directory for a database file.
+    ///
+    /// For example, `state_dir_for_database_path("app.db", "-turbolite")`
+    /// returns `app.db-turbolite` beside `app.db`.
+    pub fn state_dir_for_database_path(
+        db_path: impl AsRef<std::path::Path>,
+        suffix: &str,
+    ) -> PathBuf {
+        let db_path = db_path.as_ref();
+        let file_name = db_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "turbolite.db".into());
+        db_path.with_file_name(format!("{file_name}{suffix}"))
+    }
+
+    /// Build a file-first local configuration.
+    ///
+    /// The caller's `db_path` becomes the local database image and Turbolite's
+    /// metadata/staging state lives under `<db_path>-turbolite/`.
+    pub fn for_database_path(db_path: impl Into<PathBuf>) -> Self {
+        let db_path = db_path.into();
+        Self {
+            cache_dir: Self::state_dir_for_database_path(&db_path, "-turbolite"),
+            local_data_path: Some(db_path),
+            ..Default::default()
+        }
+    }
+
+    /// Convert an existing config to the file-first local layout.
+    pub fn with_database_path(mut self, db_path: impl Into<PathBuf>) -> Self {
+        let db_path = db_path.into();
+        self.cache_dir = Self::state_dir_for_database_path(&db_path, "-turbolite");
+        self.local_data_path = Some(db_path);
+        self
+    }
+
     pub(crate) fn has_legacy_backend_config(&self) -> bool {
         !self.bucket.is_empty() || !self.prefix.is_empty() || self.endpoint_url.is_some()
     }

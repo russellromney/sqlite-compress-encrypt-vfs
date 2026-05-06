@@ -30,6 +30,8 @@ pub fn manifest_from_msgpack(bytes: &[u8]) -> serde_json::Value {
 
 /// Counter for unique VFS names across tests (SQLite requires unique names).
 static VFS_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Counter for unique object-store prefixes across parallel test runs.
+static PREFIX_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub fn unique_vfs_name(prefix: &str) -> String {
     let n = VFS_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -42,9 +44,23 @@ pub fn test_bucket() -> String {
         .expect("TIERED_TEST_BUCKET env var required for tiered tests")
 }
 
-/// Get S3 endpoint URL (default: Tigris).
-pub fn endpoint_url() -> String {
-    std::env::var("AWS_ENDPOINT_URL").unwrap_or_else(|_| "https://t3.storage.dev".to_string())
+/// Get the S3-compatible endpoint override, when the test environment supplies one.
+///
+/// Real AWS uses the provider default endpoint, so an absent value must remain
+/// `None`. Tigris/S3-compatible runs provide `AWS_ENDPOINT_URL` through soup.
+pub fn endpoint_url() -> Option<String> {
+    std::env::var("AWS_ENDPOINT_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+pub fn aws_region() -> String {
+    if endpoint_url().is_some() {
+        return "auto".to_string();
+    }
+    std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string())
 }
 
 /// Storage tier: local-only (no S3) or S3-backed.
@@ -150,9 +166,12 @@ pub fn cold_reader_config_mode(
 
 /// Create a TurboliteConfig with a unique prefix (so tests don't collide).
 pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig {
+    let n = PREFIX_COUNTER.fetch_add(1, Ordering::SeqCst);
     let unique_prefix = format!(
-        "test/{}/{}",
+        "test/{}/{}-{}-{}",
         prefix,
+        std::process::id(),
+        n,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -163,8 +182,8 @@ pub fn test_config(prefix: &str, cache_dir: &std::path::Path) -> TurboliteConfig
         prefix: unique_prefix,
         cache_dir: cache_dir.to_path_buf(),
         compression_level: 3,
-        endpoint_url: Some(endpoint_url()),
-        region: Some("auto".to_string()),
+        endpoint_url: endpoint_url(),
+        region: Some(aws_region()),
         runtime_handle: Some(shared_runtime_handle()),
         gc_enabled: false, // Async GC races with cold readers under parallel tests
         ..Default::default()
@@ -184,7 +203,7 @@ pub fn cold_reader_config(
         prefix: prefix.to_string(),
         cache_dir: cache_dir.to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         read_only: true,
         runtime_handle: Some(shared_runtime_handle()),
         ..Default::default()
@@ -250,7 +269,7 @@ pub fn verify_s3_manifest(
     let rt = shared_runtime_handle();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -300,7 +319,7 @@ pub fn verify_s3_has_page_groups(bucket: &str, prefix: &str, endpoint: &Option<S
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -328,7 +347,7 @@ pub fn count_s3_objects(bucket: &str, prefix: &str, endpoint: &Option<String>) -
     let rt = shared_runtime_handle();
     rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);

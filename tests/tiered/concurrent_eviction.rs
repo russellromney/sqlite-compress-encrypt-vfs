@@ -91,7 +91,7 @@ fn open_evicting_reader(
         bucket: bucket.to_string(),
         prefix: prefix.to_string(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         cache_dir: cache_dir.path().to_path_buf(),
         pages_per_group: 16,
         read_only: true,

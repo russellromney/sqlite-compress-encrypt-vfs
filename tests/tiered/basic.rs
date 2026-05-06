@@ -111,7 +111,7 @@ fn test_checkpoint_uploads() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let manifest_data = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -620,7 +620,7 @@ fn test_cache_clear_survival() {
 #[test]
 fn test_page_group_cache_populates() {
     // Write data, checkpoint, then do a cold read and verify that
-    // the cache directory has data.cache + page_bitmap (page group model).
+    // the cold reader populates its local data image from page groups.
     let write_cache = TempDir::new().unwrap();
     let config = test_config("pgcache", write_cache.path());
     let vfs_name = unique_vfs_name("tiered_pgcache_w");
@@ -712,8 +712,8 @@ fn test_page_group_cache_populates() {
     );
     eprintln!("data.cache size after cold scan: {} bytes", cache_size);
 
-    // page_bitmap is persisted only during checkpoint, not during reads.
-    // For a read-only cold reader, the bitmap is in-memory only.
+    // local_state is persisted during checkpoint, not during reads.
+    // For a read-only cold reader, cache presence is in-memory only.
     // Verify the cache actually serves correct data (already done via COUNT(*) above).
 }
 
@@ -749,7 +749,7 @@ fn test_destroy_remote() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let exists_before = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -774,7 +774,7 @@ fn test_destroy_remote() {
         prefix: prefix.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
         endpoint_url: endpoint.clone(),
-        region: Some("auto".to_string()),
+        region: Some(aws_region()),
         runtime_handle: Some(super::helpers::shared_runtime_handle()),
         ..Default::default()
     };
@@ -784,7 +784,7 @@ fn test_destroy_remote() {
     // Verify manifest is gone
     let exists_after = rt.block_on(async {
         let aws_config = aws_config::from_env()
-            .region(aws_sdk_s3::config::Region::new("auto"))
+            .region(aws_sdk_s3::config::Region::new(aws_region()))
             .load()
             .await;
         let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
@@ -926,7 +926,7 @@ fn test_manifest_version_increments() {
      -> u64 {
         rt.block_on(async {
             let aws_config = aws_config::from_env()
-                .region(aws_sdk_s3::config::Region::new("auto"))
+                .region(aws_sdk_s3::config::Region::new(aws_region()))
                 .load()
                 .await;
             let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config);
