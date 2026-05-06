@@ -1152,6 +1152,17 @@ impl TurboliteVfs {
     ///
     /// See `crate::tiered::replay` for the full lifecycle contract.
     pub fn begin_replay(&self) -> io::Result<crate::tiered::replay::ReplayHandle> {
+        self.begin_replay_after(self.manifest().change_counter)
+    }
+
+    /// Begin a direct page replay cycle after a known durable replay cursor.
+    ///
+    /// The returned handle will only accept `current_seq + 1` as its first
+    /// committed changeset sequence.
+    pub fn begin_replay_after(
+        &self,
+        current_seq: u64,
+    ) -> io::Result<crate::tiered::replay::ReplayHandle> {
         let staging_dir = self.config.cache_dir.join("staging");
         std::fs::create_dir_all(&staging_dir)?;
         let ctx = crate::tiered::replay::ReplayContext {
@@ -1170,7 +1181,9 @@ impl TurboliteVfs {
                 guard.clone()
             },
         };
-        crate::tiered::replay::ReplayHandle::new(ctx)
+        let mut handle = crate::tiered::replay::ReplayHandle::new(ctx)?;
+        handle.set_expected_next_changeset_seq(current_seq + 1)?;
+        Ok(handle)
     }
 
     /// Test-only deterministic pause hook for `ReplayHandle::finalize`.

@@ -60,7 +60,7 @@ cargo test -p turbolite --lib
 
 Result:
 
-- 530 passed
+- 531 passed
 - Backend: local/in-memory test backends
 - Proves: core VFS, manifest/page replay, local state, cache, compaction,
   checkpoint/delta contract validators, and regression invariants

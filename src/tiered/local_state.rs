@@ -1,4 +1,5 @@
 use super::*;
+use fs2::FileExt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 const LOCAL_STATE_FILE: &str = "local_state.msgpack";
@@ -69,7 +70,13 @@ pub(crate) fn load_or_default(cache_dir: &Path) -> io::Result<LocalState> {
 pub(crate) fn persist(cache_dir: &Path, state: &LocalState) -> io::Result<()> {
     fs::create_dir_all(cache_dir)?;
     let path = path(cache_dir);
-    let tmp = cache_dir.join("local_state.msgpack.tmp");
+    let tmp = cache_dir.join(format!(
+        "local_state.msgpack.{}.{}.tmp",
+        std::process::id(),
+        format!("{:?}", std::thread::current().id())
+            .replace('(', "_")
+            .replace(')', "_")
+    ));
     let mut state = state.clone().normalized();
     state.format_version = 1;
     let data = rmp_serde::to_vec(&state).map_err(|e| {
@@ -99,6 +106,10 @@ pub(crate) fn persist(cache_dir: &Path, state: &LocalState) -> io::Result<()> {
     Ok(())
 }
 
+fn lock_file_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("local_state.lock")
+}
+
 fn update_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
     let locks = LOCAL_STATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let key = cache_dir.to_path_buf();
@@ -113,8 +124,15 @@ pub(crate) fn update<F>(cache_dir: &Path, f: F) -> io::Result<()>
 where
     F: FnOnce(&mut LocalState),
 {
+    fs::create_dir_all(cache_dir)?;
     let lock = update_lock(cache_dir);
     let _guard = lock.lock().expect("local_state update lock poisoned");
+    let file_lock = FsOpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_file_path(cache_dir))?;
+    file_lock.lock_exclusive()?;
     let mut state = load_or_default(cache_dir)?;
     f(&mut state);
     persist(cache_dir, &state)

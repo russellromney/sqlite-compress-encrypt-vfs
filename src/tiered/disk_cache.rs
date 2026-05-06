@@ -1676,6 +1676,22 @@ impl DiskCache {
             }
         }
 
+        let stale_sub_chunks: Vec<SubChunkId> = {
+            let ids: Vec<SubChunkId> = self.tracker.lock().present.iter().copied().collect();
+            ids.into_iter()
+                .filter(|id| {
+                    let pages = self.sub_chunk_page_nums(*id);
+                    pages.is_empty() || pages.iter().all(|page| *page >= page_count)
+                })
+                .collect()
+        };
+        if !stale_sub_chunks.is_empty() {
+            let mut tracker = self.tracker.lock();
+            for id in stale_sub_chunks {
+                tracker.remove(id);
+            }
+        }
+
         if self.cache_compression {
             let mut index = self.cache_index.lock();
             let stale_pages: Vec<u64> = index

@@ -300,6 +300,11 @@ pub struct ReplayHandle {
     /// Sequence numbers of changesets whose pages have been observed
     /// in their entirety and committed by the driver.
     committed_seqs: Vec<u64>,
+    /// Next changeset sequence this replay handle will accept. Defaults
+    /// to 1 so the primitive fails closed on skipped initial sequences;
+    /// integration layers resuming from a later cursor must set this
+    /// explicitly before committing changesets.
+    expected_next_seq: u64,
     /// Page size pinned at `begin_replay` from the live manifest. All
     /// `apply_page` calls must match this size; mismatch is rejected
     /// as `InvalidData`.
@@ -325,6 +330,7 @@ impl ReplayHandle {
             target_page_count: None,
             max_sqlite_page_id: 0,
             committed_seqs: Vec::new(),
+            expected_next_seq: 1,
             page_size,
             consumed: false,
         })
@@ -378,29 +384,45 @@ impl ReplayHandle {
         Ok(())
     }
 
+    /// Set the first changeset sequence expected by this handle.
+    ///
+    /// Direct replay must be driven from a caller's durable replay cursor. The
+    /// handle enforces the cursor locally instead of accepting an arbitrary
+    /// first sequence and only checking gaps after that.
+    pub fn set_expected_next_changeset_seq(&mut self, next_seq: u64) -> io::Result<()> {
+        self.check_not_consumed("set_expected_next_changeset_seq")?;
+        if !self.committed_seqs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "set_expected_next_changeset_seq must be called before commit_changeset",
+            ));
+        }
+        if next_seq == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "changeset sequences are 1-based; expected next sequence cannot be 0",
+            ));
+        }
+        self.expected_next_seq = next_seq;
+        Ok(())
+    }
+
     /// Mark a changeset as fully observed. Called by the driver after
     /// every `apply_page` for that changeset succeeded. Pure
     /// telemetry: no side effects on the cache.
     pub fn commit_changeset(&mut self, seq: u64) -> io::Result<()> {
         self.check_not_consumed("commit_changeset")?;
-        if self.committed_seqs.contains(&seq) {
+        if seq != self.expected_next_seq {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("commit_changeset: duplicate sequence {seq}"),
+                format!(
+                    "commit_changeset: non-contiguous sequence {seq}; expected {}",
+                    self.expected_next_seq
+                ),
             ));
         }
-        if let Some(max) = self.committed_seqs.iter().copied().max() {
-            if seq != max + 1 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "commit_changeset: non-contiguous sequence {seq}; expected {}",
-                        max + 1
-                    ),
-                ));
-            }
-        }
         self.committed_seqs.push(seq);
+        self.expected_next_seq += 1;
         Ok(())
     }
 
@@ -446,9 +468,9 @@ impl ReplayHandle {
     /// Atomicity scope: per-page pwrite is OS-atomic; mid-batch
     /// failure is hidden from readers either by the bitmap gate
     /// (newly-allocated pages) or by pre-image rollback (overwrites
-    /// of already-present pages). Inter-page atomicity for in-flight
-    /// SQLite read transactions requires a separate xLock-scoped
-    /// gate not yet wired here.
+    /// of already-present pages). The replay gate below blocks
+    /// in-flight SQLite read transactions across the commit phase so
+    /// readers see either the pre-replay or post-replay snapshot.
     pub fn finalize(self) -> io::Result<FinalizeReport> {
         self.finalize_inner(/* external_write_held = */ false)
     }
@@ -886,7 +908,10 @@ mod tests {
             ..Default::default()
         };
         let vfs = TurboliteVfs::new_local(config).expect("local VFS");
-        let manifest = vfs.import_sqlite_file(&seed_path).expect("import");
+        let mut manifest = vfs.import_sqlite_file(&seed_path).expect("import");
+        manifest.version += 1;
+        manifest.change_counter = 0;
+        vfs.set_manifest(manifest.clone());
         let page_size = manifest.page_size;
         assert!(
             page_size >= 4096,
@@ -1022,7 +1047,7 @@ mod tests {
         let seq = pre_change_counter + 100;
         let payload = vec![0x88u8; page_size as usize];
 
-        let mut handle = vfs.begin_replay().unwrap();
+        let mut handle = vfs.begin_replay_after(seq - 1).unwrap();
         handle.apply_page(2, &payload).unwrap();
         handle.commit_changeset(seq).unwrap();
         handle.finalize().unwrap();
@@ -1053,7 +1078,7 @@ mod tests {
         h1.commit_changeset(1).unwrap();
         h1.finalize().unwrap();
 
-        let mut h2 = vfs.begin_replay().unwrap();
+        let mut h2 = vfs.begin_replay_after(1).unwrap();
         h2.apply_page(2, &payload_b).unwrap();
         h2.commit_changeset(2).unwrap();
         h2.finalize().unwrap();
@@ -1184,7 +1209,7 @@ mod tests {
         // Now replay a page other than page 1; db_header must stay
         // identical.
         let payload = vec![0x55u8; page_size as usize];
-        let mut h1 = vfs.begin_replay().unwrap();
+        let mut h1 = vfs.begin_replay_after(1).unwrap();
         h1.apply_page(2, &payload).unwrap();
         h1.commit_changeset(2).unwrap();
         h1.finalize().unwrap();
@@ -1283,6 +1308,14 @@ mod tests {
             .unwrap();
         let pre_len = std::fs::metadata(vfs.cache_file_path()).unwrap().len();
         assert!(pre_len >= pre_page_count * page_size as u64);
+        let stale_sub_chunk = {
+            let cache = vfs_cache(&vfs);
+            let mut tracker = cache.tracker.lock();
+            let id = tracker.sub_chunk_for_page(4);
+            tracker.mark_present(id, crate::tiered::SubChunkTier::Data);
+            assert!(tracker.is_sub_chunk_present(&id));
+            id
+        };
 
         let mut handle = vfs.begin_replay().unwrap();
         handle.set_target_page_count(4).unwrap();
@@ -1297,6 +1330,13 @@ mod tests {
             4 * page_size as u64
         );
         assert!(!vfs_cache(&vfs).is_present(4));
+        assert!(
+            !vfs_cache(&vfs)
+                .tracker
+                .lock()
+                .is_sub_chunk_present(&stale_sub_chunk),
+            "shrink must prune tracker state for sub-chunks beyond the new page count"
+        );
     }
 
     #[test]
@@ -1307,11 +1347,25 @@ mod tests {
 
         let mut handle = vfs.begin_replay().unwrap();
         handle.apply_page(1, &payload).unwrap();
-        handle.commit_changeset(3).unwrap();
-        let err = handle.commit_changeset(5).unwrap_err();
+        handle.commit_changeset(1).unwrap();
+        let err = handle.commit_changeset(3).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("non-contiguous"));
+    }
+
+    #[test]
+    fn finalize_rejects_skipped_initial_changeset_sequence() {
+        let tmp = TempDir::new().unwrap();
+        let (vfs, page_size) = fresh_vfs_with_pages(&tmp, 4);
+        let payload = vec![0xEEu8; page_size as usize];
+
+        let mut handle = vfs.begin_replay().unwrap();
+        handle.apply_page(1, &payload).unwrap();
+        let err = handle.commit_changeset(3).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("expected 1"));
     }
 
     #[test]
@@ -1794,7 +1848,10 @@ mod tests {
                 ..Default::default()
             };
             let vfs = TurboliteVfs::new_local(config).unwrap();
-            let manifest = vfs.import_sqlite_file(&seed_path).unwrap();
+            let mut manifest = vfs.import_sqlite_file(&seed_path).unwrap();
+            manifest.version += 1;
+            manifest.change_counter = 0;
+            vfs.set_manifest(manifest.clone());
             let page_size = manifest.page_size;
             let cache = vfs_cache(&vfs);
 
@@ -2541,7 +2598,7 @@ mod tests {
         cache.write_page(0, &pre_replay).unwrap();
 
         let new_bytes = vec![0xBBu8; page_size as usize];
-        let mut handle = vfs.begin_replay().unwrap();
+        let mut handle = vfs.begin_replay_after(6).unwrap();
         handle.apply_page(1, &new_bytes).unwrap();
         handle.commit_changeset(7).unwrap();
         handle.finalize().unwrap();
